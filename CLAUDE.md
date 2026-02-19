@@ -9,10 +9,11 @@ ZipLattice is a portable, JSON-backed knowledge graph manager built on NetworkX.
 ## Project layout
 
 ```
-knowledge_graph.py    # Entire library and CLI (single-file implementation)
-README.md             # Project documentation
-LICENSE               # MIT license
-.gitignore            # Standard Python ignores
+knowledge_graph.py       # Knowledge graph library and CLI (single-file)
+convert_to_markdown.py   # Standalone document-to-Markdown converter (single-file)
+README.md                # Project documentation
+LICENSE                  # MIT license
+.gitignore               # Standard Python ignores
 ```
 
 At runtime, the library creates:
@@ -25,6 +26,7 @@ At runtime, the library creates:
 - Python 3.10+ (uses `from __future__ import annotations` and modern type hints)
 - **Required:** `networkx`
 - **Optional:** `pyvis` (for Pyvis visualization export)
+- **Optional (for converter):** `pymupdf4llm`, `mammoth`, `markdownify`
 - Cytoscape.js is loaded from CDN in exported HTML files and does not need a local install
 
 ## Key classes
@@ -41,8 +43,9 @@ At runtime, the library creates:
 # Install dependencies
 pip install networkx
 pip install pyvis  # optional, for Pyvis visualization
+pip install pymupdf4llm mammoth markdownify  # optional, for document converter
 
-# CLI usage
+# Knowledge graph CLI
 python knowledge_graph.py <path-to-graph.json> --stats
 python knowledge_graph.py <path-to-graph.json> --node <id>
 python knowledge_graph.py <path-to-graph.json> --neighbors <id> --depth 2
@@ -50,8 +53,13 @@ python knowledge_graph.py <path-to-graph.json> --pyvis output.html
 python knowledge_graph.py <path-to-graph.json> --cytoscape output.html
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --sections
 
+# Document converter CLI
+python convert_to_markdown.py document.pdf -o document.md
+python convert_to_markdown.py file1.pdf file2.docx -d output_dir/
+
 # Library usage
 python -c "from knowledge_graph import KnowledgeGraph; print('OK')"
+python -c "from convert_to_markdown import convert; print('OK')"
 ```
 
 ## Testing

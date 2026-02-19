@@ -153,6 +153,52 @@ The following node types are available by default (advisory, not enforced):
 
 `concept`, `entity`, `document`, `section`, `technology`, `tool`, `process`, `event`, `person`, `organization`, `code`, `configuration`, `artifact`, `custom`
 
+## Document conversion
+
+A standalone companion utility (`convert_to_markdown.py`) converts PDF, Word, and HTML files into Markdown for ingestion into the knowledge graph.
+
+### Dependencies
+
+```bash
+pip install pymupdf4llm mammoth markdownify
+```
+
+All pure Python -- no system binaries, GPU, or model downloads required.
+
+### Usage
+
+```bash
+# Convert to stdout
+python convert_to_markdown.py document.pdf
+
+# Convert to a file
+python convert_to_markdown.py document.pdf -o document.md
+
+# Batch convert to a directory
+python convert_to_markdown.py file1.pdf file2.docx file3.html -d output_dir/
+```
+
+Then ingest the resulting Markdown into the knowledge graph:
+
+```bash
+python knowledge_graph.py my_graph.json --ingest-md document.md --sections
+```
+
+The converter can also be used as a library:
+
+```python
+from convert_to_markdown import convert
+
+md = convert("document.pdf")                          # returns string
+md = convert("document.pdf", output="document.md")    # also writes to file
+```
+
+| Format | Library | Notes |
+|--------|---------|-------|
+| PDF | `pymupdf4llm` | Heading detection via font analysis, tables, code blocks |
+| DOCX | `mammoth` + `markdownify` | Semantic HTML intermediate, ATX headings |
+| HTML | `markdownify` | Strips script/style/nav/footer before conversion |
+
 ## License
 
 MIT -- see [LICENSE](LICENSE) for details.
