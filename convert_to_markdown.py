@@ -41,11 +41,11 @@ def _markdownify(html: str, **kwargs) -> str:
         )
 
     class _Converter(MarkdownConverter):
-        def convert_img(self, el, text, convert_as_inline):
+        def convert_img(self, el, text, *args, **kwargs):
             src = el.get("src", "")
             if src.startswith("data:"):
                 return ""
-            return super().convert_img(el, text, convert_as_inline)
+            return super().convert_img(el, text, *args, **kwargs)
 
     kwargs.setdefault("heading_style", "ATX")
     return _Converter(**kwargs).convert(html)
