@@ -26,7 +26,7 @@ At runtime, the library creates:
 - Python 3.10+ (uses `from __future__ import annotations` and modern type hints)
 - **Required:** `networkx`
 - **Optional:** `pyvis` (for Pyvis visualization export)
-- **Optional (for converter):** `pymupdf4llm`, `mammoth`, `markdownify`
+- **Optional (for converter):** `pymupdf4llm`, `mammoth`, `markdownify`, `pymupdf_layout` (improves PDF layout analysis)
 - Cytoscape.js is loaded from CDN in exported HTML files and does not need a local install
 
 ## Key classes
@@ -44,6 +44,7 @@ At runtime, the library creates:
 pip install networkx
 pip install pyvis  # optional, for Pyvis visualization
 pip install pymupdf4llm mammoth markdownify  # optional, for document converter
+pip install pymupdf_layout  # optional, improves PDF page layout analysis
 
 # Knowledge graph CLI
 python knowledge_graph.py <path-to-graph.json> --stats

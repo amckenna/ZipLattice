@@ -31,6 +31,26 @@ from pathlib import Path
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".html", ".htm"}
 
 
+def _markdownify(html: str, **kwargs) -> str:
+    """Convert HTML to Markdown, skipping images with base64 data URIs."""
+    try:
+        from markdownify import MarkdownConverter
+    except ImportError:
+        raise SystemExit(
+            "Markdown conversion requires markdownify: pip install markdownify"
+        )
+
+    class _Converter(MarkdownConverter):
+        def convert_img(self, el, text, convert_as_inline):
+            src = el.get("src", "")
+            if src.startswith("data:"):
+                return ""
+            return super().convert_img(el, text, convert_as_inline)
+
+    kwargs.setdefault("heading_style", "ATX")
+    return _Converter(**kwargs).convert(html)
+
+
 def convert_pdf(path: str | Path) -> str:
     """Convert a PDF file to Markdown using pymupdf4llm."""
     try:
@@ -50,27 +70,14 @@ def convert_docx(path: str | Path) -> str:
         raise SystemExit(
             "DOCX conversion requires mammoth: pip install mammoth"
         )
-    try:
-        from markdownify import markdownify
-    except ImportError:
-        raise SystemExit(
-            "DOCX conversion requires markdownify: pip install markdownify"
-        )
 
     with open(path, "rb") as f:
         result = mammoth.convert_to_html(f)
-    return markdownify(result.value, heading_style="ATX")
+    return _markdownify(result.value)
 
 
 def convert_html(path: str | Path) -> str:
     """Convert a local HTML file to Markdown using markdownify."""
-    try:
-        from markdownify import markdownify
-    except ImportError:
-        raise SystemExit(
-            "HTML conversion requires markdownify: pip install markdownify"
-        )
-
     html = Path(path).read_text(encoding="utf-8")
 
     # Strip non-content tags before conversion
@@ -79,7 +86,7 @@ def convert_html(path: str | Path) -> str:
             rf"<{tag}[\s>].*?</{tag}>", "", html, flags=re.DOTALL | re.IGNORECASE
         )
 
-    return markdownify(html, heading_style="ATX")
+    return _markdownify(html)
 
 
 # ---------------------------------------------------------------------------
