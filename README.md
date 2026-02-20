@@ -161,6 +161,7 @@ A standalone companion utility (`convert_to_markdown.py`) converts PDF, Word, an
 
 ```bash
 pip install pymupdf4llm mammoth markdownify
+pip install pymupdf_layout  # optional, improves PDF page layout analysis
 ```
 
 All pure Python -- no system binaries, GPU, or model downloads required.
@@ -195,7 +196,7 @@ md = convert("document.pdf", output="document.md")    # also writes to file
 
 | Format | Library | Notes |
 |--------|---------|-------|
-| PDF | `pymupdf4llm` | Heading detection via font analysis, tables, code blocks |
+| PDF | `pymupdf4llm` | Heading detection via font analysis, tables, code blocks. Install `pymupdf_layout` for improved page layout analysis. |
 | DOCX | `mammoth` + `markdownify` | Semantic HTML intermediate, ATX headings |
 | HTML | `markdownify` | Strips script/style/nav/footer before conversion |
 
