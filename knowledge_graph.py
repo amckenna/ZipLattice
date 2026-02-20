@@ -4026,9 +4026,10 @@ def main():
     parser.add_argument("--cytoscape", nargs="?", const="graph_cytoscape.html",
                         help="Export Cytoscape visualization (optionally specify output path)")
     parser.add_argument("--center", help="Center visualization on this node (use with --pyvis/--cytoscape)")
-    parser.add_argument("--ingest-md", help="Parse a markdown file and show section breakdown")
+    parser.add_argument("--preview-md", help="Preview section breakdown of a markdown file (dry run)")
+    parser.add_argument("--ingest-md", help="Ingest a markdown file into the graph (stores source, creates structure nodes)")
     parser.add_argument("--sections", action="store_true",
-                        help="Show full section details when used with --ingest-md")
+                        help="Show full section details when used with --preview-md or --ingest-md")
     parser.add_argument("--sources", action="store_true",
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
@@ -4111,9 +4112,9 @@ def main():
         )
         print(f"Cytoscape visualization: {path}")
 
-    if args.ingest_md:
+    if args.preview_md:
         from pathlib import Path as _P
-        md_path = _P(args.ingest_md)
+        md_path = _P(args.preview_md)
         if not md_path.exists():
             print(f"File not found: {md_path}")
         else:
@@ -4144,7 +4145,66 @@ def main():
                     if len(sec["body"]) > 200:
                         preview += "..."
                     print(f"  {prefix}  → {preview}")
-            print(f"\n  Ready for ingestion with ingest_markdown_file()")
+            print(f"\n  To ingest, run: --ingest-md {args.preview_md}")
+
+    if args.ingest_md:
+        from pathlib import Path as _P
+        md_path = _P(args.ingest_md)
+        if not md_path.exists():
+            print(f"File not found: {md_path}")
+        else:
+            text = md_path.read_text(encoding="utf-8")
+            doc_id = md_path.stem
+            file_path = md_path.resolve()
+
+            # Structure-only ingestion: build document/section nodes and
+            # store the source without requiring an LLM extraction function.
+            # A no-op extractor skips entity triple extraction while still
+            # creating the full structural graph.
+            noop_extract: Callable[[str], list[dict[str, Any]]] = lambda _text: []
+
+            stats = kg.ingest_markdown(
+                text,
+                doc_id=doc_id,
+                llm_extract_fn=noop_extract,
+                original_path=file_path,
+                doc_properties={
+                    "file_path": str(md_path),
+                    "file_size": md_path.stat().st_size,
+                },
+            )
+            kg.save()
+
+            # Print summary -- structural counts: 1 document + N sections
+            struct_nodes = 1 + stats["total_sections"]
+            graph_stats = kg.stats()
+            print(f"\nIngested: {md_path.name}")
+            print(f"  Document ID: {stats['doc_id']}")
+            print(f"  Sections: {stats['total_sections']}")
+            print(f"  Structure nodes created: {struct_nodes}")
+            print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
+            if stats.get("source"):
+                src = stats["source"]
+                if src.get("is_duplicate"):
+                    print(f"  Warning: duplicate content (matches '{src['existing_doc_id']}')")
+                else:
+                    print(f"  Source stored: {src['stored_path']}")
+            print()
+
+            # Show section breakdown
+            for sec_stat in stats.get("sections", []):
+                heading = sec_stat.get("heading", "?")
+                if sec_stat.get("skipped"):
+                    print(f"    [skip] {heading} ({sec_stat.get('reason', '')})")
+                else:
+                    print(f"    [ok]   {heading} ({sec_stat.get('char_count', 0):,} chars)")
+
+            if stats["errors"]:
+                print(f"\n  Errors ({len(stats['errors'])}):")
+                for err in stats["errors"]:
+                    print(f"    - {err}")
+
+            print(f"\n  Graph saved to {args.path}")
 
     if args.sources:
         sources = kg.list_sources()
@@ -4179,12 +4239,12 @@ def main():
 
     if not any([args.stats, args.node, args.neighbors, args.split,
                 args.proposals, args.accept, args.reject, args.patterns,
-                args.pyvis, args.cytoscape, args.ingest_md,
+                args.pyvis, args.cytoscape, args.preview_md, args.ingest_md,
                 args.sources, args.check_sources]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
               f"--accept, --reject, --patterns, --pyvis, --cytoscape, "
-              f"--ingest-md, --sources, --check-sources for details.")
+              f"--preview-md, --ingest-md, --sources, --check-sources for details.")
 
 
 if __name__ == "__main__":
