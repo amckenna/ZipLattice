@@ -4030,6 +4030,12 @@ def main():
     parser.add_argument("--ingest-md", help="Ingest a markdown file into the graph (stores source, creates structure nodes)")
     parser.add_argument("--sections", action="store_true",
                         help="Show full section details when used with --preview-md or --ingest-md")
+    parser.add_argument("--ollama", nargs="?", const="qwen3-coder:30b", metavar="MODEL",
+                        help="Use Ollama for LLM extraction during ingestion (default model: qwen3-coder:30b)")
+    parser.add_argument("--ollama-url", default="http://localhost:11434",
+                        help="Ollama server URL (default: http://localhost:11434)")
+    parser.add_argument("--no-viz", action="store_true",
+                        help="Skip automatic visualization export after ingestion")
     parser.add_argument("--sources", action="store_true",
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
@@ -4157,16 +4163,61 @@ def main():
             doc_id = md_path.stem
             file_path = md_path.resolve()
 
-            # Structure-only ingestion: build document/section nodes and
-            # store the source without requiring an LLM extraction function.
-            # A no-op extractor skips entity triple extraction while still
-            # creating the full structural graph.
-            noop_extract: Callable[[str], list[dict[str, Any]]] = lambda _text: []
+            # Build the LLM extraction function
+            if args.ollama:
+                import urllib.request
+
+                ollama_model = args.ollama
+                ollama_url = args.ollama_url.rstrip("/")
+
+                def ollama_extract(prompt: str) -> list[dict[str, Any]]:
+                    """Call local Ollama server and parse JSON triples."""
+                    payload = json.dumps({
+                        "model": ollama_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.1, "num_predict": 4096},
+                    }).encode()
+                    req = urllib.request.Request(
+                        f"{ollama_url}/api/generate",
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(req, timeout=300) as resp:
+                        result = json.loads(resp.read())
+
+                    raw = result.get("response", "").strip()
+
+                    # Strip markdown fences if present
+                    if raw.startswith("```"):
+                        lines = raw.split("\n")
+                        lines = lines[1:]  # drop opening fence
+                        if lines and lines[-1].strip() == "```":
+                            lines = lines[:-1]
+                        raw = "\n".join(lines).strip()
+
+                    # Strip any leading/trailing non-JSON text to find the array
+                    start = raw.find("[")
+                    end = raw.rfind("]")
+                    if start != -1 and end != -1:
+                        raw = raw[start:end + 1]
+
+                    triples = json.loads(raw)
+                    if not isinstance(triples, list):
+                        return []
+                    return triples
+
+                extract_fn: Callable[[str], list[dict[str, Any]]] = ollama_extract
+                print(f"  Using Ollama model: {ollama_model} at {ollama_url}")
+            else:
+                # Structure-only ingestion: no LLM, build document/section
+                # nodes and store the source. Entity extraction is skipped.
+                extract_fn = lambda _text: []
 
             stats = kg.ingest_markdown(
                 text,
                 doc_id=doc_id,
-                llm_extract_fn=noop_extract,
+                llm_extract_fn=extract_fn,
                 original_path=file_path,
                 doc_properties={
                     "file_path": str(md_path),
@@ -4175,14 +4226,15 @@ def main():
             )
             kg.save()
 
-            # Print summary -- structural counts: 1 document + N sections
-            struct_nodes = 1 + stats["total_sections"]
+            # Print summary
             graph_stats = kg.stats()
             print(f"\nIngested: {md_path.name}")
             print(f"  Document ID: {stats['doc_id']}")
             print(f"  Sections: {stats['total_sections']}")
-            print(f"  Structure nodes created: {struct_nodes}")
+            print(f"  Triples extracted: {stats['total_triples']}")
             print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
+            if stats.get("total_proposals_created"):
+                print(f"  New relation proposals: {stats['total_proposals_created']}")
             if stats.get("source"):
                 src = stats["source"]
                 if src.get("is_duplicate"):
@@ -4197,7 +4249,11 @@ def main():
                 if sec_stat.get("skipped"):
                     print(f"    [skip] {heading} ({sec_stat.get('reason', '')})")
                 else:
-                    print(f"    [ok]   {heading} ({sec_stat.get('char_count', 0):,} chars)")
+                    triples_info = ""
+                    n_triples = sec_stat.get("triples_processed", 0)
+                    if n_triples:
+                        triples_info = f", {n_triples} triples"
+                    print(f"    [ok]   {heading} ({sec_stat.get('char_count', 0):,} chars{triples_info})")
 
             if stats["errors"]:
                 print(f"\n  Errors ({len(stats['errors'])}):")
@@ -4205,6 +4261,25 @@ def main():
                     print(f"    - {err}")
 
             print(f"\n  Graph saved to {args.path}")
+
+            # Auto-export visualizations
+            if not args.no_viz:
+                graph_dir = _P(args.path).parent
+                base_name = _P(args.path).stem
+
+                cyto_path = graph_dir / f"{base_name}_cytoscape.html"
+                try:
+                    kg.export_cytoscape(cyto_path)
+                    print(f"  Cytoscape visualization: {cyto_path}")
+                except Exception as e:
+                    print(f"  Cytoscape export failed: {e}")
+
+                try:
+                    pyvis_path = graph_dir / f"{base_name}_pyvis.html"
+                    kg.export_pyvis(pyvis_path)
+                    print(f"  Pyvis visualization: {pyvis_path}")
+                except Exception as e:
+                    print(f"  Pyvis export skipped: {e}")
 
     if args.sources:
         sources = kg.list_sources()
