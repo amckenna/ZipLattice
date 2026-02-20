@@ -4026,9 +4026,16 @@ def main():
     parser.add_argument("--cytoscape", nargs="?", const="graph_cytoscape.html",
                         help="Export Cytoscape visualization (optionally specify output path)")
     parser.add_argument("--center", help="Center visualization on this node (use with --pyvis/--cytoscape)")
-    parser.add_argument("--ingest-md", help="Parse a markdown file and show section breakdown")
+    parser.add_argument("--preview-md", help="Preview section breakdown of a markdown file (dry run)")
+    parser.add_argument("--ingest-md", help="Ingest a markdown file into the graph (stores source, creates structure nodes)")
     parser.add_argument("--sections", action="store_true",
-                        help="Show full section details when used with --ingest-md")
+                        help="Show full section details when used with --preview-md or --ingest-md")
+    parser.add_argument("--ollama", nargs="?", const="qwen3-coder:30b", metavar="MODEL",
+                        help="Use Ollama for LLM extraction during ingestion (default model: qwen3-coder:30b)")
+    parser.add_argument("--ollama-url", default="http://localhost:11434",
+                        help="Ollama server URL (default: http://localhost:11434)")
+    parser.add_argument("--no-viz", action="store_true",
+                        help="Skip automatic visualization export after ingestion")
     parser.add_argument("--sources", action="store_true",
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
@@ -4111,9 +4118,9 @@ def main():
         )
         print(f"Cytoscape visualization: {path}")
 
-    if args.ingest_md:
+    if args.preview_md:
         from pathlib import Path as _P
-        md_path = _P(args.ingest_md)
+        md_path = _P(args.preview_md)
         if not md_path.exists():
             print(f"File not found: {md_path}")
         else:
@@ -4144,7 +4151,135 @@ def main():
                     if len(sec["body"]) > 200:
                         preview += "..."
                     print(f"  {prefix}  → {preview}")
-            print(f"\n  Ready for ingestion with ingest_markdown_file()")
+            print(f"\n  To ingest, run: --ingest-md {args.preview_md}")
+
+    if args.ingest_md:
+        from pathlib import Path as _P
+        md_path = _P(args.ingest_md)
+        if not md_path.exists():
+            print(f"File not found: {md_path}")
+        else:
+            text = md_path.read_text(encoding="utf-8")
+            doc_id = md_path.stem
+            file_path = md_path.resolve()
+
+            # Build the LLM extraction function
+            if args.ollama:
+                import urllib.request
+
+                ollama_model = args.ollama
+                ollama_url = args.ollama_url.rstrip("/")
+
+                def ollama_extract(prompt: str) -> list[dict[str, Any]]:
+                    """Call local Ollama server and parse JSON triples."""
+                    payload = json.dumps({
+                        "model": ollama_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.1, "num_predict": 4096},
+                    }).encode()
+                    req = urllib.request.Request(
+                        f"{ollama_url}/api/generate",
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(req, timeout=300) as resp:
+                        result = json.loads(resp.read())
+
+                    raw = result.get("response", "").strip()
+
+                    # Strip markdown fences if present
+                    if raw.startswith("```"):
+                        lines = raw.split("\n")
+                        lines = lines[1:]  # drop opening fence
+                        if lines and lines[-1].strip() == "```":
+                            lines = lines[:-1]
+                        raw = "\n".join(lines).strip()
+
+                    # Strip any leading/trailing non-JSON text to find the array
+                    start = raw.find("[")
+                    end = raw.rfind("]")
+                    if start != -1 and end != -1:
+                        raw = raw[start:end + 1]
+
+                    triples = json.loads(raw)
+                    if not isinstance(triples, list):
+                        return []
+                    return triples
+
+                extract_fn: Callable[[str], list[dict[str, Any]]] = ollama_extract
+                print(f"  Using Ollama model: {ollama_model} at {ollama_url}")
+            else:
+                # Structure-only ingestion: no LLM, build document/section
+                # nodes and store the source. Entity extraction is skipped.
+                extract_fn = lambda _text: []
+
+            stats = kg.ingest_markdown(
+                text,
+                doc_id=doc_id,
+                llm_extract_fn=extract_fn,
+                original_path=file_path,
+                doc_properties={
+                    "file_path": str(md_path),
+                    "file_size": md_path.stat().st_size,
+                },
+            )
+            kg.save()
+
+            # Print summary
+            graph_stats = kg.stats()
+            print(f"\nIngested: {md_path.name}")
+            print(f"  Document ID: {stats['doc_id']}")
+            print(f"  Sections: {stats['total_sections']}")
+            print(f"  Triples extracted: {stats['total_triples']}")
+            print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
+            if stats.get("total_proposals_created"):
+                print(f"  New relation proposals: {stats['total_proposals_created']}")
+            if stats.get("source"):
+                src = stats["source"]
+                if src.get("is_duplicate"):
+                    print(f"  Warning: duplicate content (matches '{src['existing_doc_id']}')")
+                else:
+                    print(f"  Source stored: {src['stored_path']}")
+            print()
+
+            # Show section breakdown
+            for sec_stat in stats.get("sections", []):
+                heading = sec_stat.get("heading", "?")
+                if sec_stat.get("skipped"):
+                    print(f"    [skip] {heading} ({sec_stat.get('reason', '')})")
+                else:
+                    triples_info = ""
+                    n_triples = sec_stat.get("triples_processed", 0)
+                    if n_triples:
+                        triples_info = f", {n_triples} triples"
+                    print(f"    [ok]   {heading} ({sec_stat.get('char_count', 0):,} chars{triples_info})")
+
+            if stats["errors"]:
+                print(f"\n  Errors ({len(stats['errors'])}):")
+                for err in stats["errors"]:
+                    print(f"    - {err}")
+
+            print(f"\n  Graph saved to {args.path}")
+
+            # Auto-export visualizations
+            if not args.no_viz:
+                graph_dir = _P(args.path).parent
+                base_name = _P(args.path).stem
+
+                cyto_path = graph_dir / f"{base_name}_cytoscape.html"
+                try:
+                    kg.export_cytoscape(cyto_path)
+                    print(f"  Cytoscape visualization: {cyto_path}")
+                except Exception as e:
+                    print(f"  Cytoscape export failed: {e}")
+
+                try:
+                    pyvis_path = graph_dir / f"{base_name}_pyvis.html"
+                    kg.export_pyvis(pyvis_path)
+                    print(f"  Pyvis visualization: {pyvis_path}")
+                except Exception as e:
+                    print(f"  Pyvis export skipped: {e}")
 
     if args.sources:
         sources = kg.list_sources()
@@ -4179,12 +4314,12 @@ def main():
 
     if not any([args.stats, args.node, args.neighbors, args.split,
                 args.proposals, args.accept, args.reject, args.patterns,
-                args.pyvis, args.cytoscape, args.ingest_md,
+                args.pyvis, args.cytoscape, args.preview_md, args.ingest_md,
                 args.sources, args.check_sources]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
               f"--accept, --reject, --patterns, --pyvis, --cytoscape, "
-              f"--ingest-md, --sources, --check-sources for details.")
+              f"--preview-md, --ingest-md, --sources, --check-sources for details.")
 
 
 if __name__ == "__main__":

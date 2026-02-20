@@ -52,7 +52,8 @@ python knowledge_graph.py <path-to-graph.json> --node <id>
 python knowledge_graph.py <path-to-graph.json> --neighbors <id> --depth 2
 python knowledge_graph.py <path-to-graph.json> --pyvis output.html
 python knowledge_graph.py <path-to-graph.json> --cytoscape output.html
-python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --sections
+python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
 
 # Document converter CLI
 python convert_to_markdown.py document.pdf -o document.md
