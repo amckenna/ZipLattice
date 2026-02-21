@@ -1915,8 +1915,9 @@ FOCUS ENTITIES (prioritize relationships involving these):
 {json.dumps(focus_entities, indent=2)}
 """
 
-        return f"""You are a knowledge graph extraction engine. Extract entity relationships
-from the provided text as structured JSON.
+        system = f"""You are a knowledge graph extraction engine.
+Extract entity relationships from text and return ONLY a JSON array.
+Do NOT include any explanation, reasoning, or text outside the JSON.
 
 INSTRUCTIONS:
 1. Identify entities (concepts, technologies, tools, processes, people, organizations, etc.)
@@ -1933,8 +1934,8 @@ RECENTLY PROPOSED (not yet accepted — reuse if applicable):
 
 NODE TYPES (assign one to each entity):
 {json.dumps(sorted(DEFAULT_NODE_TYPES), indent=2)}
-{focus_section}
-OUTPUT FORMAT — return a JSON array of objects:
+
+OUTPUT FORMAT — a JSON array of objects:
 [
   {{
     "source": "entity name (human-readable)",
@@ -1947,8 +1948,7 @@ OUTPUT FORMAT — return a JSON array of objects:
     "justification": null,
     "confidence": 0.85,
     "context": "brief quote or paraphrase from text supporting this triple"
-  }},
-  ...
+  }}
 ]
 
 RULES:
@@ -1958,12 +1958,16 @@ RULES:
 - confidence ranges: 0.9+ explicit statement, 0.7-0.9 strong implication,
   0.5-0.7 reasonable inference, <0.5 speculative.
 - Prefer specific relations (e.g. "depends_on") over generic ones (e.g. "related_to").
+{focus_section}"""
+
+        user = f"""Extract entity relationship triples from the following text as a JSON array.
 
 TEXT:
 ---
 {text}
----
-"""
+---"""
+
+        return system + "\n\n" + user
 
     def ingest_document(
         self,
@@ -4278,37 +4282,62 @@ def main():
                 _verbose = args.verbose
 
                 def ollama_extract(prompt: str) -> list[dict[str, Any]]:
-                    """Call Ollama with format:json and parse the response."""
+                    """Call Ollama /api/chat and parse the JSON response."""
                     if _verbose:
                         logger.debug("Prompt length: %d chars", len(prompt))
 
                     payload = json.dumps({
                         "model": ollama_model,
-                        "prompt": prompt,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a JSON extraction engine. "
+                                    "Respond with ONLY a valid JSON array. "
+                                    "No thinking, no explanations, no markdown."
+                                ),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
                         "stream": False,
                         "format": "json",
                         "options": {"temperature": 0.1, "num_predict": 32768},
                     }).encode()
                     req = urllib.request.Request(
-                        f"{ollama_url}/api/generate",
+                        f"{ollama_url}/api/chat",
                         data=payload,
                         headers={"Content-Type": "application/json"},
                     )
                     with urllib.request.urlopen(req, timeout=600) as resp:
                         body = json.loads(resp.read())
 
-                    raw = body.get("response", "").strip()
+                    raw = body.get("message", {}).get("content", "").strip()
                     if _verbose:
                         logger.debug("Raw response length: %d chars", len(raw))
                     if not raw:
                         logger.warning("LLM returned empty response")
                         return []
 
-                    # With format:json the response is guaranteed valid JSON
-                    # — unless truncated by the num_predict token limit.
+                    # Try direct parse first (works when format:json is honored)
                     try:
                         parsed = json.loads(raw)
                     except json.JSONDecodeError:
+                        parsed = None
+
+                    # If direct parse failed, try to extract JSON from the text
+                    # (model may have produced thinking/prose around the JSON)
+                    if parsed is None:
+                        start = raw.find("[")
+                        if start != -1:
+                            end = raw.rfind("]")
+                            if end > start:
+                                try:
+                                    parsed = json.loads(raw[start:end + 1])
+                                except json.JSONDecodeError:
+                                    pass
+
+                    # Last resort: salvage truncated JSON array
+                    if parsed is None:
                         salvaged = _salvage_truncated_json(raw)
                         if salvaged is not None:
                             logger.warning(
