@@ -2119,6 +2119,17 @@ TEXT:
                         stats["errors"].append(f"Triple too short ({len(triple)} elements): {triple}")
                         continue
 
+                # Skip non-dict items (e.g. bare strings returned by
+                # non-compliant LLMs).
+                if not isinstance(triple, dict):
+                    stats["errors"].append(
+                        f"Triple processing error: expected dict, got {type(triple).__name__} — {triple}"
+                    )
+                    logger.warning(
+                        "Skipping non-dict triple from doc '%s': %s", doc_id, triple
+                    )
+                    continue
+
                 source_label = triple.get("source", "").strip()
                 target_label = triple.get("target", "").strip()
                 if not source_label or not target_label:
