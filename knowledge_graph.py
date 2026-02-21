@@ -2078,6 +2078,21 @@ TEXT:
         for triple in triples:
             stats["triples_processed"] += 1
             try:
+                # Normalize list-format triples into dicts.
+                # Some LLMs return [source, relation, target, context] arrays
+                # instead of the requested dict format.
+                if isinstance(triple, (list, tuple)):
+                    if len(triple) >= 3:
+                        triple = {
+                            "source": str(triple[0]),
+                            "relation": str(triple[1]),
+                            "target": str(triple[2]),
+                            "context": str(triple[3]) if len(triple) > 3 else "",
+                        }
+                    else:
+                        stats["errors"].append(f"Triple too short ({len(triple)} elements): {triple}")
+                        continue
+
                 source_label = triple.get("source", "").strip()
                 target_label = triple.get("target", "").strip()
                 if not source_label or not target_label:
