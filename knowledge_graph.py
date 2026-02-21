@@ -4147,6 +4147,8 @@ def main():
                         help="Ollama embedding model for node embeddings during ingestion (default: nomic-embed-text). Requires --ollama.")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip automatic visualization export after ingestion")
+    parser.add_argument("--auto-accept", action="store_true",
+                        help="Automatically accept all new relation proposals created during ingestion")
     parser.add_argument("--sources", action="store_true",
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
@@ -4467,6 +4469,13 @@ def main():
                       f"(skipped {_embed_stats['nodes_skipped']})")
             if stats.get("total_proposals_created"):
                 print(f"  New relation proposals: {stats['total_proposals_created']}")
+                if args.auto_accept:
+                    pending = kg.get_proposals()
+                    for p in pending:
+                        kg.accept_proposal(p.name)
+                    if pending:
+                        kg.save()
+                        print(f"  Auto-accepted {len(pending)} proposal(s)")
             if stats.get("source"):
                 src = stats["source"]
                 if src.get("is_duplicate"):
