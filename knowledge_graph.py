@@ -4045,6 +4045,41 @@ document.addEventListener('keydown', function(e) {{
 
 
 # ---------------------------------------------------------------------------
+# JSON salvage helper
+# ---------------------------------------------------------------------------
+
+def _salvage_truncated_json(raw: str) -> list[dict[str, Any]] | None:
+    """Try to recover complete objects from a truncated JSON array.
+
+    When the LLM hits its token limit the JSON is cut off mid-object,
+    e.g. ``[{...}, {... <eof>``. This finds the last complete object
+    boundary and closes the array so the valid prefix can be parsed.
+
+    Returns the list of recovered dicts, or None if recovery fails.
+    """
+    # Must start with '['
+    if not raw.lstrip().startswith("["):
+        return None
+
+    # Walk backwards from the end to find the last '}' that could
+    # close a complete object inside the top-level array.
+    last_brace = raw.rfind("}")
+    if last_brace == -1:
+        return None
+
+    # Close the array right after that brace
+    candidate = raw[: last_brace + 1].rstrip().rstrip(",") + "]"
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+    if isinstance(parsed, list) and all(isinstance(o, dict) for o in parsed):
+        return parsed
+    return None
+
+
+# ---------------------------------------------------------------------------
 # CLI for quick inspection
 # ---------------------------------------------------------------------------
 
@@ -4238,6 +4273,10 @@ def main():
                 ollama_model = args.ollama
                 ollama_url = args.ollama_url.rstrip("/")
 
+                # Build verbosity flags early so ollama_extract can use them
+                _quiet = args.quiet
+                _verbose = args.verbose
+
                 def ollama_extract(prompt: str) -> list[dict[str, Any]]:
                     """Call local Ollama server and parse JSON triples."""
                     payload = json.dumps({
@@ -4262,6 +4301,11 @@ def main():
                     if _verbose:
                         logger.debug("Raw response length: %d chars", len(raw))
 
+                    # Empty response — nothing to parse
+                    if not raw:
+                        logger.warning("LLM returned empty response")
+                        return []
+
                     # Strip markdown fences if present
                     if raw.startswith("```"):
                         lines = raw.split("\n")
@@ -4279,13 +4323,22 @@ def main():
                     try:
                         triples = json.loads(raw)
                     except json.JSONDecodeError:
-                        # Re-raise with raw response context for diagnostics
-                        preview = raw[:500] if raw else "(empty)"
-                        logger.error(
-                            "JSON parse failed. Raw response (%d chars): %s",
-                            len(raw), preview,
-                        )
-                        raise
+                        # Truncated response — try to salvage complete objects
+                        # by closing the array after the last complete object
+                        triples = _salvage_truncated_json(raw)
+                        if triples is not None:
+                            n_salvaged = len(triples)
+                            logger.warning(
+                                "JSON truncated, salvaged %d complete triple(s)",
+                                n_salvaged,
+                            )
+                        else:
+                            preview = raw[:500] if raw else "(empty)"
+                            logger.error(
+                                "JSON parse failed. Raw response (%d chars): %s",
+                                len(raw), preview,
+                            )
+                            return []
 
                     if not isinstance(triples, list):
                         return []
@@ -4296,11 +4349,9 @@ def main():
             else:
                 # Structure-only ingestion: no LLM, build document/section
                 # nodes and store the source. Entity extraction is skipped.
+                _quiet = args.quiet
+                _verbose = args.verbose
                 extract_fn = lambda _text: []
-
-            # Build progress callback for real-time output
-            _quiet = args.quiet
-            _verbose = args.verbose
             _ingest_t0 = time.monotonic()
 
             def _progress(event: dict[str, Any]) -> None:
