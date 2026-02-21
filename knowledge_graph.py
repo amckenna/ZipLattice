@@ -1976,6 +1976,32 @@ OUTPUT FORMAT — a JSON array of objects:
   }}
 ]
 
+EXAMPLES:
+
+Input: "The Kalman filter is widely used in navigation systems. It requires a state-space model and produces optimal estimates under Gaussian noise."
+Output:
+[
+  {{"source": "Kalman filter", "source_type": "concept", "target": "navigation systems", "target_type": "concept", "relation": "used_in", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.92, "context": "The Kalman filter is widely used in navigation systems."}},
+  {{"source": "Kalman filter", "source_type": "concept", "target": "state-space model", "target_type": "concept", "relation": "depends_on", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.90, "context": "It requires a state-space model"}},
+  {{"source": "Kalman filter", "source_type": "concept", "target": "Gaussian noise", "target_type": "concept", "relation": "assumes", "is_new_relation": true, "suggested_relation": "assumes", "justification": "Captures a precondition or assumption dependency not covered by depends_on.", "confidence": 0.85, "context": "produces optimal estimates under Gaussian noise"}}
+]
+
+Input: "TensorFlow was developed by Google Brain. It supports GPU acceleration and is commonly compared to PyTorch."
+Output:
+[
+  {{"source": "TensorFlow", "source_type": "tool", "target": "Google Brain", "target_type": "organization", "relation": "created_by", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.95, "context": "TensorFlow was developed by Google Brain."}},
+  {{"source": "TensorFlow", "source_type": "tool", "target": "GPU acceleration", "target_type": "concept", "relation": "supports", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.90, "context": "It supports GPU acceleration"}},
+  {{"source": "TensorFlow", "source_type": "tool", "target": "PyTorch", "target_type": "tool", "relation": "alternative_to", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.75, "context": "commonly compared to PyTorch"}}
+]
+
+Input: "Convolutional layers extract spatial features. Pooling reduces dimensionality before the fully connected layer classifies the output."
+Output:
+[
+  {{"source": "convolutional layers", "source_type": "concept", "target": "spatial features", "target_type": "concept", "relation": "produces", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.90, "context": "Convolutional layers extract spatial features."}},
+  {{"source": "pooling", "source_type": "concept", "target": "dimensionality", "target_type": "concept", "relation": "reduces", "is_new_relation": true, "suggested_relation": "reduces", "justification": "Captures a quantitative reduction relationship not covered by existing types.", "confidence": 0.88, "context": "Pooling reduces dimensionality"}},
+  {{"source": "fully connected layer", "source_type": "concept", "target": "convolutional layers", "target_type": "concept", "relation": "depends_on", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.70, "context": "before the fully connected layer classifies the output"}}
+]
+
 RULES:
 - relation names must be snake_case.
 - is_new_relation = true ONLY when no existing relation fits. In that case,
@@ -2078,6 +2104,21 @@ TEXT:
         for triple in triples:
             stats["triples_processed"] += 1
             try:
+                # Normalize list-format triples into dicts.
+                # Some LLMs return [source, relation, target, context] arrays
+                # instead of the requested dict format.
+                if isinstance(triple, (list, tuple)):
+                    if len(triple) >= 3:
+                        triple = {
+                            "source": str(triple[0]),
+                            "relation": str(triple[1]),
+                            "target": str(triple[2]),
+                            "context": str(triple[3]) if len(triple) > 3 else "",
+                        }
+                    else:
+                        stats["errors"].append(f"Triple too short ({len(triple)} elements): {triple}")
+                        continue
+
                 source_label = triple.get("source", "").strip()
                 target_label = triple.get("target", "").strip()
                 if not source_label or not target_label:
