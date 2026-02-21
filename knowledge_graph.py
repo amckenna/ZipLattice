@@ -2410,6 +2410,7 @@ TEXT:
         preserve_source: bool = True,
         original_path: str | Path | None = None,
         doc_properties: dict[str, Any] | None = None,
+        progress_fn: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """
         Ingest a markdown document with structure-aware chunking.
@@ -2444,6 +2445,10 @@ TEXT:
                              content-hashing for deduplication.
             original_path: Original file path for provenance tracking.
             doc_properties: Extra properties to attach to the document node.
+            progress_fn: Optional callback for real-time progress reporting.
+                         Called with event dicts containing at least an "event"
+                         key. Events: "section_start", "section_done",
+                         "section_skip".
 
         Returns:
             Aggregate stats dict with per-section breakdown.
@@ -2612,15 +2617,36 @@ TEXT:
 
             # Skip extraction on very short sections (just structural nodes)
             if section["char_count"] < 40:
-                aggregate_stats["sections"].append({
+                skip_info = {
                     "heading": heading,
                     "skipped": True,
                     "reason": "too_short",
-                })
+                }
+                aggregate_stats["sections"].append(skip_info)
+                if progress_fn:
+                    progress_fn({
+                        "event": "section_skip",
+                        "index": i,
+                        "total": len(sections),
+                        "heading": heading,
+                        "reason": "too_short",
+                        "char_count": section["char_count"],
+                    })
                 continue
+
+            # Notify progress callback before LLM extraction
+            if progress_fn:
+                progress_fn({
+                    "event": "section_start",
+                    "index": i,
+                    "total": len(sections),
+                    "heading": heading,
+                    "char_count": section["char_count"],
+                })
 
             # Run LLM extraction on this section
             section_text = context_prefix + body
+            t0 = time.monotonic()
             section_stats = self.ingest_document(
                 section_text,
                 doc_id=f"{doc_id}::{heading}",
@@ -2631,6 +2657,7 @@ TEXT:
                 ingestion_id=ingestion_id,
                 content_hash=source_content_hash,
             )
+            elapsed = time.monotonic() - t0
 
             # Link extracted entities to the section node
             if add_structure_nodes and add_structure_edges:
@@ -2652,13 +2679,29 @@ TEXT:
             aggregate_stats["total_edges_added"] += section_stats["edges_added"]
             aggregate_stats["total_proposals_created"] += section_stats["proposals_created"]
             aggregate_stats["total_proposals_augmented"] += section_stats["proposals_augmented"]
-            aggregate_stats["sections"].append({
+            section_record = {
                 "heading": heading,
                 "char_count": section["char_count"],
+                "elapsed_seconds": round(elapsed, 1),
                 **section_stats,
-            })
+            }
+            aggregate_stats["sections"].append(section_record)
             if section_stats["errors"]:
                 aggregate_stats["errors"].extend(section_stats["errors"])
+
+            # Notify progress callback after extraction
+            if progress_fn:
+                progress_fn({
+                    "event": "section_done",
+                    "index": i,
+                    "total": len(sections),
+                    "heading": heading,
+                    "char_count": section["char_count"],
+                    "elapsed_seconds": round(elapsed, 1),
+                    "triples": section_stats["triples_processed"],
+                    "nodes_added": section_stats["nodes_added"],
+                    "errors": section_stats["errors"],
+                })
 
         # Add links found in the document as lightweight reference edges
         all_links: list[dict[str, str]] = []
@@ -4042,7 +4085,19 @@ def main():
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
                         help="Verify integrity of stored source files")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show detailed progress, timing, and debug info")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress per-section output; only show final summary and errors")
     args = parser.parse_args()
+
+    # Configure logging level from CLI flags
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
+    elif args.quiet:
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     kg = KnowledgeGraph(args.path)
 
@@ -4196,10 +4251,16 @@ def main():
                         data=payload,
                         headers={"Content-Type": "application/json"},
                     )
+                    if _verbose:
+                        logger.debug("Prompt length: %d chars", len(prompt))
+
                     with urllib.request.urlopen(req, timeout=300) as resp:
                         result = json.loads(resp.read())
 
                     raw = result.get("response", "").strip()
+
+                    if _verbose:
+                        logger.debug("Raw response length: %d chars", len(raw))
 
                     # Strip markdown fences if present
                     if raw.startswith("```"):
@@ -4215,7 +4276,17 @@ def main():
                     if start != -1 and end != -1:
                         raw = raw[start:end + 1]
 
-                    triples = json.loads(raw)
+                    try:
+                        triples = json.loads(raw)
+                    except json.JSONDecodeError:
+                        # Re-raise with raw response context for diagnostics
+                        preview = raw[:500] if raw else "(empty)"
+                        logger.error(
+                            "JSON parse failed. Raw response (%d chars): %s",
+                            len(raw), preview,
+                        )
+                        raise
+
                     if not isinstance(triples, list):
                         return []
                     return triples
@@ -4227,6 +4298,37 @@ def main():
                 # nodes and store the source. Entity extraction is skipped.
                 extract_fn = lambda _text: []
 
+            # Build progress callback for real-time output
+            _quiet = args.quiet
+            _verbose = args.verbose
+            _ingest_t0 = time.monotonic()
+
+            def _progress(event: dict[str, Any]) -> None:
+                if _quiet:
+                    return
+                ev = event["event"]
+                idx = event.get("index", 0)
+                total = event.get("total", 0)
+                heading = event.get("heading", "?")
+                chars = event.get("char_count", 0)
+                tag = f"[{idx + 1}/{total}]"
+
+                if ev == "section_skip":
+                    print(f"  {tag} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
+                elif ev == "section_start":
+                    print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars)...", end="", flush=True)
+                elif ev == "section_done":
+                    elapsed = event.get("elapsed_seconds", 0)
+                    triples = event.get("triples", 0)
+                    errors = event.get("errors", [])
+                    if errors:
+                        print(f" FAILED ({elapsed}s)")
+                        if _verbose:
+                            for err in errors:
+                                print(f"         {err}")
+                    else:
+                        print(f" {triples} triples ({elapsed}s)")
+
             stats = kg.ingest_markdown(
                 text,
                 doc_id=doc_id,
@@ -4236,7 +4338,9 @@ def main():
                     "file_path": str(md_path),
                     "file_size": md_path.stat().st_size,
                 },
+                progress_fn=_progress,
             )
+            _total_elapsed = time.monotonic() - _ingest_t0
             kg.save()
 
             # Print summary
@@ -4245,6 +4349,7 @@ def main():
             print(f"  Document ID: {stats['doc_id']}")
             print(f"  Sections: {stats['total_sections']}")
             print(f"  Triples extracted: {stats['total_triples']}")
+            print(f"  Total time: {_total_elapsed:.1f}s")
             print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
             if stats.get("total_proposals_created"):
                 print(f"  New relation proposals: {stats['total_proposals_created']}")
@@ -4256,17 +4361,21 @@ def main():
                     print(f"  Source stored: {src['stored_path']}")
             print()
 
-            # Show section breakdown
-            for sec_stat in stats.get("sections", []):
-                heading = sec_stat.get("heading", "?")
-                if sec_stat.get("skipped"):
-                    print(f"    [skip] {heading} ({sec_stat.get('reason', '')})")
-                else:
-                    triples_info = ""
-                    n_triples = sec_stat.get("triples_processed", 0)
-                    if n_triples:
-                        triples_info = f", {n_triples} triples"
-                    print(f"    [ok]   {heading} ({sec_stat.get('char_count', 0):,} chars{triples_info})")
+            # Show section breakdown (verbose only — real-time output already shown)
+            if _verbose:
+                print("  Section details:")
+                for sec_stat in stats.get("sections", []):
+                    heading = sec_stat.get("heading", "?")
+                    elapsed = sec_stat.get("elapsed_seconds", "")
+                    elapsed_str = f", {elapsed}s" if elapsed else ""
+                    if sec_stat.get("skipped"):
+                        print(f"    [skip] {heading} ({sec_stat.get('reason', '')})")
+                    else:
+                        triples_info = ""
+                        n_triples = sec_stat.get("triples_processed", 0)
+                        if n_triples:
+                            triples_info = f", {n_triples} triples"
+                        print(f"    [ok]   {heading} ({sec_stat.get('char_count', 0):,} chars{triples_info}{elapsed_str})")
 
             if stats["errors"]:
                 print(f"\n  Errors ({len(stats['errors'])}):")
