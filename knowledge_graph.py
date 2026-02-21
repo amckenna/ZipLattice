@@ -4277,34 +4277,31 @@ def main():
                 _quiet = args.quiet
                 _verbose = args.verbose
 
-                def ollama_extract(prompt: str) -> list[dict[str, Any]]:
-                    """Call local Ollama server and parse JSON triples."""
+                def _ollama_call(prompt: str) -> str:
+                    """Send a prompt to Ollama and return the raw response text."""
                     payload = json.dumps({
                         "model": ollama_model,
                         "prompt": prompt,
                         "stream": False,
-                        "options": {"temperature": 0.1, "num_predict": 16384},
+                        "format": "json",
+                        "options": {"temperature": 0.1, "num_predict": 32768},
                     }).encode()
                     req = urllib.request.Request(
                         f"{ollama_url}/api/generate",
                         data=payload,
                         headers={"Content-Type": "application/json"},
                     )
-                    if _verbose:
-                        logger.debug("Prompt length: %d chars", len(prompt))
-
-                    with urllib.request.urlopen(req, timeout=300) as resp:
+                    with urllib.request.urlopen(req, timeout=600) as resp:
                         result = json.loads(resp.read())
+                    return result.get("response", "").strip()
 
-                    raw = result.get("response", "").strip()
+                def _parse_ollama_json(raw: str) -> list[dict[str, Any]] | None:
+                    """Parse an LLM response into a list of triple dicts.
 
-                    if _verbose:
-                        logger.debug("Raw response length: %d chars", len(raw))
-
-                    # Empty response — nothing to parse
+                    Returns the list on success, or None on total failure.
+                    """
                     if not raw:
-                        logger.warning("LLM returned empty response")
-                        return []
+                        return None
 
                     # Strip markdown fences if present
                     if raw.startswith("```"):
@@ -4314,35 +4311,90 @@ def main():
                             lines = lines[:-1]
                         raw = "\n".join(lines).strip()
 
+                    # Save the cleaned raw before any bracket-slicing
+                    raw_before_slice = raw
+
                     # Strip any leading/trailing non-JSON text to find the array
                     start = raw.find("[")
                     end = raw.rfind("]")
-                    if start != -1 and end != -1:
+                    if start != -1 and end != -1 and end > start:
                         raw = raw[start:end + 1]
 
+                    # Attempt 1: direct parse of bracket-sliced text
                     try:
-                        triples = json.loads(raw)
+                        parsed = json.loads(raw)
+                        # Handle models that wrap the array in an object
+                        if isinstance(parsed, dict):
+                            for v in parsed.values():
+                                if isinstance(v, list):
+                                    parsed = v
+                                    break
+                        if isinstance(parsed, list):
+                            return parsed
                     except json.JSONDecodeError:
-                        # Truncated response — try to salvage complete objects
-                        # by closing the array after the last complete object
-                        triples = _salvage_truncated_json(raw)
-                        if triples is not None:
-                            n_salvaged = len(triples)
-                            logger.warning(
-                                "JSON truncated, salvaged %d complete triple(s)",
-                                n_salvaged,
-                            )
-                        else:
-                            preview = raw[:500] if raw else "(empty)"
-                            logger.error(
-                                "JSON parse failed. Raw response (%d chars): %s",
-                                len(raw), preview,
-                            )
-                            return []
+                        pass
 
-                    if not isinstance(triples, list):
-                        return []
-                    return triples
+                    # Attempt 2: salvage truncated JSON from bracket-sliced text
+                    salvaged = _salvage_truncated_json(raw)
+                    if salvaged is not None:
+                        return salvaged
+
+                    # Attempt 3: salvage from the original raw (bracket-slicing
+                    # may have corrupted a truncated response by matching a ']'
+                    # inside a string value)
+                    if raw != raw_before_slice:
+                        salvaged = _salvage_truncated_json(raw_before_slice)
+                        if salvaged is not None:
+                            return salvaged
+
+                    return None
+
+                def ollama_extract(prompt: str) -> list[dict[str, Any]]:
+                    """Call local Ollama server and parse JSON triples."""
+                    if _verbose:
+                        logger.debug("Prompt length: %d chars", len(prompt))
+
+                    raw = _ollama_call(prompt)
+
+                    if _verbose:
+                        logger.debug("Raw response length: %d chars", len(raw))
+
+                    triples = _parse_ollama_json(raw)
+
+                    if triples is not None:
+                        if _verbose and len(raw) > 0:
+                            # Check if salvage was needed (heuristic: no ']' at end)
+                            stripped = raw.rstrip()
+                            if not stripped.endswith("]"):
+                                logger.warning(
+                                    "JSON truncated, salvaged %d complete triple(s)",
+                                    len(triples),
+                                )
+                        return triples
+
+                    # Retry once — the model may have produced prose on first try
+                    logger.warning("First attempt failed, retrying with reinforced prompt...")
+                    retry_prompt = (
+                        prompt
+                        + "\n\nCRITICAL REMINDER: You MUST return ONLY a JSON array. "
+                        "No explanations, no markdown, no text outside the JSON. "
+                        "Start your response with '[' and end with ']'."
+                    )
+                    raw = _ollama_call(retry_prompt)
+                    if _verbose:
+                        logger.debug("Retry raw response length: %d chars", len(raw))
+
+                    triples = _parse_ollama_json(raw)
+                    if triples is not None:
+                        logger.info("Retry succeeded with %d triple(s)", len(triples))
+                        return triples
+
+                    preview = raw[:500] if raw else "(empty)"
+                    logger.error(
+                        "JSON parse failed after retry. Raw response (%d chars): %s",
+                        len(raw), preview,
+                    )
+                    return []
 
                 extract_fn: Callable[[str], list[dict[str, Any]]] = ollama_extract
                 print(f"  Using Ollama model: {ollama_model} at {ollama_url}")
