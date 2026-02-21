@@ -4018,6 +4018,8 @@ def main():
     parser.add_argument("--proposals", action="store_true",
                         help="Show pending relation proposals")
     parser.add_argument("--accept", help="Accept a proposed relation by name")
+    parser.add_argument("--accept-all", action="store_true",
+                        help="Accept all pending relation proposals")
     parser.add_argument("--reject", help="Reject a proposed relation by name")
     parser.add_argument("--patterns", action="store_true",
                         help="Analyze novel relation patterns in the graph")
@@ -4082,6 +4084,17 @@ def main():
             print(f"Accepted and registered relation: '{args.accept}'")
         else:
             print(f"No pending proposal named '{args.accept}'.")
+
+    if args.accept_all:
+        pending = kg.get_proposals()
+        if not pending:
+            print("No pending proposals to accept.")
+        else:
+            for p in pending:
+                kg.accept_proposal(p.name)
+                print(f"  Accepted: '{p.name}'")
+            kg.save()
+            print(f"\nAccepted {len(pending)} proposal(s).")
 
     if args.reject:
         if kg.reject_proposal(args.reject):
@@ -4313,12 +4326,13 @@ def main():
                         print(f"    {k}: {v}")
 
     if not any([args.stats, args.node, args.neighbors, args.split,
-                args.proposals, args.accept, args.reject, args.patterns,
-                args.pyvis, args.cytoscape, args.preview_md, args.ingest_md,
+                args.proposals, args.accept, args.accept_all, args.reject,
+                args.patterns, args.pyvis, args.cytoscape,
+                args.preview_md, args.ingest_md,
                 args.sources, args.check_sources]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
-              f"--accept, --reject, --patterns, --pyvis, --cytoscape, "
+              f"--accept, --accept-all, --reject, --patterns, --pyvis, --cytoscape, "
               f"--preview-md, --ingest-md, --sources, --check-sources for details.")
 
 
