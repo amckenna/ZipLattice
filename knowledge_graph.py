@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import time
+import urllib.request
 from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field, asdict
@@ -42,6 +43,30 @@ from typing import Any, Callable, Optional
 import networkx as nx
 
 logger = logging.getLogger(__name__)
+
+
+def ollama_embed(
+    texts: list[str], *, model: str, url: str = "http://localhost:11434"
+) -> list[list[float]]:
+    """Call Ollama ``/api/embed`` for a batch of texts.
+
+    Args:
+        texts: List of strings to embed.
+        model: Ollama model name (e.g. ``nomic-embed-text``).
+        url: Ollama server base URL.
+
+    Returns:
+        One embedding vector per input text, in the same order.
+    """
+    payload = json.dumps({"model": model, "input": texts}).encode()
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}/api/embed",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = json.loads(resp.read())
+    return body["embeddings"]
 
 
 # ---------------------------------------------------------------------------
@@ -4118,8 +4143,12 @@ def main():
                         help="Use Ollama for LLM extraction during ingestion (default model: qwen3-coder:30b)")
     parser.add_argument("--ollama-url", default="http://localhost:11434",
                         help="Ollama server URL (default: http://localhost:11434)")
+    parser.add_argument("--embed-model", default="nomic-embed-text", metavar="MODEL",
+                        help="Ollama embedding model for node embeddings during ingestion (default: nomic-embed-text). Requires --ollama.")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip automatic visualization export after ingestion")
+    parser.add_argument("--auto-accept", action="store_true",
+                        help="Automatically accept all new relation proposals created during ingestion")
     parser.add_argument("--sources", action="store_true",
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
@@ -4272,8 +4301,6 @@ def main():
 
             # Build the LLM extraction function
             if args.ollama:
-                import urllib.request
-
                 ollama_model = args.ollama
                 ollama_url = args.ollama_url.rstrip("/")
 
@@ -4409,6 +4436,24 @@ def main():
                 progress_fn=_progress,
             )
             _total_elapsed = time.monotonic() - _ingest_t0
+
+            # Embed nodes using Ollama if available
+            _embed_stats = None
+            if args.ollama:
+                _embed_model = args.embed_model
+                _embed_url = ollama_url
+
+                def _embed_fn(batch: list[str]) -> list[list[float]]:
+                    return ollama_embed(batch, model=_embed_model, url=_embed_url)
+
+                if not _quiet:
+                    print(f"  Embedding nodes with {_embed_model}...", end="", flush=True)
+                _embed_t0 = time.monotonic()
+                _embed_stats = kg.embed_nodes(_embed_fn, skip_existing=True)
+                _embed_elapsed = time.monotonic() - _embed_t0
+                if not _quiet:
+                    print(f" {_embed_stats['nodes_embedded']} nodes ({_embed_elapsed:.1f}s)")
+
             kg.save()
 
             # Print summary
@@ -4419,8 +4464,18 @@ def main():
             print(f"  Triples extracted: {stats['total_triples']}")
             print(f"  Total time: {_total_elapsed:.1f}s")
             print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
+            if _embed_stats and _embed_stats["nodes_embedded"]:
+                print(f"  Nodes embedded: {_embed_stats['nodes_embedded']} "
+                      f"(skipped {_embed_stats['nodes_skipped']})")
             if stats.get("total_proposals_created"):
                 print(f"  New relation proposals: {stats['total_proposals_created']}")
+                if args.auto_accept:
+                    pending = kg.get_proposals()
+                    for p in pending:
+                        kg.accept_proposal(p.name)
+                    if pending:
+                        kg.save()
+                        print(f"  Auto-accepted {len(pending)} proposal(s)")
             if stats.get("source"):
                 src = stats["source"]
                 if src.get("is_duplicate"):

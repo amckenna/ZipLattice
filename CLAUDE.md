@@ -10,6 +10,8 @@ ZipLattice is a portable, JSON-backed knowledge graph manager built on NetworkX.
 
 ```
 knowledge_graph.py       # Knowledge graph library and CLI (single-file)
+query_graph.py           # Knowledge graph query application (search, RAG, CLI)
+test_query_graph.py      # Tests for query_graph.py
 convert_to_markdown.py   # Standalone document-to-Markdown converter (single-file)
 README.md                # Project documentation
 LICENSE                  # MIT license
@@ -36,6 +38,7 @@ At runtime, the library creates:
 - `RelationProposal` (line ~166) -- Dataclass tracking proposed new relation types with examples and confidence scores.
 - `ProposalStatus` (line ~159) -- Enum: PENDING, ACCEPTED, REJECTED.
 - `GraphEncoder` (line ~121) -- Custom JSON encoder for datetime, set, Enum, and Path objects.
+- `ollama_embed()` (module-level) -- Calls Ollama `/api/embed` endpoint. Used during ingestion and by `query_graph.py` at query time.
 
 ## How to run
 
@@ -54,6 +57,16 @@ python knowledge_graph.py <path-to-graph.json> --pyvis output.html
 python knowledge_graph.py <path-to-graph.json> --cytoscape output.html
 python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --ollama qwen3-coder:30b --embed-model nomic-embed-text
+
+# Query graph CLI
+python query_graph.py <path-to-graph.json> search "synthetic aperture radar"
+python query_graph.py <path-to-graph.json> context "how does SAR work?"
+python query_graph.py <path-to-graph.json> ask "how does SAR work?" --ollama qwen3-coder:30b
+python query_graph.py <path-to-graph.json> node <node-id>
+python query_graph.py <path-to-graph.json> neighbors <node-id> --depth 2
+python query_graph.py <path-to-graph.json> path <source-id> <target-id>
+python query_graph.py <path-to-graph.json> stats
 
 # Document converter CLI
 python convert_to_markdown.py document.pdf -o document.md
@@ -66,10 +79,13 @@ python -c "from convert_to_markdown import convert; print('OK')"
 
 ## Testing
 
-There is no formal test suite. To verify the module loads correctly:
-
 ```bash
+# Run query_graph tests (no Ollama needed)
+python -m pytest test_query_graph.py -v
+
+# Verify modules load
 python -c "from knowledge_graph import KnowledgeGraph"
+python -c "from query_graph import search_nodes, build_context, ask"
 ```
 
 ## Architecture notes
