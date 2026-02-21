@@ -4283,7 +4283,7 @@ def main():
                         "model": ollama_model,
                         "prompt": prompt,
                         "stream": False,
-                        "options": {"temperature": 0.1, "num_predict": 4096},
+                        "options": {"temperature": 0.1, "num_predict": 16384},
                     }).encode()
                     req = urllib.request.Request(
                         f"{ollama_url}/api/generate",
