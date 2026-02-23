@@ -190,6 +190,8 @@ def main() -> None:
                         help="Ollama model for LLM chat (default: qwen3-coder:30b)")
     shared.add_argument("--ollama-url", default="http://localhost:11434",
                         help="Ollama server URL (default: http://localhost:11434)")
+    shared.add_argument("--embed-url", default=None, metavar="URL",
+                        help="Ollama server URL for embeddings (default: same as --ollama-url)")
     shared.add_argument("--embed-model", default="nomic-embed-text", metavar="MODEL",
                         help="Ollama embedding model for query embedding (default: nomic-embed-text)")
     shared.add_argument("--top-k", type=int, default=10, help="Number of search results")
@@ -256,7 +258,7 @@ def main() -> None:
     kg = KnowledgeGraph(args.path)
 
     # Build embed function for query-time use
-    embed_url = args.ollama_url.rstrip("/")
+    embed_url = (args.embed_url or args.ollama_url).rstrip("/")
     embed_model = args.embed_model
 
     def embed_fn(texts: list[str]) -> list[list[float]]:
@@ -306,7 +308,7 @@ def main() -> None:
             return
 
         chat_model = args.ollama
-        chat_url = embed_url
+        chat_url = args.ollama_url.rstrip("/")
 
         def llm_fn(prompt: str) -> str:
             return ollama_chat(prompt, model=chat_model, url=chat_url)
