@@ -263,6 +263,15 @@ def main() -> None:
     embed_url = (args.embed_url or args.ollama_url).rstrip("/")
     embed_model = args.embed_model
 
+    # Warn if the query embed model doesn't match what was used to build the graph
+    if kg.embed_model and kg.embed_model != embed_model:
+        logger.warning(
+            "Embedding model mismatch: graph was embedded with '%s' "
+            "but query is using '%s'. Results will be unreliable. "
+            "Use --embed-model %s to match.",
+            kg.embed_model, embed_model, kg.embed_model,
+        )
+
     def embed_fn(texts: list[str]) -> list[list[float]]:
         return ollama_embed(texts, model=embed_model, url=embed_url)
 

@@ -290,6 +290,7 @@ class KnowledgeGraph:
         # Internal state
         self._data: dict[str, Any] = self._empty_graph_data()
         self._embeddings: dict[str, list[float]] = {}
+        self._embed_meta: dict[str, Any] = {}
         self._proposals: list[RelationProposal] = []
         self._G: nx.DiGraph = nx.DiGraph()
         self._dirty = False
@@ -395,7 +396,13 @@ class KnowledgeGraph:
         """Load embeddings from separate JSON file."""
         path = Path(path) if path else self.embeddings_path
         with open(path, "r", encoding="utf-8") as f:
-            self._embeddings = json.load(f)
+            raw = json.load(f)
+        # Support files with _meta key (new format) or flat dict (legacy)
+        if isinstance(raw, dict) and "_meta" in raw:
+            self._embed_meta = raw.pop("_meta")
+            self._embeddings = raw
+        else:
+            self._embeddings = raw
         self._dirty_embeddings = False
         logger.info("Loaded %d embeddings from %s", len(self._embeddings), path)
 
@@ -403,8 +410,10 @@ class KnowledgeGraph:
         """Save embeddings to separate JSON file."""
         path = Path(path) if path else self.embeddings_path
         path.parent.mkdir(parents=True, exist_ok=True)
+        data = dict(self._embeddings)
+        data["_meta"] = self._embed_meta
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self._embeddings, f, indent=2, sort_keys=True)
+            json.dump(data, f, indent=2, sort_keys=True)
         self._dirty_embeddings = False
         logger.info("Saved %d embeddings to %s", len(self._embeddings), path)
 
@@ -1295,6 +1304,16 @@ class KnowledgeGraph:
         """List node IDs that lack embeddings (useful for batch embedding jobs)."""
         return sorted(set(self._data["nodes"].keys()) - set(self._embeddings.keys()))
 
+    @property
+    def embed_model(self) -> str | None:
+        """Return the embedding model name stored in the embeddings file, or None."""
+        return self._embed_meta.get("model")
+
+    @property
+    def embed_dim(self) -> int | None:
+        """Return the embedding dimension stored in the embeddings file, or None."""
+        return self._embed_meta.get("dim")
+
     def find_similar(
         self, query_embedding: list[float], top_k: int = 5
     ) -> list[tuple[str, float]]:
@@ -1303,7 +1322,23 @@ class KnowledgeGraph:
 
         Returns list of (node_id, similarity_score) tuples, descending.
         Uses pure Python — for large-scale use, replace with numpy/faiss.
+
+        Raises ValueError if the query embedding dimension doesn't match
+        the stored embeddings.
         """
+        # Check for dimension mismatch (catches wrong embedding model)
+        if self._embeddings:
+            stored_dim = len(next(iter(self._embeddings.values())))
+            query_dim = len(query_embedding)
+            if query_dim != stored_dim:
+                raise ValueError(
+                    f"Embedding dimension mismatch: query has {query_dim} dims "
+                    f"but graph embeddings have {stored_dim} dims. "
+                    f"This usually means the query is using a different "
+                    f"embedding model than was used during ingestion"
+                    f"{f' ({self.embed_model})' if self.embed_model else ''}."
+                )
+
         def cosine_sim(a: list[float], b: list[float]) -> float:
             dot = sum(x * y for x, y in zip(a, b))
             norm_a = sum(x * x for x in a) ** 0.5
@@ -1510,6 +1545,7 @@ class KnowledgeGraph:
         include_neighbors: bool = True,
         max_chars: int = 4000,
         store_text: bool = False,
+        model_name: str | None = None,
     ) -> dict[str, Any]:
         """
         Generate embeddings for nodes in batch.
@@ -1628,6 +1664,15 @@ class KnowledgeGraph:
                     f"(nodes: {batch_ids[:3]}...)"
                 )
                 logger.error("Embedding batch failed: %s", e)
+
+        # Record embedding metadata when we successfully embedded at least one node
+        if stats["nodes_embedded"] > 0:
+            if model_name:
+                self._embed_meta["model"] = model_name
+            # Infer dimension from first available embedding
+            for emb in self._embeddings.values():
+                self._embed_meta["dim"] = len(emb)
+                break
 
         logger.info(
             "Embedded %d nodes in %d batches (%d skipped, %d errors)",
@@ -4501,7 +4546,7 @@ def main():
                 if not _quiet:
                     print(f"  Embedding nodes with {_embed_model}...", end="", flush=True)
                 _embed_t0 = time.monotonic()
-                _embed_stats = kg.embed_nodes(_embed_fn, skip_existing=True)
+                _embed_stats = kg.embed_nodes(_embed_fn, skip_existing=True, model_name=_embed_model)
                 _embed_elapsed = time.monotonic() - _embed_t0
                 if not _quiet:
                     print(f" {_embed_stats['nodes_embedded']} nodes ({_embed_elapsed:.1f}s)")
