@@ -244,7 +244,7 @@ def test_cli_node_not_found(kg_path):
 
 def test_cli_json_output(kg_path):
     result = subprocess.run(
-        [sys.executable, "query_graph.py", kg_path, "node", "radar", "--json"],
+        [sys.executable, "query_graph.py", "--json", kg_path, "node", "radar"],
         capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
     )
     assert result.returncode == 0

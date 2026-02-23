@@ -212,32 +212,32 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
 
     # search
-    p_search = sub.add_parser("search", help="Semantic search over graph nodes", parents=[shared])
+    p_search = sub.add_parser("search", help="Semantic search over graph nodes")
     p_search.add_argument("query", help="Search query text")
 
     # context
-    p_ctx = sub.add_parser("context", help="Build RAG context block from graph", parents=[shared])
+    p_ctx = sub.add_parser("context", help="Build RAG context block from graph")
     p_ctx.add_argument("query", help="Query text")
 
     # ask
-    p_ask = sub.add_parser("ask", help="Full RAG: search + context + LLM answer", parents=[shared])
+    p_ask = sub.add_parser("ask", help="Full RAG: search + context + LLM answer")
     p_ask.add_argument("question", help="Question to answer")
 
     # node
-    p_node = sub.add_parser("node", help="Look up a single node by ID", parents=[shared])
+    p_node = sub.add_parser("node", help="Look up a single node by ID")
     p_node.add_argument("node_id", help="Node ID")
 
     # neighbors
-    p_nbr = sub.add_parser("neighbors", help="Get neighbors of a node", parents=[shared])
+    p_nbr = sub.add_parser("neighbors", help="Get neighbors of a node")
     p_nbr.add_argument("node_id", help="Node ID")
 
     # path
-    p_path = sub.add_parser("path", help="Shortest path between two nodes", parents=[shared])
+    p_path = sub.add_parser("path", help="Shortest path between two nodes")
     p_path.add_argument("source", help="Source node ID")
     p_path.add_argument("target", help="Target node ID")
 
     # stats
-    sub.add_parser("stats", help="Print graph statistics", parents=[shared])
+    sub.add_parser("stats", help="Print graph statistics")
 
     args = parser.parse_args()
 
