@@ -4362,8 +4362,8 @@ def main():
                         help="Ollama model for LLM extraction during ingestion (default: qwen3-coder:30b)")
     parser.add_argument("--ollama-url", default="http://localhost:11434",
                         help="Ollama server URL for LLM extraction (default: http://localhost:11434)")
-    parser.add_argument("--embed-url", default="http://localhost:11434", metavar="URL",
-                        help="Ollama server URL for embeddings (default: http://localhost:11434)")
+    parser.add_argument("--embed-url", default=None, metavar="URL",
+                        help="Ollama server URL for embeddings (default: same as --ollama-url)")
     parser.add_argument("--embed-model", default=None, metavar="MODEL",
                         help="Ollama embedding model for node embeddings during ingestion "
                              "(default: auto-detect from graph, or nomic-embed-text)")
@@ -4380,6 +4380,10 @@ def main():
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress per-section output; only show final summary and errors")
     args = parser.parse_args()
+
+    # Default --embed-url to --ollama-url when not explicitly set
+    if args.embed_url is None:
+        args.embed_url = args.ollama_url
 
     # Configure logging level from CLI flags
     if args.verbose:
