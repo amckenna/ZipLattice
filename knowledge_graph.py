@@ -275,17 +275,28 @@ class KnowledgeGraph:
     ):
         """
         Args:
-            graph_path: Path to the main graph JSON file.
+            graph_path: Path to the main graph JSON file.  All runtime
+                        artifacts (embeddings, sources, visualizations)
+                        are placed in a dedicated directory named after
+                        the graph stem.  For example, ``my_graph.json``
+                        becomes ``my_graph/my_graph.json``.
             embeddings_path: Path to the embeddings JSON file.
-                             Defaults to ``<graph_stem>_embeddings.json``.
+                             Defaults to ``<graph_dir>/<stem>_embeddings.json``.
             sources_dir: Directory for storing ingested source files.
-                         Defaults to ``<graph_stem>_sources/``.
+                         Defaults to ``<graph_dir>/<stem>_sources/``.
             strict_relations: If True, only allow CoreRelation values and
                               explicitly registered custom relations.
             strict_node_types: If True, only allow DEFAULT_NODE_TYPES.
             auto_timestamp: Automatically add created/updated timestamps.
         """
-        self.graph_path = Path(graph_path)
+        raw = Path(graph_path)
+        # Place the graph file inside a dedicated directory named after
+        # the graph stem, unless it already lives in one.
+        if raw.parent.name != raw.stem:
+            graph_dir = raw.parent / raw.stem
+            self.graph_path = graph_dir / raw.name
+        else:
+            self.graph_path = raw
         self.embeddings_path = Path(
             embeddings_path
             or self.graph_path.with_name(
@@ -4794,12 +4805,12 @@ def main():
                 for err in stats["errors"]:
                     print(f"    - {err}")
 
-            print(f"\n  Graph saved to {args.path}")
+            print(f"\n  Graph saved to {kg.graph_path}")
 
             # Auto-export visualizations
             if not args.no_viz:
-                graph_dir = _P(args.path).parent
-                base_name = _P(args.path).stem
+                graph_dir = kg.graph_path.parent
+                base_name = kg.graph_path.stem
 
                 cyto_path = graph_dir / f"{base_name}_cytoscape.html"
                 try:
