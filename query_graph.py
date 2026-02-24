@@ -191,8 +191,8 @@ def main() -> None:
                         help="Ollama model for LLM query/chat (default: qwen3-coder:30b)")
     shared.add_argument("--ollama-url", default="http://localhost:11434",
                         help="Ollama server URL (default: http://localhost:11434)")
-    shared.add_argument("--embed-url", default=None, metavar="URL",
-                        help="Ollama server URL for embeddings (default: same as --ollama-url)")
+    shared.add_argument("--embed-url", default="http://localhost:11434", metavar="URL",
+                        help="Ollama server URL for embeddings (default: http://localhost:11434)")
     shared.add_argument("--embed-model", default="nomic-embed-text", metavar="MODEL",
                         help="Ollama embedding model for query embedding (default: nomic-embed-text)")
     shared.add_argument("--top-k", type=int, default=10, help="Number of search results")
@@ -260,8 +260,17 @@ def main() -> None:
     kg = KnowledgeGraph(args.graph)
 
     # Build embed function for query-time use
-    embed_url = (args.embed_url or args.ollama_url).rstrip("/")
+    embed_url = args.embed_url.rstrip("/")
     embed_model = args.embed_model
+
+    # Warn if the query embed model doesn't match what was used to build the graph
+    if kg.embed_model and kg.embed_model != embed_model:
+        logger.warning(
+            "Embedding model mismatch: graph was embedded with '%s' "
+            "but query is using '%s'. Results will be unreliable. "
+            "Use --embed-model %s to match.",
+            kg.embed_model, embed_model, kg.embed_model,
+        )
 
     def embed_fn(texts: list[str]) -> list[list[float]]:
         return ollama_embed(texts, model=embed_model, url=embed_url)
