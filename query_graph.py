@@ -151,6 +151,8 @@ def ask(
         f"Answer:"
     )
 
+    logger.debug("Full prompt (%d chars):\n%s", len(prompt), prompt)
+
     return llm_fn(prompt)
 
 
@@ -161,19 +163,23 @@ def ask(
 
 def ollama_chat(prompt: str, *, model: str, url: str) -> str:
     """Call Ollama ``/api/chat`` with a single user message."""
+    endpoint = f"{url.rstrip('/')}/api/chat"
+    logger.debug("ollama_chat: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
     }).encode()
     req = urllib.request.Request(
-        f"{url.rstrip('/')}/api/chat",
+        endpoint,
         data=payload,
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=600) as resp:
         body = json.loads(resp.read())
-    return body.get("message", {}).get("content", "").strip()
+    answer = body.get("message", {}).get("content", "").strip()
+    logger.debug("ollama_chat: response=%d chars", len(answer))
+    return answer
 
 
 # ---------------------------------------------------------------------------
