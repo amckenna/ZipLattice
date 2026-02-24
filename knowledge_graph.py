@@ -58,14 +58,29 @@ def ollama_embed(
     Returns:
         One embedding vector per input text, in the same order.
     """
+    endpoint = f"{url.rstrip('/')}/api/embed"
     payload = json.dumps({"model": model, "input": texts}).encode()
     req = urllib.request.Request(
-        f"{url.rstrip('/')}/api/embed",
+        endpoint,
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        body = json.loads(resp.read())
+    logger.debug("ollama_embed: POST %s  model=%s  texts=%d", endpoint, model, len(texts))
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"Embedding request failed (HTTP {exc.code}): "
+            f"POST {endpoint} with model '{model}'. "
+            f"Check that the Ollama server is running at {url} "
+            f"and the model '{model}' is available (ollama list)."
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {endpoint}: {exc.reason}. "
+            f"Is the server running?"
+        ) from exc
     return body["embeddings"]
 
 
@@ -2164,8 +2179,27 @@ TEXT:
                         stats["errors"].append(f"Triple too short ({len(triple)} elements): {triple}")
                         continue
 
-                # Skip non-dict items (e.g. bare strings returned by
-                # non-compliant LLMs).
+                # Attempt to parse bare-string triples returned by some LLMs.
+                # Common patterns: "Subject has Object", "A is connected to B",
+                # "X provides Y for Z".
+                if isinstance(triple, str):
+                    parsed = _parse_string_triple(triple)
+                    if parsed is not None:
+                        triple = parsed
+                        logger.debug(
+                            "Parsed string triple from doc '%s': %s", doc_id, parsed
+                        )
+                    else:
+                        stats["errors"].append(
+                            f"Triple processing error: could not parse string — {triple}"
+                        )
+                        logger.warning(
+                            "Skipping unparseable string triple from doc '%s': %s",
+                            doc_id, triple,
+                        )
+                        continue
+
+                # Skip non-dict items (e.g. bare ints, bools, etc.).
                 if not isinstance(triple, dict):
                     stats["errors"].append(
                         f"Triple processing error: expected dict, got {type(triple).__name__} — {triple}"
@@ -4171,6 +4205,93 @@ document.addEventListener('keydown', function(e) {{
 
 
 # ---------------------------------------------------------------------------
+# String-triple parser
+# ---------------------------------------------------------------------------
+
+# Relation phrases that can appear in bare-string triples returned by LLMs.
+# Ordered longest-first so greedy matching picks the most specific phrase.
+_STRING_TRIPLE_VERBS: list[str] = sorted(
+    [
+        " is a ",
+        " is an ",
+        " is ",
+        " are ",
+        " has ",
+        " have ",
+        " had ",
+        " uses ",
+        " used by ",
+        " provides ",
+        " contains ",
+        " implements ",
+        " runs ",
+        " runs on ",
+        " is part of ",
+        " is located in ",
+        " is connected to ",
+        " is based on ",
+        " is used by ",
+        " is used for ",
+        " is composed of ",
+        " is derived from ",
+        " is related to ",
+        " is associated with ",
+        " depends on ",
+        " belongs to ",
+        " supports ",
+        " enables ",
+        " produces ",
+        " processes ",
+        " communicates with ",
+        " interfaces with ",
+        " connects to ",
+        " operates on ",
+        " controls ",
+        " manages ",
+        " generates ",
+        " receives ",
+        " transmits ",
+        " stores ",
+        " loads ",
+        " reads ",
+        " writes ",
+        " extends ",
+        " inherits from ",
+        " calls ",
+        " invokes ",
+        " wraps ",
+    ],
+    key=len,
+    reverse=True,
+)
+
+
+def _parse_string_triple(text: str) -> dict[str, str] | None:
+    """Try to parse a bare-string triple like ``'A has B'`` into a dict.
+
+    Returns ``{"source": ..., "relation": ..., "target": ...}`` on success,
+    or ``None`` if the string cannot be split into a recognisable triple.
+    """
+    text = text.strip()
+    if not text:
+        return None
+
+    for verb in _STRING_TRIPLE_VERBS:
+        idx = text.lower().find(verb.lower())
+        if idx > 0:
+            source = text[:idx].strip()
+            target = text[idx + len(verb):].strip()
+            if source and target:
+                relation = verb.strip()
+                return {
+                    "source": source,
+                    "relation": relation,
+                    "target": target,
+                }
+    return None
+
+
+# ---------------------------------------------------------------------------
 # JSON salvage helper
 # ---------------------------------------------------------------------------
 
@@ -4236,12 +4357,15 @@ def main():
     parser.add_argument("--ingest-md", help="Ingest a markdown file into the graph (stores source, creates structure nodes)")
     parser.add_argument("--sections", action="store_true",
                         help="Show full section details when used with --preview-md or --ingest-md")
-    parser.add_argument("--ollama", nargs="?", const="qwen3-coder:30b", metavar="MODEL",
-                        help="Use Ollama for LLM extraction during ingestion (default model: qwen3-coder:30b)")
+    parser.add_argument("--query-model", "--ollama", nargs="?", const="qwen3-coder:30b",
+                        metavar="MODEL", dest="query_model",
+                        help="Ollama model for LLM extraction during ingestion (default: qwen3-coder:30b)")
     parser.add_argument("--ollama-url", default="http://localhost:11434",
-                        help="Ollama server URL (default: http://localhost:11434)")
+                        help="Ollama server URL for LLM extraction (default: http://localhost:11434)")
+    parser.add_argument("--embed-url", default="http://localhost:11434", metavar="URL",
+                        help="Ollama server URL for embeddings (default: http://localhost:11434)")
     parser.add_argument("--embed-model", default="nomic-embed-text", metavar="MODEL",
-                        help="Ollama embedding model for node embeddings during ingestion (default: nomic-embed-text). Requires --ollama.")
+                        help="Ollama embedding model for node embeddings during ingestion (default: nomic-embed-text)")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip automatic visualization export after ingestion")
     parser.add_argument("--auto-accept", action="store_true",
@@ -4397,8 +4521,8 @@ def main():
             file_path = md_path.resolve()
 
             # Build the LLM extraction function
-            if args.ollama:
-                ollama_model = args.ollama
+            if args.query_model:
+                ollama_model = args.query_model
                 ollama_url = args.ollama_url.rstrip("/")
 
                 # Build verbosity flags early so ollama_extract can use them
@@ -4536,9 +4660,9 @@ def main():
 
             # Embed nodes using Ollama if available
             _embed_stats = None
-            if args.ollama:
+            if args.query_model:
                 _embed_model = args.embed_model
-                _embed_url = ollama_url
+                _embed_url = args.embed_url.rstrip("/")
 
                 def _embed_fn(batch: list[str]) -> list[list[float]]:
                     return ollama_embed(batch, model=_embed_model, url=_embed_url)
@@ -4551,7 +4675,7 @@ def main():
                 if not _quiet:
                     print(f" {_embed_stats['nodes_embedded']} nodes ({_embed_elapsed:.1f}s)")
 
-            kg.save()
+            kg.save_all()
 
             # Print summary
             graph_stats = kg.stats()
