@@ -18,10 +18,17 @@ LICENSE                  # MIT license
 .gitignore               # Standard Python ignores
 ```
 
-At runtime, the library creates:
-- A graph JSON file (e.g. `knowledge_graph.json`) for nodes, edges, metadata, and proposals
-- An embeddings JSON file (e.g. `knowledge_graph_embeddings.json`) for vector data
-- A sources directory (e.g. `knowledge_graph_sources/`) for stored document text
+At runtime, the library creates a dedicated directory named after the graph stem
+containing all artifacts. For example, passing `knowledge_graph.json` produces:
+
+```
+knowledge_graph/                  # dedicated graph directory
+  knowledge_graph.json            # nodes, edges, metadata, proposals
+  knowledge_graph_embeddings.json # vector data
+  knowledge_graph_sources/        # stored document text
+  knowledge_graph_cytoscape.html  # Cytoscape visualization (auto-exported)
+  knowledge_graph_pyvis.html      # Pyvis visualization (auto-exported)
+```
 
 ## Language and dependencies
 
