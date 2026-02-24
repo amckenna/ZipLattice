@@ -771,3 +771,28 @@ def test_build_context_uses_labels_in_edges(rich_kg):
     # Raw IDs should NOT appear in the Relationships section
     relationships_section = ctx.split("### Relationships")[1] if "### Relationships" in ctx else ""
     assert "sar --[" not in relationships_section
+
+
+def test_build_context_fallback_description_from_edge_context(tmp_path):
+    """Nodes without a stored description get one from edge context."""
+    path = str(tmp_path / "fallback_graph.json")
+    kg = KnowledgeGraph(path)
+
+    # Node with NO description
+    kg.add_node("kalman", type="concept", label="Kalman Filter", properties={})
+    kg.add_node("navigation", type="concept", label="Navigation Systems", properties={})
+
+    # Edge WITH context sentence
+    kg.add_edge("kalman", "navigation", relation="used_in",
+                properties={"context": "The Kalman filter is widely used in navigation systems."})
+
+    kg.set_embedding("kalman",     _unit([0.9, 0.1, 0.0, 0.0]))
+    kg.set_embedding("navigation", _unit([0.8, 0.2, 0.0, 0.0]))
+    kg.save_all()
+
+    ctx = build_context(kg, "kalman filter", fake_embed, max_nodes=5)
+    # Both nodes should have the edge context as a fallback description
+    assert "The Kalman filter is widely used in navigation systems." in ctx
+    # Check it appears in the nodes section (not just in the edge)
+    nodes_section = ctx.split("### Relationships")[0]
+    assert "The Kalman filter is widely used in navigation systems." in nodes_section

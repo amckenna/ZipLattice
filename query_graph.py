@@ -130,6 +130,16 @@ def build_context(
                  f"{len(context['edges'])} edges)")
     lines.append("")
 
+    # Build a map of edge context sentences per node so we can synthesize
+    # a description for nodes that don't have one stored.
+    _edge_contexts: dict[str, list[str]] = {}
+    for edge in context["edges"]:
+        ctx = edge.get("properties", {}).get("context", "")
+        if ctx:
+            for endpoint in (edge.get("source"), edge.get("target")):
+                if endpoint and endpoint in node_set:
+                    _edge_contexts.setdefault(endpoint, []).append(ctx)
+
     # Nodes — include descriptions and section body text
     for nid, ndata in context["nodes"].items():
         label = ndata.get("label", nid)
@@ -137,6 +147,9 @@ def build_context(
         conf = ndata.get("confidence", 1.0)
         props = ndata.get("properties", {})
         desc = props.get("description", "")
+        # Fall back to the first edge context sentence if no description
+        if not desc and nid in _edge_contexts:
+            desc = _edge_contexts[nid][0]
         line = f"- [{ntype}] {label} (id={nid}, confidence={conf:.2f})"
         if desc:
             line += f"\n    {desc}"
