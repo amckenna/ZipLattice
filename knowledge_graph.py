@@ -2311,7 +2311,10 @@ TEXT:
                         # Node already exists — backfill description if missing
                         existing = self._data["nodes"].get(nid, {})
                         if not existing.get("properties", {}).get("description"):
-                            self.update_node(nid, properties={"description": desc})
+                            existing.setdefault("properties", {})["description"] = desc
+                            # Sync networkx
+                            self._G.nodes[nid].update(existing)
+                            self._dirty = True
                     entity_ids.add(nid)
 
                 # Handle novel vs known relations
