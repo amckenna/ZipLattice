@@ -53,13 +53,23 @@ def search_nodes(
     Returns:
         List of result dicts from ``kg.search()``.
     """
-    return kg.search(
+    logger.debug(
+        "search_nodes: %d embeddings loaded, %d nodes in graph",
+        len(kg._embeddings), len(kg._data["nodes"]),
+    )
+    results = kg.search(
         query,
         embed_fn,
         top_k=top_k,
         node_types=node_types,
         expand_depth=expand_depth,
     )
+    logger.debug("search_nodes: %d results returned", len(results))
+    for r in results[:5]:
+        logger.debug(
+            "  %.4f  %s  (%s)", r["similarity"], r["label"], r["node_id"],
+        )
+    return results
 
 
 def build_context(
