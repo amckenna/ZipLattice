@@ -2243,6 +2243,27 @@ TEXT:
                     )
                     continue
 
+                # Normalize common LLM key aliases so that triples
+                # returned as {"subject": ..., "object": ...} or
+                # {"head": ..., "tail": ...} are accepted.
+                _KEY_ALIASES = {
+                    "subject": "source",
+                    "head": "source",
+                    "from": "source",
+                    "entity1": "source",
+                    "object": "target",
+                    "tail": "target",
+                    "to": "target",
+                    "entity2": "target",
+                    "predicate": "relation",
+                    "relationship": "relation",
+                    "rel": "relation",
+                    "type": "relation",
+                }
+                for old_key, new_key in _KEY_ALIASES.items():
+                    if old_key in triple and new_key not in triple:
+                        triple[new_key] = triple.pop(old_key)
+
                 source_label = triple.get("source", "").strip()
                 target_label = triple.get("target", "").strip()
                 if not source_label or not target_label:
