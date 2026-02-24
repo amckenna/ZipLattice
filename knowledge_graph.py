@@ -4251,12 +4251,15 @@ def main():
     parser.add_argument("--ingest-md", help="Ingest a markdown file into the graph (stores source, creates structure nodes)")
     parser.add_argument("--sections", action="store_true",
                         help="Show full section details when used with --preview-md or --ingest-md")
-    parser.add_argument("--ollama", nargs="?", const="qwen3-coder:30b", metavar="MODEL",
-                        help="Use Ollama for LLM extraction during ingestion (default model: qwen3-coder:30b)")
+    parser.add_argument("--query-model", "--ollama", nargs="?", const="qwen3-coder:30b",
+                        metavar="MODEL", dest="query_model",
+                        help="Ollama model for LLM extraction during ingestion (default: qwen3-coder:30b)")
     parser.add_argument("--ollama-url", default="http://localhost:11434",
-                        help="Ollama server URL (default: http://localhost:11434)")
+                        help="Ollama server URL for LLM extraction (default: http://localhost:11434)")
+    parser.add_argument("--embed-url", default="http://localhost:11434", metavar="URL",
+                        help="Ollama server URL for embeddings (default: http://localhost:11434)")
     parser.add_argument("--embed-model", default="nomic-embed-text", metavar="MODEL",
-                        help="Ollama embedding model for node embeddings during ingestion (default: nomic-embed-text). Requires --ollama.")
+                        help="Ollama embedding model for node embeddings during ingestion (default: nomic-embed-text)")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip automatic visualization export after ingestion")
     parser.add_argument("--auto-accept", action="store_true",
@@ -4412,8 +4415,8 @@ def main():
             file_path = md_path.resolve()
 
             # Build the LLM extraction function
-            if args.ollama:
-                ollama_model = args.ollama
+            if args.query_model:
+                ollama_model = args.query_model
                 ollama_url = args.ollama_url.rstrip("/")
 
                 # Build verbosity flags early so ollama_extract can use them
@@ -4551,9 +4554,9 @@ def main():
 
             # Embed nodes using Ollama if available
             _embed_stats = None
-            if args.ollama:
+            if args.query_model:
                 _embed_model = args.embed_model
-                _embed_url = ollama_url
+                _embed_url = args.embed_url.rstrip("/")
 
                 def _embed_fn(batch: list[str]) -> list[list[float]]:
                     return ollama_embed(batch, model=_embed_model, url=_embed_url)

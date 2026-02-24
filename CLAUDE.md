@@ -57,12 +57,12 @@ python knowledge_graph.py <path-to-graph.json> --pyvis output.html
 python knowledge_graph.py <path-to-graph.json> --cytoscape output.html
 python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
-python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --ollama qwen3-coder:30b --embed-model nomic-embed-text
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --embed-model nomic-embed-text
 
 # Query graph CLI
 python query_graph.py <path-to-graph.json> search "synthetic aperture radar"
 python query_graph.py <path-to-graph.json> context "how does SAR work?"
-python query_graph.py <path-to-graph.json> ask "how does SAR work?" --ollama qwen3-coder:30b
+python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-model qwen3-coder:30b
 python query_graph.py <path-to-graph.json> node <node-id>
 python query_graph.py <path-to-graph.json> neighbors <node-id> --depth 2
 python query_graph.py <path-to-graph.json> path <source-id> <target-id>
