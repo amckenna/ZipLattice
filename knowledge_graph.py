@@ -67,7 +67,7 @@ def ollama_embed(
     )
     logger.debug("ollama_embed: POST %s  model=%s  texts=%d", endpoint, model, len(texts))
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=240) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         raise RuntimeError(
@@ -4598,7 +4598,7 @@ def main():
                         data=payload,
                         headers={"Content-Type": "application/json"},
                     )
-                    with urllib.request.urlopen(req, timeout=600) as resp:
+                    with urllib.request.urlopen(req, timeout=1200) as resp:
                         body = json.loads(resp.read())
 
                     raw = body.get("message", {}).get("content", "").strip()

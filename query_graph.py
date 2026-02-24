@@ -200,7 +200,7 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
     )
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
+        with urllib.request.urlopen(req, timeout=1200) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         raise RuntimeError(
