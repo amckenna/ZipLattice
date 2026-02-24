@@ -8,12 +8,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.error
 from unittest.mock import patch, MagicMock
 
 import pytest
 
 from knowledge_graph import KnowledgeGraph, ollama_embed
-from query_graph import search_nodes, build_context, ask
+from query_graph import search_nodes, build_context, ask, ollama_chat
 
 
 # ---------------------------------------------------------------------------
@@ -277,3 +278,362 @@ def test_cli_no_command(kg_path):
         capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
     )
     assert result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# ollama_chat tests
+# ---------------------------------------------------------------------------
+
+
+def _mock_urlopen_response(body_dict):
+    """Create a mock urlopen response returning the given JSON body."""
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(body_dict).encode()
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    return mock_resp
+
+
+def test_ollama_chat_basic():
+    """Verify ollama_chat extracts response content correctly."""
+    mock_resp = _mock_urlopen_response({
+        "message": {"content": "Hello from Ollama"}
+    })
+    with patch("query_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = ollama_chat("test prompt", model="llama2", url="http://localhost:11434")
+    assert result == "Hello from Ollama"
+
+
+def test_ollama_chat_strips_whitespace():
+    """Verify leading/trailing whitespace is stripped from the response."""
+    mock_resp = _mock_urlopen_response({
+        "message": {"content": "  spaced answer  \n"}
+    })
+    with patch("query_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = ollama_chat("test", model="m", url="http://localhost:11434")
+    assert result == "spaced answer"
+
+
+def test_ollama_chat_missing_content():
+    """Returns empty string when content field is missing."""
+    mock_resp = _mock_urlopen_response({"message": {}})
+    with patch("query_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = ollama_chat("test", model="m", url="http://localhost:11434")
+    assert result == ""
+
+
+def test_ollama_chat_missing_message():
+    """Returns empty string when message key doesn't exist."""
+    mock_resp = _mock_urlopen_response({})
+    with patch("query_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = ollama_chat("test", model="m", url="http://localhost:11434")
+    assert result == ""
+
+
+def test_ollama_chat_payload_format():
+    """Verify the JSON payload sent to the server."""
+    mock_resp = _mock_urlopen_response({"message": {"content": "ok"}})
+    with patch("query_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        ollama_chat("test prompt", model="llama2", url="http://localhost:11434")
+
+    req = mock_urlopen.call_args[0][0]
+    assert req.full_url == "http://localhost:11434/api/chat"
+    body = json.loads(req.data)
+    assert body["model"] == "llama2"
+    assert body["messages"] == [{"role": "user", "content": "test prompt"}]
+    assert body["stream"] is False
+
+
+def test_ollama_chat_trailing_slash():
+    """Verify trailing slash in URL is handled correctly."""
+    mock_resp = _mock_urlopen_response({"message": {"content": "ok"}})
+    with patch("query_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        ollama_chat("test", model="m", url="http://localhost:11434/")
+
+    req = mock_urlopen.call_args[0][0]
+    assert req.full_url == "http://localhost:11434/api/chat"
+
+
+def test_ollama_chat_http_error():
+    """Verify HTTPError is wrapped in RuntimeError with helpful message."""
+    exc = urllib.error.HTTPError(
+        "http://localhost:11434/api/chat", 404, "Not Found", {}, None
+    )
+    with patch("query_graph.urllib.request.urlopen", side_effect=exc):
+        with pytest.raises(RuntimeError, match="HTTP 404"):
+            ollama_chat("test", model="bad-model", url="http://localhost:11434")
+
+
+def test_ollama_chat_connection_error():
+    """Verify URLError is wrapped in RuntimeError with helpful message."""
+    exc = urllib.error.URLError("Connection refused")
+    with patch("query_graph.urllib.request.urlopen", side_effect=exc):
+        with pytest.raises(RuntimeError, match="Cannot connect"):
+            ollama_chat("test", model="m", url="http://localhost:11434")
+
+
+# ---------------------------------------------------------------------------
+# Additional search_nodes edge-case tests
+# ---------------------------------------------------------------------------
+
+
+def test_search_nodes_nonexistent_type_filter(kg):
+    """Search with a non-existent type filter returns empty results."""
+    results = search_nodes(kg, "radar", fake_embed, top_k=10,
+                           node_types=["nonexistent"], expand_depth=0)
+    assert results == []
+
+
+def test_search_nodes_top_k_exceeds_available(kg):
+    """top_k larger than the graph still returns all matching nodes."""
+    results = search_nodes(kg, "radar", fake_embed, top_k=1000, expand_depth=0)
+    assert len(results) <= len(kg._data["nodes"])
+    assert len(results) > 0
+
+
+# ---------------------------------------------------------------------------
+# Additional ask edge-case tests
+# ---------------------------------------------------------------------------
+
+
+def test_ask_empty_graph(tmp_path):
+    """ask() works with an empty graph (LLM sees fallback context)."""
+    path = str(tmp_path / "empty.json")
+    empty_kg = KnowledgeGraph(path)
+    empty_kg.add_node("x", type="concept", label="X")
+    empty_kg.save()
+
+    received = []
+
+    def capture(prompt):
+        received.append(prompt)
+        return "No context available."
+
+    answer = ask(empty_kg, "what is X?", fake_embed, capture)
+    assert answer == "No context available."
+    assert "No relevant nodes" in received[0]
+
+
+def test_ask_llm_returns_empty(kg):
+    """ask() returns empty string when LLM returns empty."""
+    answer = ask(kg, "what is radar?", fake_embed, lambda _: "")
+    assert answer == ""
+
+
+def test_ask_llm_exception(kg):
+    """ask() propagates LLM exceptions."""
+    def failing_llm(prompt):
+        raise RuntimeError("LLM service down")
+
+    with pytest.raises(RuntimeError, match="LLM service down"):
+        ask(kg, "question", fake_embed, failing_llm)
+
+
+# ---------------------------------------------------------------------------
+# Additional CLI tests
+# ---------------------------------------------------------------------------
+
+
+def _run_cli_with_mock_embed(kg_path, cli_args):
+    """Run query_graph CLI in a subprocess with ollama_embed mocked out.
+
+    The mock returns the QUERY_EMBEDDING for any input, matching the
+    fake_embed helper used in the in-process tests.
+
+    Args:
+        kg_path: Path to the graph JSON file.
+        cli_args: Full argument list as it would appear on the command
+            line *after* ``query_graph.py``, including the graph path
+            placeholder ``{graph}`` which will be replaced.
+            Example: ``["--json", "{graph}", "search", "radar"]``
+            If ``{graph}`` is absent, ``kg_path`` is prepended.
+    """
+    emb_json = json.dumps(QUERY_EMBEDDING)
+    script = (
+        "import sys, json; "
+        "from unittest.mock import patch; "
+        f"emb = {emb_json}; "
+        "mock = lambda texts, **kw: [emb for _ in texts]; "
+        "patcher = patch('query_graph.ollama_embed', side_effect=mock); "
+        "patcher.start(); "
+        "from query_graph import main; "
+        "sys.argv = ['query_graph.py'] + sys.argv[1:]; "
+        "main()"
+    )
+    # Replace {graph} placeholder, or prepend kg_path
+    resolved = [kg_path if a == "{graph}" else a for a in cli_args]
+    if kg_path not in resolved:
+        resolved = [kg_path] + resolved
+    cmd = [sys.executable, "-c", script] + resolved
+    return subprocess.run(
+        cmd, capture_output=True, text=True,
+        cwd=os.path.dirname(__file__) or ".",
+    )
+
+
+def test_cli_search(kg_path):
+    """Verify search command produces formatted output."""
+    result = _run_cli_with_mock_embed(kg_path, ["{graph}", "search", "radar"])
+    assert result.returncode == 0, result.stderr
+    assert "Radar" in result.stdout
+    assert "1." in result.stdout
+
+
+def test_cli_search_json(kg_path):
+    """Verify search --json returns a JSON array of results."""
+    result = _run_cli_with_mock_embed(kg_path, ["--json", "{graph}", "search", "radar"])
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert isinstance(data, list)
+    assert len(data) > 0
+    assert "node_id" in data[0]
+    assert "similarity" in data[0]
+
+
+def test_cli_search_top_k(kg_path):
+    """Verify --top-k limits results."""
+    result = _run_cli_with_mock_embed(kg_path, ["--top-k", "2", "{graph}", "search", "radar"])
+    assert result.returncode == 0, result.stderr
+    # Count numbered result lines (e.g. "1. ...", "2. ...")
+    numbered = [l for l in result.stdout.splitlines() if l and l[0].isdigit() and "." in l[:4]]
+    assert len(numbered) <= 2
+
+
+def test_cli_context(kg_path):
+    """Verify context command produces formatted context block."""
+    result = _run_cli_with_mock_embed(kg_path, ["{graph}", "context", "radar"])
+    assert result.returncode == 0, result.stderr
+    assert "Knowledge Graph Context" in result.stdout
+
+
+def test_cli_context_json(kg_path):
+    """Verify context --json returns structured data."""
+    result = _run_cli_with_mock_embed(kg_path, ["--json", "{graph}", "context", "radar"])
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert "nodes" in data
+    assert "edges" in data
+
+
+def test_cli_ask_requires_query_model(kg_path):
+    """Verify ask command fails gracefully without --query-model."""
+    result = subprocess.run(
+        [sys.executable, "query_graph.py", kg_path, "ask", "what is radar?"],
+        capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+    )
+    assert result.returncode == 0
+    assert "Error" in result.stdout or "required" in result.stdout
+
+
+def test_cli_path_no_path(kg_path):
+    """Verify path command with non-existent nodes."""
+    result = subprocess.run(
+        [sys.executable, "query_graph.py", kg_path, "path", "nonexistent-a", "nonexistent-b"],
+        capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+    )
+    assert result.returncode == 0
+    assert "No path" in result.stdout
+
+
+def test_cli_path_json(kg_path):
+    """Verify path --json returns structured data."""
+    result = subprocess.run(
+        [sys.executable, "query_graph.py", "--json", kg_path, "path", "radar", "frequency"],
+        capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+    )
+    assert result.returncode == 0
+    data = json.loads(result.stdout)
+    assert data["source"] == "radar"
+    assert data["target"] == "frequency"
+    assert isinstance(data["path"], list)
+
+
+def test_cli_neighbors_json(kg_path):
+    """Verify neighbors --json returns structured data."""
+    result = subprocess.run(
+        [sys.executable, "query_graph.py", "--json", kg_path, "neighbors", "radar"],
+        capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+    )
+    assert result.returncode == 0
+    data = json.loads(result.stdout)
+    assert isinstance(data, list)
+    assert len(data) > 0
+
+
+def test_cli_neighbors_nonexistent(kg_path):
+    """Verify neighbors handles non-existent nodes."""
+    result = subprocess.run(
+        [sys.executable, "query_graph.py", kg_path, "neighbors", "does-not-exist"],
+        capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+    )
+    assert result.returncode == 0
+    assert "No neighbors" in result.stdout
+
+
+def test_cli_stats_json(kg_path):
+    """Verify stats --json returns valid JSON with expected keys."""
+    result = subprocess.run(
+        [sys.executable, "query_graph.py", "--json", kg_path, "stats"],
+        capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+    )
+    assert result.returncode == 0
+    data = json.loads(result.stdout)
+    assert "num_nodes" in data
+    assert "num_edges" in data
+
+
+def test_cli_verbose(kg_path):
+    """Verify --verbose flag doesn't crash and produces debug output."""
+    result = subprocess.run(
+        [sys.executable, "query_graph.py", "--verbose", kg_path, "stats"],
+        capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+    )
+    assert result.returncode == 0
+
+
+def test_cli_quiet(kg_path):
+    """Verify --quiet flag suppresses info messages."""
+    result = subprocess.run(
+        [sys.executable, "query_graph.py", "--quiet", kg_path, "stats"],
+        capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+    )
+    assert result.returncode == 0
+    # Quiet mode should suppress INFO-level messages from stderr
+    assert "INFO" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Embed URL defaulting tests
+# ---------------------------------------------------------------------------
+
+
+def test_cli_embed_url_defaults_to_ollama_url(kg_path):
+    """Verify --embed-url defaults to --ollama-url when not specified.
+
+    We check this by running a search with --verbose and a custom
+    --ollama-url. The embed config log line should show the custom URL.
+    """
+    result = subprocess.run(
+        [sys.executable, "query_graph.py", "--verbose",
+         "--ollama-url", "http://custom-host:9999",
+         kg_path, "search", "radar"],
+        capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+    )
+    # The embed call will fail (no server at custom-host), but the
+    # config log line should show the inherited URL.
+    combined = result.stdout + result.stderr
+    assert "http://custom-host:9999" in combined
+
+
+def test_cli_embed_url_explicit_override(kg_path):
+    """Verify --embed-url can be set independently of --ollama-url."""
+    result = subprocess.run(
+        [sys.executable, "query_graph.py", "--verbose",
+         "--ollama-url", "http://llm-host:9999",
+         "--embed-url", "http://embed-host:8888",
+         kg_path, "search", "radar"],
+        capture_output=True, text=True, cwd=os.path.dirname(__file__) or ".",
+    )
+    combined = result.stdout + result.stderr
+    # The embed config should show the explicit embed URL, not the LLM URL
+    assert "http://embed-host:8888" in combined

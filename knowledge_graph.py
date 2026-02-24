@@ -1362,12 +1362,22 @@ class KnowledgeGraph:
                 return 0.0
             return dot / (norm_a * norm_b)
 
+        if not self._embeddings:
+            logger.debug("find_similar: no embeddings loaded, returning empty")
+            return []
+
         scores = []
         for nid, emb in self._embeddings.items():
             sim = cosine_sim(query_embedding, emb)
             scores.append((nid, sim))
 
         scores.sort(key=lambda x: x[1], reverse=True)
+        logger.debug(
+            "find_similar: scored %d nodes, top=%.4f, bottom=%.4f",
+            len(scores),
+            scores[0][1] if scores else 0.0,
+            scores[-1][1] if scores else 0.0,
+        )
         return scores[:top_k]
 
     def build_embedding_text(
@@ -1660,10 +1670,12 @@ class KnowledgeGraph:
                 embeddings = embed_fn(batch_texts)
 
                 if len(embeddings) != len(batch_ids):
-                    stats["errors"].append(
+                    msg = (
                         f"Batch {stats['batches']}: expected {len(batch_ids)} "
                         f"embeddings, got {len(embeddings)}"
                     )
+                    stats["errors"].append(msg)
+                    logger.warning("Embedding batch size mismatch: %s", msg)
                     continue
 
                 for nid, emb in zip(batch_ids, embeddings):
@@ -2144,6 +2156,10 @@ TEXT:
 
         if not isinstance(triples, list):
             stats["errors"].append(f"LLM returned non-list: {type(triples)}")
+            logger.warning(
+                "LLM returned %s instead of list for doc '%s': %s",
+                type(triples).__name__, doc_id, str(triples)[:200],
+            )
             return stats
 
         if triples:
@@ -2318,6 +2334,13 @@ TEXT:
                     confidence=0.9,
                 )
 
+        n_errors = len(stats["errors"])
+        if n_errors and stats["nodes_added"] == 0 and stats["triples_processed"] > 0:
+            logger.warning(
+                "All %d triples from doc '%s' failed to produce nodes "
+                "(%d errors). Run with --verbose to see error details.",
+                stats["triples_processed"], doc_id, n_errors,
+            )
         logger.info(
             "Ingested doc '%s': %d triples → %d nodes, %d edges, %d proposals",
             doc_id, stats["triples_processed"], stats["nodes_added"],
@@ -4783,14 +4806,14 @@ def main():
                     kg.export_cytoscape(cyto_path)
                     print(f"  Cytoscape visualization: {cyto_path}")
                 except Exception as e:
-                    print(f"  Cytoscape export failed: {e}")
+                    logger.error("Cytoscape export failed: %s", e)
 
                 try:
                     pyvis_path = graph_dir / f"{base_name}_pyvis.html"
                     kg.export_pyvis(pyvis_path)
                     print(f"  Pyvis visualization: {pyvis_path}")
                 except Exception as e:
-                    print(f"  Pyvis export skipped: {e}")
+                    logger.error("Pyvis export skipped: %s", e)
 
     if args.sources:
         sources = kg.list_sources()
