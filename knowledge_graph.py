@@ -4449,7 +4449,8 @@ def main():
                         help="Export Cytoscape visualization (optionally specify output path)")
     parser.add_argument("--center", help="Center visualization on this node (use with --pyvis/--cytoscape)")
     parser.add_argument("--preview-md", help="Preview section breakdown of a markdown file (dry run)")
-    parser.add_argument("--ingest-md", help="Ingest a markdown file into the graph (stores source, creates structure nodes)")
+    parser.add_argument("--ingest-md", nargs="+", metavar="FILE",
+                        help="Ingest one or more markdown files into the graph (supports globs)")
     parser.add_argument("--sections", action="store_true",
                         help="Show full section details when used with --preview-md or --ingest-md")
     parser.add_argument("--query-model", "--ollama", nargs="?", const="qwen3-coder:30b",
@@ -4612,148 +4613,171 @@ def main():
 
     if args.ingest_md:
         from pathlib import Path as _P
-        md_path = _P(args.ingest_md)
-        if not md_path.exists():
-            print(f"File not found: {md_path}")
+
+        # Build the LLM extraction function (shared across all files)
+        _quiet = args.quiet
+        _verbose = args.verbose
+
+        if args.query_model:
+            ollama_model = args.query_model
+            ollama_url = args.ollama_url.rstrip("/")
+
+            def ollama_extract(prompt: str) -> list[dict[str, Any]]:
+                """Call Ollama /api/chat and parse the JSON response."""
+                if _verbose:
+                    logger.debug("Prompt length: %d chars", len(prompt))
+
+                payload = json.dumps({
+                    "model": ollama_model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a JSON extraction engine. "
+                                "Respond with ONLY a valid JSON array. "
+                                "No thinking, no explanations, no markdown."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "stream": False,
+                    "format": "json",
+                    "options": {"temperature": 0.1, "num_predict": 32768},
+                }).encode()
+                req = urllib.request.Request(
+                    f"{ollama_url}/api/chat",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=1200) as resp:
+                    body = json.loads(resp.read())
+
+                raw = body.get("message", {}).get("content", "").strip()
+                if _verbose:
+                    logger.debug("Raw response length: %d chars", len(raw))
+                if not raw:
+                    logger.warning("LLM returned empty response")
+                    return []
+
+                # Try direct parse first (works when format:json is honored)
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    parsed = None
+
+                # If direct parse failed, try to extract JSON from the text
+                # (model may have produced thinking/prose around the JSON)
+                if parsed is None:
+                    start = raw.find("[")
+                    if start != -1:
+                        end = raw.rfind("]")
+                        if end > start:
+                            try:
+                                parsed = json.loads(raw[start:end + 1])
+                            except json.JSONDecodeError:
+                                pass
+
+                # Last resort: salvage truncated JSON array
+                if parsed is None:
+                    salvaged = _salvage_truncated_json(raw)
+                    if salvaged is not None:
+                        logger.warning(
+                            "JSON truncated, salvaged %d complete triple(s)",
+                            len(salvaged),
+                        )
+                        return salvaged
+                    logger.error(
+                        "JSON parse failed (%d chars): %s",
+                        len(raw), raw[:500],
+                    )
+                    return []
+
+                # Handle models that wrap the array in an object
+                if isinstance(parsed, dict):
+                    for v in parsed.values():
+                        if isinstance(v, list):
+                            return v
+                    return []
+                if isinstance(parsed, list):
+                    return parsed
+                return []
+
+            extract_fn: Callable[[str], list[dict[str, Any]]] = ollama_extract
+            print(f"  Using Ollama model: {ollama_model} at {ollama_url}")
         else:
+            # Structure-only ingestion: no LLM, build document/section
+            # nodes and store the source. Entity extraction is skipped.
+            extract_fn = lambda _text: []
+
+        def _progress(event: dict[str, Any]) -> None:
+            if _quiet:
+                return
+            ev = event["event"]
+            idx = event.get("index", 0)
+            total = event.get("total", 0)
+            heading = event.get("heading", "?")
+            chars = event.get("char_count", 0)
+            tag = f"[{idx + 1}/{total}]"
+
+            if ev == "section_skip":
+                print(f"  {tag} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
+            elif ev == "section_start":
+                print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars)...", end="", flush=True)
+            elif ev == "section_done":
+                elapsed = event.get("elapsed_seconds", 0)
+                triples = event.get("triples", 0)
+                nodes_added = event.get("nodes_added", 0)
+                errors = event.get("errors", [])
+                if errors and nodes_added == 0 and triples > 0:
+                    print(f" {triples} triples → 0 nodes ({len(errors)} errors, {elapsed}s)")
+                    if _verbose:
+                        for err in errors[:5]:
+                            print(f"         {err}")
+                        if len(errors) > 5:
+                            print(f"         ... and {len(errors) - 5} more")
+                elif errors:
+                    print(f" {triples} triples → {nodes_added} nodes ({len(errors)} errors, {elapsed}s)")
+                    if _verbose:
+                        for err in errors[:5]:
+                            print(f"         {err}")
+                        if len(errors) > 5:
+                            print(f"         ... and {len(errors) - 5} more")
+                else:
+                    print(f" {triples} triples → {nodes_added} nodes ({elapsed}s)")
+
+        # Resolve embed model once (shared across all files)
+        _embed_model = None
+        _embed_url = None
+        if args.query_model:
+            if args.embed_model is not None:
+                _embed_model = args.embed_model
+            elif kg.embed_model:
+                _embed_model = kg.embed_model
+                if not _quiet:
+                    print(f"  Using embed model '{_embed_model}' from graph metadata")
+            else:
+                _embed_model = "nomic-embed-text"
+            _embed_url = args.embed_url.rstrip("/")
+
+        _all_stats: list[dict[str, Any]] = []
+        _batch_t0 = time.monotonic()
+
+        for md_file_arg in args.ingest_md:
+            md_path = _P(md_file_arg)
+            if not md_path.exists():
+                print(f"File not found: {md_path}")
+                continue
+
             text = md_path.read_text(encoding="utf-8")
             doc_id = md_path.stem
             file_path = md_path.resolve()
 
-            # Build the LLM extraction function
-            if args.query_model:
-                ollama_model = args.query_model
-                ollama_url = args.ollama_url.rstrip("/")
+            if not _quiet and len(args.ingest_md) > 1:
+                print(f"\n{'='*60}")
+                print(f"  File: {md_path.name}")
+                print(f"{'='*60}")
 
-                # Build verbosity flags early so ollama_extract can use them
-                _quiet = args.quiet
-                _verbose = args.verbose
-
-                def ollama_extract(prompt: str) -> list[dict[str, Any]]:
-                    """Call Ollama /api/chat and parse the JSON response."""
-                    if _verbose:
-                        logger.debug("Prompt length: %d chars", len(prompt))
-
-                    payload = json.dumps({
-                        "model": ollama_model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a JSON extraction engine. "
-                                    "Respond with ONLY a valid JSON array. "
-                                    "No thinking, no explanations, no markdown."
-                                ),
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        "stream": False,
-                        "format": "json",
-                        "options": {"temperature": 0.1, "num_predict": 32768},
-                    }).encode()
-                    req = urllib.request.Request(
-                        f"{ollama_url}/api/chat",
-                        data=payload,
-                        headers={"Content-Type": "application/json"},
-                    )
-                    with urllib.request.urlopen(req, timeout=1200) as resp:
-                        body = json.loads(resp.read())
-
-                    raw = body.get("message", {}).get("content", "").strip()
-                    if _verbose:
-                        logger.debug("Raw response length: %d chars", len(raw))
-                    if not raw:
-                        logger.warning("LLM returned empty response")
-                        return []
-
-                    # Try direct parse first (works when format:json is honored)
-                    try:
-                        parsed = json.loads(raw)
-                    except json.JSONDecodeError:
-                        parsed = None
-
-                    # If direct parse failed, try to extract JSON from the text
-                    # (model may have produced thinking/prose around the JSON)
-                    if parsed is None:
-                        start = raw.find("[")
-                        if start != -1:
-                            end = raw.rfind("]")
-                            if end > start:
-                                try:
-                                    parsed = json.loads(raw[start:end + 1])
-                                except json.JSONDecodeError:
-                                    pass
-
-                    # Last resort: salvage truncated JSON array
-                    if parsed is None:
-                        salvaged = _salvage_truncated_json(raw)
-                        if salvaged is not None:
-                            logger.warning(
-                                "JSON truncated, salvaged %d complete triple(s)",
-                                len(salvaged),
-                            )
-                            return salvaged
-                        logger.error(
-                            "JSON parse failed (%d chars): %s",
-                            len(raw), raw[:500],
-                        )
-                        return []
-
-                    # Handle models that wrap the array in an object
-                    if isinstance(parsed, dict):
-                        for v in parsed.values():
-                            if isinstance(v, list):
-                                return v
-                        return []
-                    if isinstance(parsed, list):
-                        return parsed
-                    return []
-
-                extract_fn: Callable[[str], list[dict[str, Any]]] = ollama_extract
-                print(f"  Using Ollama model: {ollama_model} at {ollama_url}")
-            else:
-                # Structure-only ingestion: no LLM, build document/section
-                # nodes and store the source. Entity extraction is skipped.
-                _quiet = args.quiet
-                _verbose = args.verbose
-                extract_fn = lambda _text: []
             _ingest_t0 = time.monotonic()
-
-            def _progress(event: dict[str, Any]) -> None:
-                if _quiet:
-                    return
-                ev = event["event"]
-                idx = event.get("index", 0)
-                total = event.get("total", 0)
-                heading = event.get("heading", "?")
-                chars = event.get("char_count", 0)
-                tag = f"[{idx + 1}/{total}]"
-
-                if ev == "section_skip":
-                    print(f"  {tag} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
-                elif ev == "section_start":
-                    print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars)...", end="", flush=True)
-                elif ev == "section_done":
-                    elapsed = event.get("elapsed_seconds", 0)
-                    triples = event.get("triples", 0)
-                    nodes_added = event.get("nodes_added", 0)
-                    errors = event.get("errors", [])
-                    if errors and nodes_added == 0 and triples > 0:
-                        print(f" {triples} triples → 0 nodes ({len(errors)} errors, {elapsed}s)")
-                        if _verbose:
-                            for err in errors[:5]:
-                                print(f"         {err}")
-                            if len(errors) > 5:
-                                print(f"         ... and {len(errors) - 5} more")
-                    elif errors:
-                        print(f" {triples} triples → {nodes_added} nodes ({len(errors)} errors, {elapsed}s)")
-                        if _verbose:
-                            for err in errors[:5]:
-                                print(f"         {err}")
-                            if len(errors) > 5:
-                                print(f"         ... and {len(errors) - 5} more")
-                    else:
-                        print(f" {triples} triples → {nodes_added} nodes ({elapsed}s)")
 
             stats = kg.ingest_markdown(
                 text,
@@ -4770,18 +4794,7 @@ def main():
 
             # Embed nodes using Ollama if available
             _embed_stats = None
-            if args.query_model:
-                # Resolve embed model: explicit flag > graph metadata > fallback
-                if args.embed_model is not None:
-                    _embed_model = args.embed_model
-                elif kg.embed_model:
-                    _embed_model = kg.embed_model
-                    if not _quiet:
-                        print(f"  Using embed model '{_embed_model}' from graph metadata")
-                else:
-                    _embed_model = "nomic-embed-text"
-                _embed_url = args.embed_url.rstrip("/")
-
+            if _embed_model:
                 def _embed_fn(batch: list[str]) -> list[list[float]]:
                     return ollama_embed(batch, model=_embed_model, url=_embed_url)
 
@@ -4795,7 +4808,22 @@ def main():
 
             kg.save_all()
 
-            # Print summary
+            # Auto-accept proposals after each file
+            if stats.get("total_proposals_created") and args.auto_accept:
+                pending = kg.get_proposals()
+                for p in pending:
+                    kg.accept_proposal(p.name)
+                if pending:
+                    kg.save()
+
+            _all_stats.append({
+                "stats": stats,
+                "embed_stats": _embed_stats,
+                "elapsed": _total_elapsed,
+                "md_path": md_path,
+            })
+
+            # Print per-file summary
             graph_stats = kg.stats()
             print(f"\nIngested: {md_path.name}")
             print(f"  Document ID: {stats['doc_id']}")
@@ -4810,23 +4838,17 @@ def main():
             if stats.get("total_proposals_created"):
                 print(f"  New relation proposals: {stats['total_proposals_created']}")
                 if args.auto_accept:
-                    pending = kg.get_proposals()
-                    for p in pending:
-                        kg.accept_proposal(p.name)
-                    if pending:
-                        kg.save()
-                        print(f"  Auto-accepted {len(pending)} proposal(s)")
+                    print(f"  Auto-accepted {stats['total_proposals_created']} proposal(s)")
             if stats.get("source"):
                 src = stats["source"]
                 if src.get("is_duplicate"):
                     print(f"  Warning: duplicate content (matches '{src['existing_doc_id']}')")
                 else:
                     print(f"  Source stored: {src['stored_path']}")
-            print()
 
-            # Show section breakdown (verbose only — real-time output already shown)
+            # Show section breakdown (verbose only)
             if _verbose:
-                print("  Section details:")
+                print("\n  Section details:")
                 for sec_stat in stats.get("sections", []):
                     heading = sec_stat.get("heading", "?")
                     elapsed = sec_stat.get("elapsed_seconds", "")
@@ -4852,9 +4874,25 @@ def main():
                 for err in stats["errors"]:
                     print(f"    - {err}")
 
+        # Batch summary for multi-file ingestion
+        if len(_all_stats) > 1:
+            _batch_elapsed = time.monotonic() - _batch_t0
+            total_triples = sum(s["stats"]["total_triples"] for s in _all_stats)
+            total_nodes = sum(s["stats"]["total_nodes_added"] for s in _all_stats)
+            total_edges = sum(s["stats"]["total_edges_added"] for s in _all_stats)
+            graph_stats = kg.stats()
+            print(f"\n{'='*60}")
+            print(f"  Batch complete: {len(_all_stats)} files ingested")
+            print(f"  Total triples: {total_triples}")
+            print(f"  Total nodes added: {total_nodes}, edges added: {total_edges}")
+            print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
+            print(f"  Total time: {_batch_elapsed:.1f}s")
+            print(f"{'='*60}")
+
+        if _all_stats:
             print(f"\n  Graph saved to {kg.graph_path}")
 
-            # Auto-export visualizations
+            # Auto-export visualizations (once at the end)
             if not args.no_viz:
                 graph_dir = kg.graph_path.parent
                 base_name = kg.graph_path.stem
