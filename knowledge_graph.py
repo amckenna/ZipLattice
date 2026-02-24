@@ -2179,8 +2179,27 @@ TEXT:
                         stats["errors"].append(f"Triple too short ({len(triple)} elements): {triple}")
                         continue
 
-                # Skip non-dict items (e.g. bare strings returned by
-                # non-compliant LLMs).
+                # Attempt to parse bare-string triples returned by some LLMs.
+                # Common patterns: "Subject has Object", "A is connected to B",
+                # "X provides Y for Z".
+                if isinstance(triple, str):
+                    parsed = _parse_string_triple(triple)
+                    if parsed is not None:
+                        triple = parsed
+                        logger.debug(
+                            "Parsed string triple from doc '%s': %s", doc_id, parsed
+                        )
+                    else:
+                        stats["errors"].append(
+                            f"Triple processing error: could not parse string — {triple}"
+                        )
+                        logger.warning(
+                            "Skipping unparseable string triple from doc '%s': %s",
+                            doc_id, triple,
+                        )
+                        continue
+
+                # Skip non-dict items (e.g. bare ints, bools, etc.).
                 if not isinstance(triple, dict):
                     stats["errors"].append(
                         f"Triple processing error: expected dict, got {type(triple).__name__} — {triple}"
@@ -4183,6 +4202,93 @@ document.addEventListener('keydown', function(e) {{
 </script>
 </body>
 </html>"""
+
+
+# ---------------------------------------------------------------------------
+# String-triple parser
+# ---------------------------------------------------------------------------
+
+# Relation phrases that can appear in bare-string triples returned by LLMs.
+# Ordered longest-first so greedy matching picks the most specific phrase.
+_STRING_TRIPLE_VERBS: list[str] = sorted(
+    [
+        " is a ",
+        " is an ",
+        " is ",
+        " are ",
+        " has ",
+        " have ",
+        " had ",
+        " uses ",
+        " used by ",
+        " provides ",
+        " contains ",
+        " implements ",
+        " runs ",
+        " runs on ",
+        " is part of ",
+        " is located in ",
+        " is connected to ",
+        " is based on ",
+        " is used by ",
+        " is used for ",
+        " is composed of ",
+        " is derived from ",
+        " is related to ",
+        " is associated with ",
+        " depends on ",
+        " belongs to ",
+        " supports ",
+        " enables ",
+        " produces ",
+        " processes ",
+        " communicates with ",
+        " interfaces with ",
+        " connects to ",
+        " operates on ",
+        " controls ",
+        " manages ",
+        " generates ",
+        " receives ",
+        " transmits ",
+        " stores ",
+        " loads ",
+        " reads ",
+        " writes ",
+        " extends ",
+        " inherits from ",
+        " calls ",
+        " invokes ",
+        " wraps ",
+    ],
+    key=len,
+    reverse=True,
+)
+
+
+def _parse_string_triple(text: str) -> dict[str, str] | None:
+    """Try to parse a bare-string triple like ``'A has B'`` into a dict.
+
+    Returns ``{"source": ..., "relation": ..., "target": ...}`` on success,
+    or ``None`` if the string cannot be split into a recognisable triple.
+    """
+    text = text.strip()
+    if not text:
+        return None
+
+    for verb in _STRING_TRIPLE_VERBS:
+        idx = text.lower().find(verb.lower())
+        if idx > 0:
+            source = text[:idx].strip()
+            target = text[idx + len(verb):].strip()
+            if source and target:
+                relation = verb.strip()
+                return {
+                    "source": source,
+                    "relation": relation,
+                    "target": target,
+                }
+    return None
 
 
 # ---------------------------------------------------------------------------
