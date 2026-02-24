@@ -679,6 +679,12 @@ def rich_kg(tmp_path):
     # Edge to a node that won't be in top search results
     kg.add_edge("polarization", "vegetation", relation="interacts_with",
                 properties={"context": "Polarization affects backscatter from vegetation canopies."})
+    # Structural edge to an external node — should be filtered from boundary edges
+    kg.add_node("sar-doc", type="document", label="SAR Guide Document",
+                properties={"description": "Full SAR guide"})
+    kg.add_edge("sec-polarization", "sar-doc", relation="part_of")
+    kg.add_edge("sar-doc", "sec-polarization", relation="contains")
+    kg.set_embedding("sar-doc", _unit([0.05, 0.05, 0.05, 0.85]))
 
     # Embeddings: sar and sec-polarization close to query, vegetation far away
     kg.set_embedding("sec-polarization", _unit([0.9, 0.1, 0.0, 0.0]))
@@ -726,23 +732,42 @@ def test_build_context_includes_edge_context(rich_kg):
 
 
 def test_build_context_includes_boundary_edges(rich_kg):
-    """Verify edges to nodes outside the context window are included."""
+    """Verify non-structural edges to external nodes are included."""
     # With max_nodes=4 and vegetation having low similarity, it should
     # fall outside the node set. But the edge polarization→vegetation
-    # should still appear as a boundary edge.
+    # should still appear as a boundary edge (interacts_with is not structural).
     ctx = build_context(rich_kg, "SAR polarization", fake_embed, max_nodes=4)
-    assert "vegetation" in ctx.lower()
+    assert "Vegetation" in ctx
     assert "(external)" in ctx
     assert "backscatter from vegetation" in ctx
 
 
 def test_build_context_boundary_edge_labels_external(rich_kg):
-    """Verify boundary nodes are marked '(external)' in edge lines."""
+    """Verify boundary nodes are marked '(external)' and use labels."""
     ctx = build_context(rich_kg, "SAR polarization", fake_embed, max_nodes=4)
-    # Find the boundary edge line
+    # Find the boundary edge line — should use the label "Vegetation"
     for line in ctx.splitlines():
-        if "vegetation" in line and "--[" in line:
+        if "Vegetation" in line and "--[" in line:
             assert "(external)" in line
             break
     else:
-        pytest.fail("Expected a boundary edge line containing 'vegetation'")
+        pytest.fail("Expected a boundary edge line containing 'Vegetation'")
+
+
+def test_build_context_filters_structural_boundary_edges(rich_kg):
+    """Verify part_of/contains/documented_by boundary edges are excluded."""
+    ctx = build_context(rich_kg, "SAR polarization", fake_embed, max_nodes=4)
+    # The structural edges sec-polarization→sar-doc should NOT appear
+    assert "part_of" not in ctx
+    assert "contains" not in ctx
+    assert "SAR Guide Document" not in ctx
+
+
+def test_build_context_uses_labels_in_edges(rich_kg):
+    """Verify edge lines use human-readable labels instead of raw IDs."""
+    ctx = build_context(rich_kg, "SAR polarization", fake_embed, max_nodes=5)
+    # Internal edge: sar→polarization should show labels
+    assert "Synthetic Aperture Radar --[uses]--> Polarization" in ctx
+    # Raw IDs should NOT appear in the Relationships section
+    relationships_section = ctx.split("### Relationships")[1] if "### Relationships" in ctx else ""
+    assert "sar --[" not in relationships_section
