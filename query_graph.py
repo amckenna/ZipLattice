@@ -112,6 +112,19 @@ def build_context(
 
     node_set = set(context["nodes"])
 
+    # Structural relations are useful between nodes that are *both* in the
+    # context window (navigation) but pure noise as boundary edges.
+    _STRUCTURAL_RELATIONS = {"part_of", "contains", "documented_by"}
+
+    # Helper to resolve a human-readable label for any node ID
+    def _label(nid: str) -> str:
+        # Prefer label from context nodes (already fetched)
+        if nid in context["nodes"]:
+            return context["nodes"][nid].get("label", nid)
+        # Fall back to the full graph for external nodes
+        full = kg._data["nodes"].get(nid, {})
+        return full.get("label", nid)
+
     lines: list[str] = []
     lines.append(f"## Knowledge Graph Context ({len(context['nodes'])} nodes, "
                  f"{len(context['edges'])} edges)")
@@ -137,26 +150,37 @@ def build_context(
         lines.append(line)
 
     # Edges — include context sentences and label boundary nodes
-    if context["edges"]:
+    edge_lines: list[str] = []
+    for edge in context["edges"]:
+        src = edge.get("source", "?")
+        tgt = edge.get("target", "?")
+        rel = edge.get("relation", "related_to")
+        is_boundary = src not in node_set or tgt not in node_set
+
+        # Drop structural scaffolding from boundary edges — they add
+        # noise without helping the LLM reason about the domain.
+        if is_boundary and rel in _STRUCTURAL_RELATIONS:
+            continue
+
+        # Use human-readable labels instead of raw slugified IDs
+        src_display = _label(src)
+        tgt_display = _label(tgt)
+        if src not in node_set:
+            src_display += " (external)"
+        if tgt not in node_set:
+            tgt_display += " (external)"
+
+        edge_line = f"- {src_display} --[{rel}]--> {tgt_display}"
+        # Append the source sentence so the LLM gets real evidence
+        ctx = edge.get("properties", {}).get("context", "")
+        if ctx:
+            edge_line += f"\n    \"{ctx}\""
+        edge_lines.append(edge_line)
+
+    if edge_lines:
         lines.append("")
         lines.append("### Relationships")
-        for edge in context["edges"]:
-            src = edge.get("source", "?")
-            tgt = edge.get("target", "?")
-            rel = edge.get("relation", "related_to")
-            # Mark nodes outside the context window for clarity
-            src_label = src
-            tgt_label = tgt
-            if src not in node_set:
-                src_label = f"{src} (external)"
-            if tgt not in node_set:
-                tgt_label = f"{tgt} (external)"
-            edge_line = f"- {src_label} --[{rel}]--> {tgt_label}"
-            # Append the source sentence so the LLM gets real evidence
-            ctx = edge.get("properties", {}).get("context", "")
-            if ctx:
-                edge_line += f"\n    \"{ctx}\""
-            lines.append(edge_line)
+        lines.extend(edge_lines)
 
     return "\n".join(lines)
 
