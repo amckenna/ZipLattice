@@ -4364,8 +4364,9 @@ def main():
                         help="Ollama server URL for LLM extraction (default: http://localhost:11434)")
     parser.add_argument("--embed-url", default="http://localhost:11434", metavar="URL",
                         help="Ollama server URL for embeddings (default: http://localhost:11434)")
-    parser.add_argument("--embed-model", default="nomic-embed-text", metavar="MODEL",
-                        help="Ollama embedding model for node embeddings during ingestion (default: nomic-embed-text)")
+    parser.add_argument("--embed-model", default=None, metavar="MODEL",
+                        help="Ollama embedding model for node embeddings during ingestion "
+                             "(default: auto-detect from graph, or nomic-embed-text)")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip automatic visualization export after ingestion")
     parser.add_argument("--auto-accept", action="store_true",
@@ -4661,7 +4662,15 @@ def main():
             # Embed nodes using Ollama if available
             _embed_stats = None
             if args.query_model:
-                _embed_model = args.embed_model
+                # Resolve embed model: explicit flag > graph metadata > fallback
+                if args.embed_model is not None:
+                    _embed_model = args.embed_model
+                elif kg.embed_model:
+                    _embed_model = kg.embed_model
+                    if not _quiet:
+                        print(f"  Using embed model '{_embed_model}' from graph metadata")
+                else:
+                    _embed_model = "nomic-embed-text"
                 _embed_url = args.embed_url.rstrip("/")
 
                 def _embed_fn(batch: list[str]) -> list[list[float]]:
