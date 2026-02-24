@@ -4675,7 +4675,7 @@ def main():
                 if not _quiet:
                     print(f" {_embed_stats['nodes_embedded']} nodes ({_embed_elapsed:.1f}s)")
 
-            kg.save()
+            kg.save_all()
 
             # Print summary
             graph_stats = kg.stats()
