@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+import urllib.error
 import urllib.request
 from typing import Any, Callable
 
@@ -94,10 +96,15 @@ def build_context(
     """
     results = search_nodes(kg, query, embed_fn, top_k=max_nodes, expand_depth=0)
     if not results:
+        logger.debug("build_context: no search results for query")
         return "(No relevant nodes found in the knowledge graph.)"
 
     seed_ids = [r["node_id"] for r in results]
     context = kg.get_context_window(seed_ids, depth=depth, max_nodes=max_nodes)
+    logger.debug(
+        "build_context: %d seed nodes expanded to %d nodes, %d edges (depth=%d)",
+        len(seed_ids), len(context["nodes"]), len(context["edges"]), depth,
+    )
 
     lines: list[str] = []
     lines.append(f"## Knowledge Graph Context ({len(context['nodes'])} nodes, "
@@ -149,8 +156,10 @@ def ask(
     Returns:
         The LLM's answer string.
     """
+    t0 = time.monotonic()
     context = build_context(kg, question, embed_fn, max_nodes=max_nodes)
-    logger.debug("Context length: %d chars", len(context))
+    ctx_elapsed = time.monotonic() - t0
+    logger.debug("Context length: %d chars (%.2fs)", len(context), ctx_elapsed)
 
     prompt = (
         f"You are a helpful assistant. Use the following knowledge graph "
@@ -163,7 +172,11 @@ def ask(
 
     logger.debug("Full prompt (%d chars):\n%s", len(prompt), prompt)
 
-    return llm_fn(prompt)
+    t1 = time.monotonic()
+    answer = llm_fn(prompt)
+    llm_elapsed = time.monotonic() - t1
+    logger.debug("LLM answer: %d chars (%.1fs)", len(answer), llm_elapsed)
+    return answer
 
 
 # ---------------------------------------------------------------------------
@@ -185,10 +198,25 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        body = json.loads(resp.read())
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"Chat request failed (HTTP {exc.code}): "
+            f"POST {endpoint} with model '{model}'. "
+            f"Check that the Ollama server is running at {url} "
+            f"and the model '{model}' is available (ollama list)."
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {endpoint}: {exc.reason}. "
+            f"Is the server running?"
+        ) from exc
+    elapsed = time.monotonic() - t0
     answer = body.get("message", {}).get("content", "").strip()
-    logger.debug("ollama_chat: response=%d chars", len(answer))
+    logger.debug("ollama_chat: response=%d chars (%.1fs)", len(answer), elapsed)
     return answer
 
 
