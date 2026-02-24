@@ -58,14 +58,29 @@ def ollama_embed(
     Returns:
         One embedding vector per input text, in the same order.
     """
+    endpoint = f"{url.rstrip('/')}/api/embed"
     payload = json.dumps({"model": model, "input": texts}).encode()
     req = urllib.request.Request(
-        f"{url.rstrip('/')}/api/embed",
+        endpoint,
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        body = json.loads(resp.read())
+    logger.debug("ollama_embed: POST %s  model=%s  texts=%d", endpoint, model, len(texts))
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"Embedding request failed (HTTP {exc.code}): "
+            f"POST {endpoint} with model '{model}'. "
+            f"Check that the Ollama server is running at {url} "
+            f"and the model '{model}' is available (ollama list)."
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {endpoint}: {exc.reason}. "
+            f"Is the server running?"
+        ) from exc
     return body["embeddings"]
 
 

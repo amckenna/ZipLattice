@@ -262,6 +262,7 @@ def main() -> None:
     # Build embed function for query-time use
     embed_url = args.embed_url.rstrip("/")
     embed_model = args.embed_model
+    logger.info("Embed config: model='%s' url='%s'", embed_model, embed_url)
 
     # Warn if the query embed model doesn't match what was used to build the graph
     if kg.embed_model and kg.embed_model != embed_model:
