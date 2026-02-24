@@ -53,13 +53,23 @@ def search_nodes(
     Returns:
         List of result dicts from ``kg.search()``.
     """
-    return kg.search(
+    logger.debug(
+        "search_nodes: %d embeddings loaded, %d nodes in graph",
+        len(kg._embeddings), len(kg._data["nodes"]),
+    )
+    results = kg.search(
         query,
         embed_fn,
         top_k=top_k,
         node_types=node_types,
         expand_depth=expand_depth,
     )
+    logger.debug("search_nodes: %d results returned", len(results))
+    for r in results[:5]:
+        logger.debug(
+            "  %.4f  %s  (%s)", r["similarity"], r["label"], r["node_id"],
+        )
+    return results
 
 
 def build_context(
@@ -197,8 +207,8 @@ def main() -> None:
                         help="Ollama model for LLM query/chat (default: qwen3-coder:30b)")
     shared.add_argument("--ollama-url", default="http://localhost:11434",
                         help="Ollama server URL (default: http://localhost:11434)")
-    shared.add_argument("--embed-url", default="http://localhost:11434", metavar="URL",
-                        help="Ollama server URL for embeddings (default: http://localhost:11434)")
+    shared.add_argument("--embed-url", default=None, metavar="URL",
+                        help="Ollama server URL for embeddings (default: same as --ollama-url)")
     shared.add_argument("--embed-model", default=None, metavar="MODEL",
                         help="Ollama embedding model for query embedding "
                              "(default: auto-detect from graph, or nomic-embed-text)")
@@ -251,6 +261,10 @@ def main() -> None:
     sub.add_parser("stats", help="Print graph statistics")
 
     args = parser.parse_args()
+
+    # Default --embed-url to --ollama-url when not explicitly set
+    if args.embed_url is None:
+        args.embed_url = args.ollama_url
 
     # Logging
     if args.verbose:

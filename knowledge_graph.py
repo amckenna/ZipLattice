@@ -2146,6 +2146,13 @@ TEXT:
             stats["errors"].append(f"LLM returned non-list: {type(triples)}")
             return stats
 
+        if triples:
+            logger.debug(
+                "First triple from doc '%s' (type=%s): %s",
+                doc_id, type(triples[0]).__name__,
+                str(triples[0])[:300],
+            )
+
         known_relations = self._valid_relations()
         doc_slug = slugify(doc_id)
         entity_ids: set[str] = set()
@@ -2212,6 +2219,13 @@ TEXT:
                 source_label = triple.get("source", "").strip()
                 target_label = triple.get("target", "").strip()
                 if not source_label or not target_label:
+                    stats["errors"].append(
+                        f"Triple missing source/target: keys={list(triple.keys())} — {str(triple)[:200]}"
+                    )
+                    logger.debug(
+                        "Skipping triple with empty source/target: %s",
+                        str(triple)[:200],
+                    )
                     continue
 
                 source_id = slugify(source_label)
@@ -4362,8 +4376,8 @@ def main():
                         help="Ollama model for LLM extraction during ingestion (default: qwen3-coder:30b)")
     parser.add_argument("--ollama-url", default="http://localhost:11434",
                         help="Ollama server URL for LLM extraction (default: http://localhost:11434)")
-    parser.add_argument("--embed-url", default="http://localhost:11434", metavar="URL",
-                        help="Ollama server URL for embeddings (default: http://localhost:11434)")
+    parser.add_argument("--embed-url", default=None, metavar="URL",
+                        help="Ollama server URL for embeddings (default: same as --ollama-url)")
     parser.add_argument("--embed-model", default=None, metavar="MODEL",
                         help="Ollama embedding model for node embeddings during ingestion "
                              "(default: auto-detect from graph, or nomic-embed-text)")
@@ -4380,6 +4394,10 @@ def main():
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress per-section output; only show final summary and errors")
     args = parser.parse_args()
+
+    # Default --embed-url to --ollama-url when not explicitly set
+    if args.embed_url is None:
+        args.embed_url = args.ollama_url
 
     # Configure logging level from CLI flags
     if args.verbose:
@@ -4637,14 +4655,24 @@ def main():
                 elif ev == "section_done":
                     elapsed = event.get("elapsed_seconds", 0)
                     triples = event.get("triples", 0)
+                    nodes_added = event.get("nodes_added", 0)
                     errors = event.get("errors", [])
-                    if errors:
-                        print(f" FAILED ({elapsed}s)")
+                    if errors and nodes_added == 0 and triples > 0:
+                        print(f" {triples} triples → 0 nodes ({len(errors)} errors, {elapsed}s)")
                         if _verbose:
-                            for err in errors:
+                            for err in errors[:5]:
                                 print(f"         {err}")
+                            if len(errors) > 5:
+                                print(f"         ... and {len(errors) - 5} more")
+                    elif errors:
+                        print(f" {triples} triples → {nodes_added} nodes ({len(errors)} errors, {elapsed}s)")
+                        if _verbose:
+                            for err in errors[:5]:
+                                print(f"         {err}")
+                            if len(errors) > 5:
+                                print(f"         ... and {len(errors) - 5} more")
                     else:
-                        print(f" {triples} triples ({elapsed}s)")
+                        print(f" {triples} triples → {nodes_added} nodes ({elapsed}s)")
 
             stats = kg.ingest_markdown(
                 text,
@@ -4692,6 +4720,7 @@ def main():
             print(f"  Document ID: {stats['doc_id']}")
             print(f"  Sections: {stats['total_sections']}")
             print(f"  Triples extracted: {stats['total_triples']}")
+            print(f"  Nodes added: {stats['total_nodes_added']}, Edges added: {stats['total_edges_added']}")
             print(f"  Total time: {_total_elapsed:.1f}s")
             print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
             if _embed_stats and _embed_stats["nodes_embedded"]:
@@ -4726,9 +4755,16 @@ def main():
                     else:
                         triples_info = ""
                         n_triples = sec_stat.get("triples_processed", 0)
+                        n_nodes = sec_stat.get("nodes_added", 0)
+                        n_errors = len(sec_stat.get("errors", []))
                         if n_triples:
                             triples_info = f", {n_triples} triples"
-                        print(f"    [ok]   {heading} ({sec_stat.get('char_count', 0):,} chars{triples_info}{elapsed_str})")
+                        if n_triples and n_nodes == 0 and n_errors:
+                            tag = "WARN"
+                            triples_info += f", 0 nodes, {n_errors} errors"
+                        else:
+                            tag = "ok"
+                        print(f"    [{tag}]   {heading} ({sec_stat.get('char_count', 0):,} chars{triples_info}{elapsed_str})")
 
             if stats["errors"]:
                 print(f"\n  Errors ({len(stats['errors'])}):")
