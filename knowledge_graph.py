@@ -3142,6 +3142,7 @@ TEXT:
         depth: int = 1,
         max_nodes: int = 50,
         include_embeddings: bool = False,
+        boundary_edges: bool = False,
     ) -> dict[str, Any]:
         """
         Build a context payload for LLM consumption.
@@ -3154,6 +3155,10 @@ TEXT:
             depth: How many hops to traverse from each seed.
             max_nodes: Cap on total nodes returned.
             include_embeddings: Whether to include embedding vectors.
+            boundary_edges: If True, include edges where *at least one*
+                endpoint is in the node set (not just edges where both
+                endpoints are present).  This surfaces relationships to
+                nodes just outside the context window.
 
         Returns:
             A dict ready for json.dumps() and injection into an LLM prompt.
@@ -3174,6 +3179,14 @@ TEXT:
         )[:max_nodes]
 
         node_set = set(sorted_ids)
+        if boundary_edges:
+            edge_filter = lambda e: (
+                e["source"] in node_set or e["target"] in node_set
+            )
+        else:
+            edge_filter = lambda e: (
+                e["source"] in node_set and e["target"] in node_set
+            )
         context: dict[str, Any] = {
             "nodes": {
                 nid: deepcopy(self._data["nodes"][nid])
@@ -3183,7 +3196,7 @@ TEXT:
             "edges": [
                 deepcopy(e)
                 for e in self._data["edges"]
-                if e["source"] in node_set and e["target"] in node_set
+                if edge_filter(e)
             ],
         }
 

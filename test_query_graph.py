@@ -637,3 +637,112 @@ def test_cli_embed_url_explicit_override(kg_path):
     combined = result.stdout + result.stderr
     # The embed config should show the explicit embed URL, not the LLM URL
     assert "http://embed-host:8888" in combined
+
+
+# ---------------------------------------------------------------------------
+# Rich context tests (edge context, section body, descriptions, boundary edges)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rich_kg(tmp_path):
+    """Graph with edge context strings, section body text, and descriptions."""
+    path = str(tmp_path / "rich_graph.json")
+    kg = KnowledgeGraph(path)
+
+    # Section node with body text
+    kg.add_node("sec-polarization", type="section", label="Polarization",
+                properties={
+                    "body_text": "SAR sensors transmit linearly polarized waves. "
+                                 "Polarization affects how radar signals interact "
+                                 "with surface features.",
+                    "path": ["SAR Guide", "Polarization"],
+                })
+
+    # Concept nodes with descriptions
+    kg.add_node("sar", type="concept", label="Synthetic Aperture Radar",
+                properties={"description": "An imaging radar using motion to synthesize a large antenna"})
+    kg.add_node("polarization", type="concept", label="Polarization",
+                properties={"description": "Orientation of the electromagnetic wave"})
+    kg.add_node("hh-pol", type="concept", label="HH Polarization",
+                properties={"description": "Horizontal transmit, horizontal receive"})
+
+    # Node outside the search window (low similarity) to test boundary edges
+    kg.add_node("vegetation", type="concept", label="Vegetation",
+                properties={"description": "Plant cover on the surface"})
+
+    # Edges with context sentences
+    kg.add_edge("sar", "polarization", relation="uses",
+                properties={"context": "SAR systems use polarization to distinguish surface types."})
+    kg.add_edge("polarization", "hh-pol", relation="has_subtype",
+                properties={"context": "HH is one of four standard polarization modes."})
+    # Edge to a node that won't be in top search results
+    kg.add_edge("polarization", "vegetation", relation="interacts_with",
+                properties={"context": "Polarization affects backscatter from vegetation canopies."})
+
+    # Embeddings: sar and sec-polarization close to query, vegetation far away
+    kg.set_embedding("sec-polarization", _unit([0.9, 0.1, 0.0, 0.0]))
+    kg.set_embedding("sar",              _unit([0.85, 0.15, 0.0, 0.0]))
+    kg.set_embedding("polarization",     _unit([0.8, 0.2, 0.0, 0.0]))
+    kg.set_embedding("hh-pol",           _unit([0.7, 0.3, 0.0, 0.0]))
+    kg.set_embedding("vegetation",       _unit([0.1, 0.1, 0.8, 0.1]))
+
+    kg.save_all()
+    return kg
+
+
+def test_build_context_includes_descriptions(rich_kg):
+    """Verify node descriptions appear in the context output."""
+    ctx = build_context(rich_kg, "SAR polarization", fake_embed, max_nodes=5)
+    assert "An imaging radar using motion" in ctx
+    assert "Orientation of the electromagnetic wave" in ctx
+
+
+def test_build_context_includes_section_body(rich_kg):
+    """Verify section body text is included and truncated."""
+    ctx = build_context(rich_kg, "SAR polarization", fake_embed, max_nodes=5)
+    assert "Content:" in ctx
+    assert "linearly polarized waves" in ctx
+
+
+def test_build_context_includes_section_body_truncated(rich_kg):
+    """Verify very long body text gets truncated."""
+    # Override the section body with something huge
+    rich_kg._data["nodes"]["sec-polarization"]["properties"]["body_text"] = "x" * 2000
+    rich_kg._rebuild_networkx()
+
+    ctx = build_context(rich_kg, "SAR", fake_embed, max_nodes=5, max_body_chars=100)
+    # Should be truncated with "..."
+    assert "..." in ctx
+    # Should not contain the full 2000 chars
+    assert "x" * 200 not in ctx
+
+
+def test_build_context_includes_edge_context(rich_kg):
+    """Verify edge context sentences appear in the formatted context."""
+    ctx = build_context(rich_kg, "SAR polarization", fake_embed, max_nodes=5)
+    assert "SAR systems use polarization to distinguish surface types." in ctx
+    assert "HH is one of four standard polarization modes." in ctx
+
+
+def test_build_context_includes_boundary_edges(rich_kg):
+    """Verify edges to nodes outside the context window are included."""
+    # With max_nodes=4 and vegetation having low similarity, it should
+    # fall outside the node set. But the edge polarization→vegetation
+    # should still appear as a boundary edge.
+    ctx = build_context(rich_kg, "SAR polarization", fake_embed, max_nodes=4)
+    assert "vegetation" in ctx.lower()
+    assert "(external)" in ctx
+    assert "backscatter from vegetation" in ctx
+
+
+def test_build_context_boundary_edge_labels_external(rich_kg):
+    """Verify boundary nodes are marked '(external)' in edge lines."""
+    ctx = build_context(rich_kg, "SAR polarization", fake_embed, max_nodes=4)
+    # Find the boundary edge line
+    for line in ctx.splitlines():
+        if "vegetation" in line and "--[" in line:
+            assert "(external)" in line
+            break
+    else:
+        pytest.fail("Expected a boundary edge line containing 'vegetation'")
