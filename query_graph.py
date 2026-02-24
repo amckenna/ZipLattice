@@ -151,6 +151,8 @@ def ask(
         f"Answer:"
     )
 
+    logger.debug("Full prompt (%d chars):\n%s", len(prompt), prompt)
+
     return llm_fn(prompt)
 
 
@@ -161,19 +163,23 @@ def ask(
 
 def ollama_chat(prompt: str, *, model: str, url: str) -> str:
     """Call Ollama ``/api/chat`` with a single user message."""
+    endpoint = f"{url.rstrip('/')}/api/chat"
+    logger.debug("ollama_chat: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
     }).encode()
     req = urllib.request.Request(
-        f"{url.rstrip('/')}/api/chat",
+        endpoint,
         data=payload,
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=600) as resp:
         body = json.loads(resp.read())
-    return body.get("message", {}).get("content", "").strip()
+    answer = body.get("message", {}).get("content", "").strip()
+    logger.debug("ollama_chat: response=%d chars", len(answer))
+    return answer
 
 
 # ---------------------------------------------------------------------------
@@ -193,8 +199,9 @@ def main() -> None:
                         help="Ollama server URL (default: http://localhost:11434)")
     shared.add_argument("--embed-url", default="http://localhost:11434", metavar="URL",
                         help="Ollama server URL for embeddings (default: http://localhost:11434)")
-    shared.add_argument("--embed-model", default="nomic-embed-text", metavar="MODEL",
-                        help="Ollama embedding model for query embedding (default: nomic-embed-text)")
+    shared.add_argument("--embed-model", default=None, metavar="MODEL",
+                        help="Ollama embedding model for query embedding "
+                             "(default: auto-detect from graph, or nomic-embed-text)")
     shared.add_argument("--top-k", type=int, default=10, help="Number of search results")
     shared.add_argument("--depth", type=int, default=1, help="Neighborhood expansion depth")
     shared.add_argument("--node-types", nargs="+", metavar="TYPE",
@@ -261,17 +268,26 @@ def main() -> None:
 
     # Build embed function for query-time use
     embed_url = args.embed_url.rstrip("/")
-    embed_model = args.embed_model
-    logger.info("Embed config: model='%s' url='%s'", embed_model, embed_url)
 
-    # Warn if the query embed model doesn't match what was used to build the graph
-    if kg.embed_model and kg.embed_model != embed_model:
-        logger.warning(
-            "Embedding model mismatch: graph was embedded with '%s' "
-            "but query is using '%s'. Results will be unreliable. "
-            "Use --embed-model %s to match.",
-            kg.embed_model, embed_model, kg.embed_model,
-        )
+    # Resolve embed model: prefer explicit CLI flag, then graph metadata, then fallback
+    if args.embed_model is not None:
+        embed_model = args.embed_model
+        # Warn if explicitly set model doesn't match what was used to build the graph
+        if kg.embed_model and kg.embed_model != embed_model:
+            logger.warning(
+                "Embedding model mismatch: graph was embedded with '%s' "
+                "but query is using '%s'. Results will be unreliable. "
+                "Use --embed-model %s to match.",
+                kg.embed_model, embed_model, kg.embed_model,
+            )
+    elif kg.embed_model:
+        embed_model = kg.embed_model
+        logger.info("Using embed model '%s' from graph metadata", embed_model)
+    else:
+        embed_model = "nomic-embed-text"
+        logger.info("No embed model in graph metadata, falling back to '%s'", embed_model)
+
+    logger.info("Embed config: model='%s' url='%s'", embed_model, embed_url)
 
     def embed_fn(texts: list[str]) -> list[list[float]]:
         return ollama_embed(texts, model=embed_model, url=embed_url)
