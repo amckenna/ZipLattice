@@ -81,6 +81,7 @@ def build_context(
     *,
     max_nodes: int = 30,
     depth: int = 1,
+    max_body_chars: int = 500,
 ) -> str:
     """Search the graph and format a context block for an LLM prompt.
 
@@ -90,6 +91,7 @@ def build_context(
         embed_fn: Embedding function for the query text.
         max_nodes: Maximum number of nodes in the context window.
         depth: Neighborhood expansion depth.
+        max_body_chars: Truncate section body text to this many characters.
 
     Returns:
         A formatted text block suitable for injecting into an LLM prompt.
@@ -100,29 +102,41 @@ def build_context(
         return "(No relevant nodes found in the knowledge graph.)"
 
     seed_ids = [r["node_id"] for r in results]
-    context = kg.get_context_window(seed_ids, depth=depth, max_nodes=max_nodes)
+    context = kg.get_context_window(
+        seed_ids, depth=depth, max_nodes=max_nodes, boundary_edges=True,
+    )
     logger.debug(
         "build_context: %d seed nodes expanded to %d nodes, %d edges (depth=%d)",
         len(seed_ids), len(context["nodes"]), len(context["edges"]), depth,
     )
+
+    node_set = set(context["nodes"])
 
     lines: list[str] = []
     lines.append(f"## Knowledge Graph Context ({len(context['nodes'])} nodes, "
                  f"{len(context['edges'])} edges)")
     lines.append("")
 
-    # Nodes
+    # Nodes — include descriptions and section body text
     for nid, ndata in context["nodes"].items():
         label = ndata.get("label", nid)
         ntype = ndata.get("type", "concept")
         conf = ndata.get("confidence", 1.0)
-        desc = ndata.get("properties", {}).get("description", "")
+        props = ndata.get("properties", {})
+        desc = props.get("description", "")
         line = f"- [{ntype}] {label} (id={nid}, confidence={conf:.2f})"
         if desc:
             line += f"\n    {desc}"
+        # Include section body text (truncated) so the LLM gets real content
+        if ntype == "section":
+            body = props.get("body_text", "")
+            if body:
+                if len(body) > max_body_chars:
+                    body = body[:max_body_chars] + "..."
+                line += f"\n    Content: {body}"
         lines.append(line)
 
-    # Edges
+    # Edges — include context sentences and label boundary nodes
     if context["edges"]:
         lines.append("")
         lines.append("### Relationships")
@@ -130,7 +144,19 @@ def build_context(
             src = edge.get("source", "?")
             tgt = edge.get("target", "?")
             rel = edge.get("relation", "related_to")
-            lines.append(f"- {src} --[{rel}]--> {tgt}")
+            # Mark nodes outside the context window for clarity
+            src_label = src
+            tgt_label = tgt
+            if src not in node_set:
+                src_label = f"{src} (external)"
+            if tgt not in node_set:
+                tgt_label = f"{tgt} (external)"
+            edge_line = f"- {src_label} --[{rel}]--> {tgt_label}"
+            # Append the source sentence so the LLM gets real evidence
+            ctx = edge.get("properties", {}).get("context", "")
+            if ctx:
+                edge_line += f"\n    \"{ctx}\""
+            lines.append(edge_line)
 
     return "\n".join(lines)
 
