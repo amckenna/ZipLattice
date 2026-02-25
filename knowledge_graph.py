@@ -2175,6 +2175,35 @@ TEXT:
             )
             return stats
 
+        # Detect off-topic responses: if no triple has any recognized key,
+        # the model returned garbage unrelated to the extraction prompt.
+        if triples:
+            _EXPECTED_KEYS = {
+                "source", "subject", "head", "from", "entity1",
+                "target", "object", "tail", "to", "entity2",
+                "relation", "predicate", "relationship", "rel",
+            }
+            _has_valid = any(
+                isinstance(t, dict) and _EXPECTED_KEYS & t.keys()
+                for t in triples
+            )
+            if not _has_valid:
+                sample_keys = set()
+                for t in triples[:3]:
+                    if isinstance(t, dict):
+                        sample_keys.update(t.keys())
+                stats["errors"].append(
+                    f"LLM returned {len(triples)} item(s) with no recognized triple keys "
+                    f"(got keys: {sorted(sample_keys)[:10]}). "
+                    f"Model may have ignored the extraction prompt."
+                )
+                logger.warning(
+                    "Off-topic response for doc '%s': %d items, keys=%s, first=%s",
+                    doc_id, len(triples), sorted(sample_keys)[:10],
+                    str(triples[0])[:200] if triples else "?",
+                )
+                return stats
+
         if triples:
             logger.debug(
                 "First triple from doc '%s' (type=%s): %s",
@@ -4397,10 +4426,22 @@ def _salvage_truncated_json(raw: str) -> list[dict[str, Any]] | None:
     e.g. ``[{...}, {... <eof>``. This finds the last complete object
     boundary and closes the array so the valid prefix can be parsed.
 
+    Also handles dict-wrapped arrays (e.g. ``{"entities": [{...}, {... <eof>``).
+    In that case, the inner array is located and salvaged.
+
     Returns the list of recovered dicts, or None if recovery fails.
     """
-    # Must start with '['
-    if not raw.lstrip().startswith("["):
+    stripped = raw.lstrip()
+
+    # Handle dict-wrapped arrays: find the first '[' inside the object
+    if stripped.startswith("{"):
+        arr_start = raw.find("[")
+        if arr_start == -1:
+            return None
+        # Extract from the array start and recurse on the inner array
+        return _salvage_truncated_json(raw[arr_start:])
+
+    if not stripped.startswith("["):
         return None
 
     # Walk backwards from the end to find the last '}' that could
