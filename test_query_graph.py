@@ -190,10 +190,13 @@ def test_ask_includes_context(kg):
 
 
 def test_ollama_embed_request():
-    """Verify ollama_embed sends the correct HTTP request."""
+    """Verify ollama_embed sends the correct HTTP request (OpenAI format)."""
     mock_response = MagicMock()
     mock_response.read.return_value = json.dumps({
-        "embeddings": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+        "data": [
+            {"embedding": [0.1, 0.2, 0.3], "index": 0},
+            {"embedding": [0.4, 0.5, 0.6], "index": 1},
+        ]
     }).encode()
     mock_response.__enter__ = lambda s: s
     mock_response.__exit__ = MagicMock(return_value=False)
@@ -205,7 +208,7 @@ def test_ollama_embed_request():
     # Check the request was made correctly
     call_args = mock_urlopen.call_args
     req = call_args[0][0]
-    assert "/api/embed" in req.full_url
+    assert "/v1/embeddings" in req.full_url
     body = json.loads(req.data)
     assert body["model"] == "test-model"
     assert body["input"] == ["hello", "world"]
@@ -294,50 +297,51 @@ def _mock_urlopen_response(body_dict):
     return mock_resp
 
 
+def _openai_chat_response(content):
+    """Build an OpenAI-format chat completion response dict."""
+    return {"choices": [{"message": {"content": content}}]}
+
+
 def test_ollama_chat_basic():
     """Verify ollama_chat extracts response content correctly."""
-    mock_resp = _mock_urlopen_response({
-        "message": {"content": "Hello from Ollama"}
-    })
+    mock_resp = _mock_urlopen_response(_openai_chat_response("Hello from LLM"))
     with patch("query_graph.urllib.request.urlopen", return_value=mock_resp):
         result = ollama_chat("test prompt", model="llama2", url="http://localhost:11434")
-    assert result == "Hello from Ollama"
+    assert result == "Hello from LLM"
 
 
 def test_ollama_chat_strips_whitespace():
     """Verify leading/trailing whitespace is stripped from the response."""
-    mock_resp = _mock_urlopen_response({
-        "message": {"content": "  spaced answer  \n"}
-    })
+    mock_resp = _mock_urlopen_response(_openai_chat_response("  spaced answer  \n"))
     with patch("query_graph.urllib.request.urlopen", return_value=mock_resp):
         result = ollama_chat("test", model="m", url="http://localhost:11434")
     assert result == "spaced answer"
 
 
 def test_ollama_chat_missing_content():
-    """Returns empty string when content field is missing."""
-    mock_resp = _mock_urlopen_response({"message": {}})
+    """Raises KeyError when content field is missing (OpenAI format)."""
+    mock_resp = _mock_urlopen_response({"choices": [{"message": {}}]})
     with patch("query_graph.urllib.request.urlopen", return_value=mock_resp):
-        result = ollama_chat("test", model="m", url="http://localhost:11434")
-    assert result == ""
+        with pytest.raises(KeyError):
+            ollama_chat("test", model="m", url="http://localhost:11434")
 
 
 def test_ollama_chat_missing_message():
-    """Returns empty string when message key doesn't exist."""
-    mock_resp = _mock_urlopen_response({})
+    """Raises KeyError when choices are empty (OpenAI format)."""
+    mock_resp = _mock_urlopen_response({"choices": []})
     with patch("query_graph.urllib.request.urlopen", return_value=mock_resp):
-        result = ollama_chat("test", model="m", url="http://localhost:11434")
-    assert result == ""
+        with pytest.raises(IndexError):
+            ollama_chat("test", model="m", url="http://localhost:11434")
 
 
 def test_ollama_chat_payload_format():
     """Verify the JSON payload sent to the server."""
-    mock_resp = _mock_urlopen_response({"message": {"content": "ok"}})
+    mock_resp = _mock_urlopen_response(_openai_chat_response("ok"))
     with patch("query_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
         ollama_chat("test prompt", model="llama2", url="http://localhost:11434")
 
     req = mock_urlopen.call_args[0][0]
-    assert req.full_url == "http://localhost:11434/api/chat"
+    assert req.full_url == "http://localhost:11434/v1/chat/completions"
     body = json.loads(req.data)
     assert body["model"] == "llama2"
     assert body["messages"] == [{"role": "user", "content": "test prompt"}]
@@ -346,18 +350,18 @@ def test_ollama_chat_payload_format():
 
 def test_ollama_chat_trailing_slash():
     """Verify trailing slash in URL is handled correctly."""
-    mock_resp = _mock_urlopen_response({"message": {"content": "ok"}})
+    mock_resp = _mock_urlopen_response(_openai_chat_response("ok"))
     with patch("query_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
         ollama_chat("test", model="m", url="http://localhost:11434/")
 
     req = mock_urlopen.call_args[0][0]
-    assert req.full_url == "http://localhost:11434/api/chat"
+    assert req.full_url == "http://localhost:11434/v1/chat/completions"
 
 
 def test_ollama_chat_http_error():
     """Verify HTTPError is wrapped in RuntimeError with helpful message."""
     exc = urllib.error.HTTPError(
-        "http://localhost:11434/api/chat", 404, "Not Found", {}, None
+        "http://localhost:11434/v1/chat/completions", 404, "Not Found", {}, None
     )
     with patch("query_graph.urllib.request.urlopen", side_effect=exc):
         with pytest.raises(RuntimeError, match="HTTP 404"):

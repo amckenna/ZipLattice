@@ -48,7 +48,11 @@ def _make_extract_fn(
     ollama_url: str,
     verbose: bool = False,
 ) -> Callable[[str], list[dict[str, Any]]]:
-    """Build an LLM extraction function for the given model."""
+    """Build an LLM extraction function for the given model.
+
+    Uses the OpenAI-compatible ``/v1/chat/completions`` endpoint, which
+    works with Ollama (>=0.1.14), llama.cpp, vLLM, LocalAI, etc.
+    """
 
     def extract(prompt: str) -> list[dict[str, Any]]:
         if verbose:
@@ -68,19 +72,21 @@ def _make_extract_fn(
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
-            "format": "json",
-            "options": {"temperature": 0.1, "num_predict": 32768},
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+            "max_tokens": 32768,
         }).encode()
 
         req = urllib.request.Request(
-            f"{ollama_url}/api/chat",
+            f"{ollama_url}/v1/chat/completions",
             data=payload,
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=1200) as resp:
             body = json.loads(resp.read())
 
-        raw = body.get("message", {}).get("content", "").strip()
+        # OpenAI format: choices[0].message.content
+        raw = body["choices"][0]["message"]["content"].strip()
         if verbose:
             logger.debug("[%s] Raw response length: %d chars", model, len(raw))
         if not raw:
@@ -403,7 +409,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   python benchmark_models.py doc.md --models qwen3-coder:30b gemma3:27b
-  python benchmark_models.py docs/*.md --models modelA modelB --ollama-url http://exo:11434
+  python benchmark_models.py docs/*.md --models modelA modelB --api-url http://exo:11434
   python benchmark_models.py doc.md --models modelA modelB --json
   python benchmark_models.py doc.md --models modelA modelB --max-sections 5
 """,
@@ -411,9 +417,11 @@ def main():
     parser.add_argument("files", nargs="+", metavar="FILE",
                         help="Markdown file(s) to benchmark")
     parser.add_argument("--models", nargs="+", required=True, metavar="MODEL",
-                        help="Ollama model names to compare")
-    parser.add_argument("--ollama-url", default="http://localhost:11434",
-                        help="Ollama server URL (default: http://localhost:11434)")
+                        help="Model names to compare")
+    parser.add_argument("--api-url", "--ollama-url", default="http://localhost:11434",
+                        dest="ollama_url",
+                        help="OpenAI-compatible API server URL (works with Ollama, llama.cpp, vLLM, etc.) "
+                             "(default: http://localhost:11434)")
     parser.add_argument("--max-sections", type=int, default=None, metavar="N",
                         help="Limit to first N sections per file (quick test)")
     parser.add_argument("--json", action="store_true", dest="json_output",
