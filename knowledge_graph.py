@@ -2182,6 +2182,8 @@ TEXT:
                 "source", "subject", "head", "from", "entity1",
                 "target", "object", "tail", "to", "entity2",
                 "relation", "predicate", "relationship", "rel",
+                # Glossary-style keys (converted to triples downstream)
+                "Concept", "concept", "Term", "term", "Name", "name",
             }
             _has_valid = any(
                 isinstance(t, dict) and _EXPECTED_KEYS & t.keys()
@@ -2294,6 +2296,44 @@ TEXT:
                 for old_key, new_key in _KEY_ALIASES.items():
                     if old_key in triple and new_key not in triple:
                         triple[new_key] = triple.pop(old_key)
+
+                # Convert glossary-style dicts into triples.
+                # Some models return {Concept, Definition, Example} or
+                # {term, definition} instead of source/target triples.
+                # We convert these into "concept -[defined_in]-> doc" triples
+                # with the definition stored as the entity description.
+                _concept_key = None
+                for _ck in ("Concept", "concept", "Term", "term", "Name", "name"):
+                    if _ck in triple and "source" not in triple:
+                        _concept_key = _ck
+                        break
+                if _concept_key is not None:
+                    _concept_name = str(triple[_concept_key]).strip()
+                    _definition = ""
+                    for _dk in ("Definition", "definition", "Description", "description"):
+                        if _dk in triple:
+                            _definition = str(triple[_dk]).strip()
+                            break
+                    _example = ""
+                    for _ek in ("Example", "example", "Examples", "examples"):
+                        if _ek in triple:
+                            _example = str(triple[_ek]).strip()
+                            break
+                    if _concept_name:
+                        triple = {
+                            "source": _concept_name,
+                            "source_type": triple.get("source_type", "concept"),
+                            "source_description": _definition,
+                            "target": doc_id.split("::")[-1] if "::" in doc_id else doc_id,
+                            "target_type": "section" if "::" in doc_id else "document",
+                            "relation": "defined_in",
+                            "confidence": 0.7,
+                            "context": _example or _definition,
+                        }
+                        logger.debug(
+                            "Converted glossary entry from doc '%s': %s → %s",
+                            doc_id, _concept_name, triple["target"],
+                        )
 
                 source_label = triple.get("source", "").strip()
                 target_label = triple.get("target", "").strip()
