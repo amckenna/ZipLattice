@@ -12,6 +12,7 @@ ZipLattice is a portable, JSON-backed knowledge graph manager built on NetworkX.
 knowledge_graph.py       # Knowledge graph library and CLI (single-file)
 query_graph.py           # Knowledge graph query application (search, RAG, CLI)
 test_query_graph.py      # Tests for query_graph.py
+benchmark_models.py      # Model comparison tool for extraction quality
 convert_to_markdown.py   # Standalone document-to-Markdown converter (single-file)
 README.md                # Project documentation
 LICENSE                  # MIT license
@@ -74,6 +75,12 @@ python query_graph.py <path-to-graph.json> node <node-id>
 python query_graph.py <path-to-graph.json> neighbors <node-id> --depth 2
 python query_graph.py <path-to-graph.json> path <source-id> <target-id>
 python query_graph.py <path-to-graph.json> stats
+
+# Model benchmark CLI
+python benchmark_models.py doc.md --models qwen3-coder:30b gemma3:27b llama3.1:70b
+python benchmark_models.py docs/*.md --models modelA modelB --ollama-url http://exo:11434
+python benchmark_models.py doc.md --models modelA modelB --json
+python benchmark_models.py doc.md --models modelA modelB --max-sections 5  # quick test
 
 # Document converter CLI
 python convert_to_markdown.py document.pdf -o document.md

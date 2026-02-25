@@ -2175,6 +2175,98 @@ TEXT:
             )
             return stats
 
+        # Detect off-topic responses: if no triple has any recognized key,
+        # the model returned garbage unrelated to the extraction prompt.
+        if triples:
+            _EXPECTED_KEYS = {
+                "source", "subject", "head", "from", "entity1",
+                "target", "object", "tail", "to", "entity2",
+                "relation", "predicate", "relationship", "rel",
+                # Glossary-style keys (converted to triples downstream)
+                "Concept", "concept", "Term", "term", "Name", "name",
+            }
+            _has_valid = any(
+                isinstance(t, dict) and _EXPECTED_KEYS & t.keys()
+                for t in triples
+            )
+            if not _has_valid:
+                sample_keys = set()
+                for t in triples[:3]:
+                    if isinstance(t, dict):
+                        sample_keys.update(t.keys())
+                stats["errors"].append(
+                    f"LLM returned {len(triples)} item(s) with no recognized triple keys "
+                    f"(got keys: {sorted(sample_keys)[:10]}). "
+                    f"Model may have ignored the extraction prompt."
+                )
+                logger.warning(
+                    "Off-topic response for doc '%s': %d items, keys=%s, first=%s",
+                    doc_id, len(triples), sorted(sample_keys)[:10],
+                    str(triples[0])[:200] if triples else "?",
+                )
+                return stats
+
+        # Detect hallucinated responses: if entity names have no lexical
+        # overlap with the source text, the model fabricated content.
+        # Extract entity names from all recognized key aliases and check
+        # whether their words appear in the input text.
+        if triples:
+            _SRC_KEYS = {"source", "subject", "head", "from", "entity1",
+                         "Concept", "concept", "Term", "term", "Name", "name"}
+            _TGT_KEYS = {"target", "object", "tail", "to", "entity2"}
+            _STOPWORDS = {
+                "the", "and", "for", "that", "this", "with", "are", "was",
+                "were", "been", "being", "have", "has", "had", "does", "did",
+                "will", "would", "could", "should", "may", "might", "can",
+                "shall", "not", "but", "its", "from", "they", "them",
+                "their", "there", "then", "than", "other", "which", "what",
+                "when", "where", "who", "how", "all", "each", "every",
+                "both", "few", "more", "most", "some", "such", "only",
+                "also", "into", "over", "after", "before", "between",
+                "under", "about", "these", "those", "through", "during",
+                "while", "used", "using",
+            }
+            _text_lower = text.lower()
+            _text_words = set(re.findall(r"[a-z]{3,}", _text_lower)) - _STOPWORDS
+            _grounded = 0
+            _checked = 0
+            for t in triples:
+                if not isinstance(t, dict):
+                    continue
+                for _kset in (_SRC_KEYS, _TGT_KEYS):
+                    for _k in _kset:
+                        val = t.get(_k, "")
+                        if not isinstance(val, str) or not val.strip():
+                            continue
+                        _checked += 1
+                        # Entity is grounded if any of its non-stopword tokens
+                        # (3+ chars) appear in the source text
+                        entity_words = set(re.findall(r"[a-z]{3,}", val.lower())) - _STOPWORDS
+                        if entity_words & _text_words:
+                            _grounded += 1
+                        break  # only check first matching key per set
+
+            if _checked >= 4 and _grounded == 0:
+                sample_entities = []
+                for t in triples[:3]:
+                    if isinstance(t, dict):
+                        for _k in ("source", "subject", "head", "Concept",
+                                   "target", "object", "tail"):
+                            if _k in t:
+                                sample_entities.append(str(t[_k])[:50])
+                stats["errors"].append(
+                    f"LLM hallucinated: {_checked} entity mentions checked, "
+                    f"0 grounded in source text. "
+                    f"Sample entities: {sample_entities[:4]}. "
+                    f"Model fabricated content unrelated to the input."
+                )
+                logger.warning(
+                    "Hallucinated response for doc '%s': 0/%d entities grounded, "
+                    "samples=%s",
+                    doc_id, _checked, sample_entities[:4],
+                )
+                return stats
+
         if triples:
             logger.debug(
                 "First triple from doc '%s' (type=%s): %s",
@@ -2265,6 +2357,44 @@ TEXT:
                 for old_key, new_key in _KEY_ALIASES.items():
                     if old_key in triple and new_key not in triple:
                         triple[new_key] = triple.pop(old_key)
+
+                # Convert glossary-style dicts into triples.
+                # Some models return {Concept, Definition, Example} or
+                # {term, definition} instead of source/target triples.
+                # We convert these into "concept -[defined_in]-> doc" triples
+                # with the definition stored as the entity description.
+                _concept_key = None
+                for _ck in ("Concept", "concept", "Term", "term", "Name", "name"):
+                    if _ck in triple and "source" not in triple:
+                        _concept_key = _ck
+                        break
+                if _concept_key is not None:
+                    _concept_name = str(triple[_concept_key]).strip()
+                    _definition = ""
+                    for _dk in ("Definition", "definition", "Description", "description"):
+                        if _dk in triple:
+                            _definition = str(triple[_dk]).strip()
+                            break
+                    _example = ""
+                    for _ek in ("Example", "example", "Examples", "examples"):
+                        if _ek in triple:
+                            _example = str(triple[_ek]).strip()
+                            break
+                    if _concept_name:
+                        triple = {
+                            "source": _concept_name,
+                            "source_type": triple.get("source_type", "concept"),
+                            "source_description": _definition,
+                            "target": doc_id.split("::")[-1] if "::" in doc_id else doc_id,
+                            "target_type": "section" if "::" in doc_id else "document",
+                            "relation": "defined_in",
+                            "confidence": 0.7,
+                            "context": _example or _definition,
+                        }
+                        logger.debug(
+                            "Converted glossary entry from doc '%s': %s → %s",
+                            doc_id, _concept_name, triple["target"],
+                        )
 
                 source_label = triple.get("source", "").strip()
                 target_label = triple.get("target", "").strip()
@@ -4397,10 +4527,22 @@ def _salvage_truncated_json(raw: str) -> list[dict[str, Any]] | None:
     e.g. ``[{...}, {... <eof>``. This finds the last complete object
     boundary and closes the array so the valid prefix can be parsed.
 
+    Also handles dict-wrapped arrays (e.g. ``{"entities": [{...}, {... <eof>``).
+    In that case, the inner array is located and salvaged.
+
     Returns the list of recovered dicts, or None if recovery fails.
     """
-    # Must start with '['
-    if not raw.lstrip().startswith("["):
+    stripped = raw.lstrip()
+
+    # Handle dict-wrapped arrays: find the first '[' inside the object
+    if stripped.startswith("{"):
+        arr_start = raw.find("[")
+        if arr_start == -1:
+            return None
+        # Extract from the array start and recurse on the inner array
+        return _salvage_truncated_json(raw[arr_start:])
+
+    if not stripped.startswith("["):
         return None
 
     # Walk backwards from the end to find the last '}' that could
