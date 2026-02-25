@@ -2206,6 +2206,67 @@ TEXT:
                 )
                 return stats
 
+        # Detect hallucinated responses: if entity names have no lexical
+        # overlap with the source text, the model fabricated content.
+        # Extract entity names from all recognized key aliases and check
+        # whether their words appear in the input text.
+        if triples:
+            _SRC_KEYS = {"source", "subject", "head", "from", "entity1",
+                         "Concept", "concept", "Term", "term", "Name", "name"}
+            _TGT_KEYS = {"target", "object", "tail", "to", "entity2"}
+            _STOPWORDS = {
+                "the", "and", "for", "that", "this", "with", "are", "was",
+                "were", "been", "being", "have", "has", "had", "does", "did",
+                "will", "would", "could", "should", "may", "might", "can",
+                "shall", "not", "but", "its", "from", "they", "them",
+                "their", "there", "then", "than", "other", "which", "what",
+                "when", "where", "who", "how", "all", "each", "every",
+                "both", "few", "more", "most", "some", "such", "only",
+                "also", "into", "over", "after", "before", "between",
+                "under", "about", "these", "those", "through", "during",
+                "while", "used", "using",
+            }
+            _text_lower = text.lower()
+            _text_words = set(re.findall(r"[a-z]{3,}", _text_lower)) - _STOPWORDS
+            _grounded = 0
+            _checked = 0
+            for t in triples:
+                if not isinstance(t, dict):
+                    continue
+                for _kset in (_SRC_KEYS, _TGT_KEYS):
+                    for _k in _kset:
+                        val = t.get(_k, "")
+                        if not isinstance(val, str) or not val.strip():
+                            continue
+                        _checked += 1
+                        # Entity is grounded if any of its non-stopword tokens
+                        # (3+ chars) appear in the source text
+                        entity_words = set(re.findall(r"[a-z]{3,}", val.lower())) - _STOPWORDS
+                        if entity_words & _text_words:
+                            _grounded += 1
+                        break  # only check first matching key per set
+
+            if _checked >= 4 and _grounded == 0:
+                sample_entities = []
+                for t in triples[:3]:
+                    if isinstance(t, dict):
+                        for _k in ("source", "subject", "head", "Concept",
+                                   "target", "object", "tail"):
+                            if _k in t:
+                                sample_entities.append(str(t[_k])[:50])
+                stats["errors"].append(
+                    f"LLM hallucinated: {_checked} entity mentions checked, "
+                    f"0 grounded in source text. "
+                    f"Sample entities: {sample_entities[:4]}. "
+                    f"Model fabricated content unrelated to the input."
+                )
+                logger.warning(
+                    "Hallucinated response for doc '%s': 0/%d entities grounded, "
+                    "samples=%s",
+                    doc_id, _checked, sample_entities[:4],
+                )
+                return stats
+
         if triples:
             logger.debug(
                 "First triple from doc '%s' (type=%s): %s",
