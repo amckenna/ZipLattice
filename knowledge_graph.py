@@ -48,17 +48,20 @@ logger = logging.getLogger(__name__)
 def ollama_embed(
     texts: list[str], *, model: str, url: str = "http://localhost:11434"
 ) -> list[list[float]]:
-    """Call Ollama ``/api/embed`` for a batch of texts.
+    """Call an OpenAI-compatible ``/v1/embeddings`` endpoint.
+
+    Works with Ollama (>=0.1.14), llama.cpp, vLLM, LocalAI, and any
+    other server that implements the OpenAI embeddings API.
 
     Args:
         texts: List of strings to embed.
-        model: Ollama model name (e.g. ``nomic-embed-text``).
-        url: Ollama server base URL.
+        model: Model name (e.g. ``nomic-embed-text``).
+        url: Server base URL.
 
     Returns:
         One embedding vector per input text, in the same order.
     """
-    endpoint = f"{url.rstrip('/')}/api/embed"
+    endpoint = f"{url.rstrip('/')}/v1/embeddings"
     payload = json.dumps({"model": model, "input": texts}).encode()
     req = urllib.request.Request(
         endpoint,
@@ -73,15 +76,17 @@ def ollama_embed(
         raise RuntimeError(
             f"Embedding request failed (HTTP {exc.code}): "
             f"POST {endpoint} with model '{model}'. "
-            f"Check that the Ollama server is running at {url} "
-            f"and the model '{model}' is available (ollama list)."
+            f"Check that the server is running at {url} "
+            f"and the model '{model}' is available."
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(
-            f"Cannot connect to Ollama at {endpoint}: {exc.reason}. "
+            f"Cannot connect to {endpoint}: {exc.reason}. "
             f"Is the server running?"
         ) from exc
-    return body["embeddings"]
+    # OpenAI format: {"data": [{"embedding": [...], "index": 0}, ...]}
+    data = sorted(body["data"], key=lambda d: d["index"])
+    return [d["embedding"] for d in data]
 
 
 # ---------------------------------------------------------------------------
@@ -4597,13 +4602,15 @@ def main():
                         help="Show full section details when used with --preview-md or --ingest-md")
     parser.add_argument("--query-model", "--ollama", nargs="?", const="qwen3-coder:30b",
                         metavar="MODEL", dest="query_model",
-                        help="Ollama model for LLM extraction during ingestion (default: qwen3-coder:30b)")
-    parser.add_argument("--ollama-url", default="http://localhost:11434",
-                        help="Ollama server URL for LLM extraction (default: http://localhost:11434)")
+                        help="Model for LLM extraction during ingestion (default: qwen3-coder:30b)")
+    parser.add_argument("--api-url", "--ollama-url", default="http://localhost:11434",
+                        dest="ollama_url",
+                        help="OpenAI-compatible API server URL (works with Ollama, llama.cpp, vLLM, etc.) "
+                             "(default: http://localhost:11434)")
     parser.add_argument("--embed-url", default=None, metavar="URL",
-                        help="Ollama server URL for embeddings (default: same as --ollama-url)")
+                        help="API server URL for embeddings (default: same as --api-url)")
     parser.add_argument("--embed-model", default=None, metavar="MODEL",
-                        help="Ollama embedding model for node embeddings during ingestion "
+                        help="Embedding model for node embeddings during ingestion "
                              "(default: auto-detect from graph, or nomic-embed-text)")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip automatic visualization export after ingestion")
@@ -4761,16 +4768,16 @@ def main():
         _verbose = args.verbose
 
         if args.query_model:
-            ollama_model = args.query_model
-            ollama_url = args.ollama_url.rstrip("/")
+            _extract_model = args.query_model
+            _extract_url = args.ollama_url.rstrip("/")
 
-            def ollama_extract(prompt: str) -> list[dict[str, Any]]:
-                """Call Ollama /api/chat and parse the JSON response."""
+            def _llm_extract(prompt: str) -> list[dict[str, Any]]:
+                """Call OpenAI-compatible /v1/chat/completions and parse JSON."""
                 if _verbose:
                     logger.debug("Prompt length: %d chars", len(prompt))
 
                 payload = json.dumps({
-                    "model": ollama_model,
+                    "model": _extract_model,
                     "messages": [
                         {
                             "role": "system",
@@ -4783,25 +4790,27 @@ def main():
                         {"role": "user", "content": prompt},
                     ],
                     "stream": False,
-                    "format": "json",
-                    "options": {"temperature": 0.1, "num_predict": 32768},
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.1,
+                    "max_tokens": 32768,
                 }).encode()
                 req = urllib.request.Request(
-                    f"{ollama_url}/api/chat",
+                    f"{_extract_url}/v1/chat/completions",
                     data=payload,
                     headers={"Content-Type": "application/json"},
                 )
                 with urllib.request.urlopen(req, timeout=1200) as resp:
                     body = json.loads(resp.read())
 
-                raw = body.get("message", {}).get("content", "").strip()
+                # OpenAI format: choices[0].message.content
+                raw = body["choices"][0]["message"]["content"].strip()
                 if _verbose:
                     logger.debug("Raw response length: %d chars", len(raw))
                 if not raw:
                     logger.warning("LLM returned empty response")
                     return []
 
-                # Try direct parse first (works when format:json is honored)
+                # Try direct parse first (works when response_format is honored)
                 try:
                     parsed = json.loads(raw)
                 except json.JSONDecodeError:
@@ -4844,8 +4853,8 @@ def main():
                     return parsed
                 return []
 
-            extract_fn: Callable[[str], list[dict[str, Any]]] = ollama_extract
-            print(f"  Using Ollama model: {ollama_model} at {ollama_url}")
+            extract_fn: Callable[[str], list[dict[str, Any]]] = _llm_extract
+            print(f"  Using model: {_extract_model} at {_extract_url}")
         else:
             # Structure-only ingestion: no LLM, build document/section
             # nodes and store the source. Entity extraction is skipped.

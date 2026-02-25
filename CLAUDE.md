@@ -46,7 +46,7 @@ knowledge_graph/                  # dedicated graph directory
 - `RelationProposal` (line ~166) -- Dataclass tracking proposed new relation types with examples and confidence scores.
 - `ProposalStatus` (line ~159) -- Enum: PENDING, ACCEPTED, REJECTED.
 - `GraphEncoder` (line ~121) -- Custom JSON encoder for datetime, set, Enum, and Path objects.
-- `ollama_embed()` (module-level) -- Calls Ollama `/api/embed` endpoint. Used during ingestion and by `query_graph.py` at query time.
+- `ollama_embed()` (module-level) -- Calls OpenAI-compatible `/v1/embeddings` endpoint. Works with Ollama, llama.cpp, vLLM, LocalAI, etc. Used during ingestion and by `query_graph.py` at query time.
 
 ## How to run
 
@@ -65,12 +65,14 @@ python knowledge_graph.py <path-to-graph.json> --pyvis output.html
 python knowledge_graph.py <path-to-graph.json> --cytoscape output.html
 python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
-python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --embed-model nomic-embed-text
+python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b --embed-model nomic-embed-text
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --api-url http://exo:11434
 
 # Query graph CLI
 python query_graph.py <path-to-graph.json> search "synthetic aperture radar"
 python query_graph.py <path-to-graph.json> context "how does SAR work?"
 python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-model qwen3-coder:30b
+python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-model qwen3-coder:30b --api-url http://exo:11434
 python query_graph.py <path-to-graph.json> node <node-id>
 python query_graph.py <path-to-graph.json> neighbors <node-id> --depth 2
 python query_graph.py <path-to-graph.json> path <source-id> <target-id>
@@ -78,7 +80,7 @@ python query_graph.py <path-to-graph.json> stats
 
 # Model benchmark CLI
 python benchmark_models.py doc.md --models qwen3-coder:30b gemma3:27b llama3.1:70b
-python benchmark_models.py docs/*.md --models modelA modelB --ollama-url http://exo:11434
+python benchmark_models.py docs/*.md --models modelA modelB --api-url http://exo:11434
 python benchmark_models.py doc.md --models modelA modelB --json
 python benchmark_models.py doc.md --models modelA modelB --max-sections 5  # quick test
 

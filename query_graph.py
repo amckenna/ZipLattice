@@ -243,13 +243,17 @@ def ask(
 
 
 # ---------------------------------------------------------------------------
-# Ollama chat helper
+# Chat helper (OpenAI-compatible)
 # ---------------------------------------------------------------------------
 
 
 def ollama_chat(prompt: str, *, model: str, url: str) -> str:
-    """Call Ollama ``/api/chat`` with a single user message."""
-    endpoint = f"{url.rstrip('/')}/api/chat"
+    """Call an OpenAI-compatible ``/v1/chat/completions`` endpoint.
+
+    Works with Ollama (>=0.1.14), llama.cpp, vLLM, LocalAI, and any
+    other server that implements the OpenAI chat completions API.
+    """
+    endpoint = f"{url.rstrip('/')}/v1/chat/completions"
     logger.debug("ollama_chat: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
     payload = json.dumps({
         "model": model,
@@ -269,16 +273,17 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
         raise RuntimeError(
             f"Chat request failed (HTTP {exc.code}): "
             f"POST {endpoint} with model '{model}'. "
-            f"Check that the Ollama server is running at {url} "
-            f"and the model '{model}' is available (ollama list)."
+            f"Check that the server is running at {url} "
+            f"and the model '{model}' is available."
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(
-            f"Cannot connect to Ollama at {endpoint}: {exc.reason}. "
+            f"Cannot connect to {endpoint}: {exc.reason}. "
             f"Is the server running?"
         ) from exc
     elapsed = time.monotonic() - t0
-    answer = body.get("message", {}).get("content", "").strip()
+    # OpenAI format: {"choices": [{"message": {"content": "..."}}]}
+    answer = body["choices"][0]["message"]["content"].strip()
     logger.debug("ollama_chat: response=%d chars (%.1fs)", len(answer), elapsed)
     return answer
 
@@ -295,13 +300,15 @@ def main() -> None:
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--query-model", "--ollama", nargs="?", const="qwen3-coder:30b",
                         metavar="MODEL", dest="query_model",
-                        help="Ollama model for LLM query/chat (default: qwen3-coder:30b)")
-    shared.add_argument("--ollama-url", default="http://localhost:11434",
-                        help="Ollama server URL (default: http://localhost:11434)")
+                        help="Model for LLM query/chat (default: qwen3-coder:30b)")
+    shared.add_argument("--api-url", "--ollama-url", default="http://localhost:11434",
+                        dest="ollama_url",
+                        help="OpenAI-compatible API server URL (works with Ollama, llama.cpp, vLLM, etc.) "
+                             "(default: http://localhost:11434)")
     shared.add_argument("--embed-url", default=None, metavar="URL",
-                        help="Ollama server URL for embeddings (default: same as --ollama-url)")
+                        help="API server URL for embeddings (default: same as --api-url)")
     shared.add_argument("--embed-model", default=None, metavar="MODEL",
-                        help="Ollama embedding model for query embedding "
+                        help="Embedding model for query embedding "
                              "(default: auto-detect from graph, or nomic-embed-text)")
     shared.add_argument("--top-k", type=int, default=10, help="Number of search results")
     shared.add_argument("--depth", type=int, default=1, help="Neighborhood expansion depth")
