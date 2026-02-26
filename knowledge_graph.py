@@ -78,11 +78,17 @@ def ollama_embed(
             detail = exc.read().decode(errors="replace").strip()
         except Exception:
             pass
-        raise RuntimeError(
+        msg = (
             f"Embedding request failed (HTTP {exc.code}): "
             f"POST {endpoint} with model '{model}'."
-            f"{f'  Server response: {detail}' if detail else ''}"
-        ) from exc
+        )
+        if detail:
+            msg += f"\nServer response: {detail}"
+        msg += (
+            f"\nCheck that the server is running at {url} "
+            f"and the model '{model}' is available."
+        )
+        raise RuntimeError(msg) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(
             f"Cannot connect to {endpoint}: {exc.reason}. "
