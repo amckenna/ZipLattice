@@ -84,10 +84,17 @@ def ollama_embed(
         )
         if detail:
             msg += f"\nServer response: {detail}"
-        msg += (
-            f"\nCheck that the server is running at {url} "
-            f"and the model '{model}' is available."
-        )
+        if exc.code == 400:
+            msg += (
+                f"\nHint: the model name '{model}' may not match what the "
+                f"server expects. Run: python query_graph.py <graph> "
+                f"list-models --api-url {url}"
+            )
+        else:
+            msg += (
+                f"\nCheck that the server is running at {url} "
+                f"and the model '{model}' is available."
+            )
         raise RuntimeError(msg) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(
@@ -4652,6 +4659,8 @@ def main():
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
                         help="Verify integrity of stored source files")
+    parser.add_argument("--list-models", action="store_true",
+                        help="List models available on the API server and exit")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show detailed progress, timing, and debug info")
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -4669,6 +4678,12 @@ def main():
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     else:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    # Commands that don't need the graph
+    if args.list_models:
+        from query_graph import _list_models
+        _list_models(args.ollama_url)
+        return
 
     kg = KnowledgeGraph(args.path)
 
