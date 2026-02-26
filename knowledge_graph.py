@@ -4522,6 +4522,28 @@ def _parse_string_triple(text: str) -> dict[str, str] | None:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# LLM response helpers
+# ---------------------------------------------------------------------------
+
+def _strip_thinking(raw: str) -> str:
+    """Remove ``<think>…</think>`` blocks from LLM responses.
+
+    Thinking models (Qwen3, DeepSeek-R1, etc.) wrap their chain-of-thought
+    reasoning in ``<think>`` tags. This strips those blocks so we only
+    parse the final answer. Handles:
+    - Complete blocks: ``<think>…</think>``
+    - Unclosed blocks (truncated): ``<think>…`` with no closing tag
+    - Multiple blocks and nested whitespace
+    """
+    # Strip complete <think>...</think> blocks (DOTALL for newlines)
+    result = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    # Strip unclosed <think> block (model hit token limit mid-thought)
+    result = re.sub(r"<think>.*", "", result, flags=re.DOTALL)
+    return result.strip()
+
+
+# ---------------------------------------------------------------------------
 # JSON salvage helper
 # ---------------------------------------------------------------------------
 
@@ -4784,7 +4806,7 @@ def main():
                             "content": (
                                 "You are a JSON extraction engine. "
                                 "Respond with ONLY a valid JSON array. "
-                                "No thinking, no explanations, no markdown."
+                                "No explanations, no markdown."
                             ),
                         },
                         {"role": "user", "content": prompt},
@@ -4806,6 +4828,12 @@ def main():
                 raw = body["choices"][0]["message"]["content"].strip()
                 if _verbose:
                     logger.debug("Raw response length: %d chars", len(raw))
+
+                # Strip <think>...</think> blocks from thinking models
+                raw = _strip_thinking(raw)
+                if _verbose and len(raw) != len(body["choices"][0]["message"]["content"].strip()):
+                    logger.debug("After stripping thinking: %d chars", len(raw))
+
                 if not raw:
                     logger.warning("LLM returned empty response")
                     return []
