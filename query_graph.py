@@ -270,11 +270,15 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
         with urllib.request.urlopen(req, timeout=1200) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode(errors="replace").strip()
+        except Exception:
+            pass
         raise RuntimeError(
             f"Chat request failed (HTTP {exc.code}): "
-            f"POST {endpoint} with model '{model}'. "
-            f"Check that the server is running at {url} "
-            f"and the model '{model}' is available."
+            f"POST {endpoint} with model '{model}'."
+            f"{f'  Server response: {detail}' if detail else ''}"
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(

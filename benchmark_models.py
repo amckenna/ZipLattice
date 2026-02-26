@@ -72,7 +72,6 @@ def _make_extract_fn(
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
-            "response_format": {"type": "json_object"},
             "temperature": 0.1,
             "max_tokens": 32768,
         }).encode()
@@ -82,8 +81,20 @@ def _make_extract_fn(
             data=payload,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=1200) as resp:
-            body = json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=1200) as resp:
+                body = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode(errors="replace").strip()
+            except Exception:
+                pass
+            logger.error("[%s] Request failed (HTTP %d): %s", model, exc.code, detail or "(no detail)")
+            return []
+        except urllib.error.URLError as exc:
+            logger.error("[%s] Cannot connect to %s: %s", model, ollama_url, exc.reason)
+            return []
 
         # OpenAI format: choices[0].message.content
         raw = body["choices"][0]["message"]["content"].strip()

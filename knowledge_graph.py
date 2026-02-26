@@ -73,11 +73,15 @@ def ollama_embed(
         with urllib.request.urlopen(req, timeout=240) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode(errors="replace").strip()
+        except Exception:
+            pass
         raise RuntimeError(
             f"Embedding request failed (HTTP {exc.code}): "
-            f"POST {endpoint} with model '{model}'. "
-            f"Check that the server is running at {url} "
-            f"and the model '{model}' is available."
+            f"POST {endpoint} with model '{model}'."
+            f"{f'  Server response: {detail}' if detail else ''}"
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(
@@ -4812,7 +4816,6 @@ def main():
                         {"role": "user", "content": prompt},
                     ],
                     "stream": False,
-                    "response_format": {"type": "json_object"},
                     "temperature": 0.1,
                     "max_tokens": 32768,
                 }).encode()
@@ -4821,8 +4824,23 @@ def main():
                     data=payload,
                     headers={"Content-Type": "application/json"},
                 )
-                with urllib.request.urlopen(req, timeout=1200) as resp:
-                    body = json.loads(resp.read())
+                try:
+                    with urllib.request.urlopen(req, timeout=1200) as resp:
+                        body = json.loads(resp.read())
+                except urllib.error.HTTPError as exc:
+                    detail = ""
+                    try:
+                        detail = exc.read().decode(errors="replace").strip()
+                    except Exception:
+                        pass
+                    logger.error(
+                        "Extraction request failed (HTTP %d): %s",
+                        exc.code, detail or "(no detail)",
+                    )
+                    return []
+                except urllib.error.URLError as exc:
+                    logger.error("Cannot connect to %s: %s", _extract_url, exc.reason)
+                    return []
 
                 # OpenAI format: choices[0].message.content
                 raw = body["choices"][0]["message"]["content"].strip()
