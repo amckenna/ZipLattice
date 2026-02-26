@@ -281,10 +281,17 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
         )
         if detail:
             msg += f"\nServer response: {detail}"
-        msg += (
-            f"\nCheck that the server is running at {url} "
-            f"and the model '{model}' is available."
-        )
+        if exc.code == 400:
+            msg += (
+                f"\nHint: the model name '{model}' may not match what the "
+                f"server expects. Run: python query_graph.py <graph> "
+                f"list-models --api-url {url}"
+            )
+        else:
+            msg += (
+                f"\nCheck that the server is running at {url} "
+                f"and the model '{model}' is available."
+            )
         raise RuntimeError(msg) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(
@@ -296,6 +303,58 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
     answer = _strip_thinking(body["choices"][0]["message"]["content"].strip())
     logger.debug("ollama_chat: response=%d chars (%.1fs)", len(answer), elapsed)
     return answer
+
+
+# ---------------------------------------------------------------------------
+# Server introspection helpers
+# ---------------------------------------------------------------------------
+
+
+def list_models(url: str) -> list[dict[str, Any]]:
+    """Query ``/v1/models`` and return the list of available models.
+
+    Works with Ollama, llama.cpp (router mode), vLLM, LocalAI, etc.
+    Returns a list of model dicts (each has at least an ``id`` key).
+    """
+    endpoint = f"{url.rstrip('/')}/v1/models"
+    req = urllib.request.Request(endpoint, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode(errors="replace").strip()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Failed to list models (HTTP {exc.code}): GET {endpoint}."
+            f"{f'  Server response: {detail}' if detail else ''}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Cannot connect to {endpoint}: {exc.reason}. "
+            f"Is the server running?"
+        ) from exc
+    return body.get("data", [])
+
+
+def _list_models(url: str) -> None:
+    """Print available models from the server."""
+    try:
+        models = list_models(url)
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
+        return
+    if not models:
+        print(f"No models found at {url}")
+        return
+    print(f"Models available at {url}:")
+    for m in models:
+        model_id = m.get("id", "?")
+        owned_by = m.get("owned_by", "")
+        extra = f"  (owned_by: {owned_by})" if owned_by else ""
+        print(f"  {model_id}{extra}")
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +427,9 @@ def main() -> None:
     # stats
     sub.add_parser("stats", help="Print graph statistics")
 
+    # list-models
+    sub.add_parser("list-models", help="List models available on the API server")
+
     args = parser.parse_args()
 
     # Default --embed-url to --ollama-url when not explicitly set
@@ -384,6 +446,11 @@ def main() -> None:
 
     if not args.command:
         parser.print_help()
+        return
+
+    # Commands that don't need the graph loaded
+    if args.command == "list-models":
+        _list_models(args.ollama_url)
         return
 
     kg = KnowledgeGraph(args.graph)
