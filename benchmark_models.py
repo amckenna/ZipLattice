@@ -38,7 +38,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from knowledge_graph import KnowledgeGraph, _salvage_truncated_json
+from knowledge_graph import KnowledgeGraph, _salvage_truncated_json, _strip_thinking
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ def _make_extract_fn(
                     "content": (
                         "You are a JSON extraction engine. "
                         "Respond with ONLY a valid JSON array. "
-                        "No thinking, no explanations, no markdown."
+                        "No explanations, no markdown."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -89,6 +89,10 @@ def _make_extract_fn(
         raw = body["choices"][0]["message"]["content"].strip()
         if verbose:
             logger.debug("[%s] Raw response length: %d chars", model, len(raw))
+
+        # Strip <think>...</think> blocks from thinking models
+        raw = _strip_thinking(raw)
+
         if not raw:
             logger.warning("[%s] Empty response", model)
             return []

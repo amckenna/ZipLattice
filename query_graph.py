@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
-from knowledge_graph import KnowledgeGraph, GraphEncoder, ollama_embed
+from knowledge_graph import KnowledgeGraph, GraphEncoder, ollama_embed, _strip_thinking
 
 logger = logging.getLogger("query_graph")
 
@@ -283,7 +283,7 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
         ) from exc
     elapsed = time.monotonic() - t0
     # OpenAI format: {"choices": [{"message": {"content": "..."}}]}
-    answer = body["choices"][0]["message"]["content"].strip()
+    answer = _strip_thinking(body["choices"][0]["message"]["content"].strip())
     logger.debug("ollama_chat: response=%d chars (%.1fs)", len(answer), elapsed)
     return answer
 
