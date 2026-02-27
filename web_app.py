@@ -78,8 +78,8 @@ def _list_graphs() -> list[dict[str, Any]]:
             sources = kg._data.get("meta", {}).get("sources", {})
             graphs.append({
                 "name": entry.name,
-                "nodes": st.get("total_nodes", 0),
-                "edges": st.get("total_edges", 0),
+                "nodes": st.get("num_nodes", 0),
+                "edges": st.get("num_edges", 0),
                 "sources": len(sources),
             })
         except Exception:
