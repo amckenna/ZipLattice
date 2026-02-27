@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}ZipLattice{% endblock %}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'monospace'],
+          },
+        },
+      },
+    }
+  </script>
+  <style>
+    /* HTMX loading indicator */
+    .htmx-request .htmx-indicator { display: inline-block; }
+    .htmx-indicator { display: none; }
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body class="h-full bg-black text-white font-mono">
+  <nav class="border-b border-gray-800 px-6 py-4">
+    <div class="max-w-7xl mx-auto flex items-center justify-between">
+      <a href="/" class="text-xl font-bold tracking-tight hover:text-gray-300">ZipLattice</a>
+      <div class="flex gap-6 text-sm">
+        <a href="/" class="hover:text-gray-300 {% block nav_dashboard %}{% endblock %}">Dashboard</a>
+        <a href="/upload" class="hover:text-gray-300 {% block nav_upload %}{% endblock %}">Upload</a>
+        <a href="/query" class="hover:text-gray-300 {% block nav_query %}{% endblock %}">Query</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="max-w-7xl mx-auto px-6 py-8">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="border-t border-gray-800 px-6 py-4 mt-auto">
+    <div class="max-w-7xl mx-auto text-center text-xs text-gray-600">
+      ZipLattice &mdash; Knowledge Graph Manager
+    </div>
+  </footer>
+</body>
+</html>

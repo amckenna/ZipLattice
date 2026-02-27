@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard — ZipLattice{% endblock %}
+{% block nav_dashboard %}text-white border-b border-white{% endblock %}
+
+{% block content %}
+<div class="space-y-8">
+  <div class="flex items-center justify-between">
+    <h1 class="text-2xl font-bold">Knowledge Graphs</h1>
+    <form hx-post="/graphs/create" hx-target="#graph-list" hx-swap="outerHTML" class="flex gap-2">
+      <input type="text" name="name" placeholder="New graph name…"
+             class="bg-black border border-gray-800 px-3 py-1.5 text-sm focus:outline-none focus:border-white" required>
+      <button type="submit"
+              class="border border-white px-4 py-1.5 text-sm hover:bg-white hover:text-black transition-colors">
+        Create
+      </button>
+    </form>
+  </div>
+
+  <div id="graph-list">
+    {% if graphs %}
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-gray-800 text-gray-400 text-left">
+          <th class="pb-2 font-normal">Name</th>
+          <th class="pb-2 font-normal text-right">Nodes</th>
+          <th class="pb-2 font-normal text-right">Edges</th>
+          <th class="pb-2 font-normal text-right">Sources</th>
+          <th class="pb-2 font-normal text-right"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for g in graphs %}
+        <tr class="border-b border-gray-800 hover:bg-gray-950">
+          <td class="py-3">
+            <a href="/graphs/{{ g.name }}" class="hover:text-gray-300">{{ g.name }}</a>
+          </td>
+          <td class="py-3 text-right text-gray-400">{{ g.nodes }}</td>
+          <td class="py-3 text-right text-gray-400">{{ g.edges }}</td>
+          <td class="py-3 text-right text-gray-400">{{ g.sources }}</td>
+          <td class="py-3 text-right">
+            <a href="/graphs/{{ g.name }}" class="text-gray-400 hover:text-white text-xs">View →</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="border border-gray-800 p-8 text-center text-gray-400">
+      No knowledge graphs found. Create one to get started.
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
