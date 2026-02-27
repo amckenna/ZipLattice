@@ -1,0 +1,37 @@
+{% if error %}
+<div class="border border-red-900 bg-red-950 p-4 text-sm mt-4">
+  <span class="text-red-400 font-bold">Ingestion Error:</span> {{ error }}
+</div>
+{% else %}
+<div class="border border-gray-800 p-4 mt-4 space-y-3">
+  <h3 class="text-sm font-bold">Ingestion Complete</h3>
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-gray-800 text-gray-400 text-left">
+        <th class="pb-1 font-normal">Document</th>
+        <th class="pb-1 font-normal text-right">Sections</th>
+        <th class="pb-1 font-normal text-right">Triples</th>
+        <th class="pb-1 font-normal text-right">Nodes</th>
+        <th class="pb-1 font-normal text-right">Edges</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in results %}
+      <tr class="border-b border-gray-800">
+        <td class="py-1">{{ r.doc_id }}</td>
+        <td class="py-1 text-right text-gray-400">{{ r.total_sections }}</td>
+        <td class="py-1 text-right text-gray-400">{{ r.total_triples }}</td>
+        <td class="py-1 text-right text-gray-400">{{ r.total_nodes_added }}</td>
+        <td class="py-1 text-right text-gray-400">{{ r.total_edges_added }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if embed_count is defined and embed_count > 0 %}
+  <p class="text-xs text-gray-400">Embedded {{ embed_count }} nodes.</p>
+  {% endif %}
+  <a href="/graphs/{{ graph_name }}" class="inline-block border border-white px-4 py-1.5 text-sm hover:bg-white hover:text-black transition-colors mt-2">
+    View Graph →
+  </a>
+</div>
+{% endif %}

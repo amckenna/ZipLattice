@@ -1,0 +1,47 @@
+{% if error %}
+<div class="border border-red-900 bg-red-950 p-4 text-sm mt-4">
+  <span class="text-red-400 font-bold">Error:</span> {{ error }}
+</div>
+{% elif mode == "search" %}
+<div class="border border-gray-800 p-4 mt-4 space-y-2">
+  <h3 class="text-sm font-bold">Search Results ({{ results|length }})</h3>
+  {% if results %}
+  <table class="w-full text-sm">
+    <thead>
+      <tr class="border-b border-gray-800 text-gray-400 text-left">
+        <th class="pb-1 font-normal">#</th>
+        <th class="pb-1 font-normal">Label</th>
+        <th class="pb-1 font-normal">Type</th>
+        <th class="pb-1 font-normal text-right">Similarity</th>
+        <th class="pb-1 font-normal text-right">Confidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in results %}
+      <tr class="border-b border-gray-800">
+        <td class="py-1 text-gray-600">{{ loop.index }}</td>
+        <td class="py-1">
+          <a href="/graphs/{{ graph_name }}" class="hover:text-gray-300">{{ r.label }}</a>
+        </td>
+        <td class="py-1 text-gray-400">{{ r.type }}</td>
+        <td class="py-1 text-right text-gray-400">{{ "%.3f"|format(r.similarity) }}</td>
+        <td class="py-1 text-right text-gray-400">{{ "%.2f"|format(r.confidence) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="text-sm text-gray-400">No results found.</p>
+  {% endif %}
+</div>
+{% elif mode == "context" %}
+<div class="border border-gray-800 p-4 mt-4 space-y-2">
+  <h3 class="text-sm font-bold">RAG Context</h3>
+  <pre class="text-xs text-gray-300 whitespace-pre-wrap bg-gray-950 p-3 border border-gray-800 max-h-96 overflow-y-auto">{{ context }}</pre>
+</div>
+{% elif mode == "ask" %}
+<div class="border border-gray-800 p-4 mt-4 space-y-2">
+  <h3 class="text-sm font-bold">Answer</h3>
+  <div class="text-sm text-gray-300 whitespace-pre-wrap">{{ answer }}</div>
+</div>
+{% endif %}

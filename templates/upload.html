@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block title %}Upload — ZipLattice{% endblock %}
+{% block nav_upload %}text-white border-b border-white{% endblock %}
+
+{% block content %}
+<div class="space-y-8 max-w-2xl">
+  <h1 class="text-2xl font-bold">Upload Documents</h1>
+
+  <form hx-post="/upload" hx-target="#upload-result" hx-swap="innerHTML"
+        hx-encoding="multipart/form-data" class="space-y-6">
+
+    <!-- Graph selection -->
+    <div class="space-y-2">
+      <label class="block text-sm text-gray-400">Target Knowledge Graph</label>
+      <select name="graph_name"
+              class="w-full bg-black border border-gray-800 px-3 py-2 text-sm focus:outline-none focus:border-white">
+        <option value="">— Select a graph —</option>
+        {% for g in graphs %}
+        <option value="{{ g.name }}">{{ g.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="flex items-center gap-3">
+      <div class="flex-1 border-t border-gray-800"></div>
+      <span class="text-xs text-gray-600">or create new</span>
+      <div class="flex-1 border-t border-gray-800"></div>
+    </div>
+
+    <div class="space-y-2">
+      <label class="block text-sm text-gray-400">New Graph Name</label>
+      <input type="text" name="new_graph_name" placeholder="e.g. my-project"
+             class="w-full bg-black border border-gray-800 px-3 py-2 text-sm focus:outline-none focus:border-white">
+    </div>
+
+    <!-- File upload -->
+    <div class="space-y-2">
+      <label class="block text-sm text-gray-400">Files (.pdf, .docx, .md, .html)</label>
+      <input type="file" name="files" multiple
+             accept=".pdf,.docx,.doc,.md,.html,.htm"
+             class="w-full text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:border file:border-gray-800 file:bg-black file:text-white file:text-sm file:cursor-pointer hover:file:bg-white hover:file:text-black file:transition-colors">
+    </div>
+
+    <button type="submit"
+            class="border border-white px-6 py-2 text-sm hover:bg-white hover:text-black transition-colors">
+      Upload &amp; Convert
+    </button>
+    <span class="htmx-indicator text-sm text-gray-400 ml-3">Converting…</span>
+  </form>
+
+  <!-- Upload result area -->
+  <div id="upload-result"></div>
+
+  <!-- Ingest result area -->
+  <div id="ingest-result"></div>
+</div>
+{% endblock %}

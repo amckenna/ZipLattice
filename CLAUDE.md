@@ -11,7 +11,16 @@ ZipLattice is a portable, JSON-backed knowledge graph manager built on NetworkX.
 ```
 knowledge_graph.py       # Knowledge graph library and CLI (single-file)
 query_graph.py           # Knowledge graph query application (search, RAG, CLI)
+web_app.py               # FastAPI web frontend (HTMX + Tailwind CSS)
+templates/               # Jinja2 HTML templates for the web frontend
+  base.html              #   Layout shell (nav, Tailwind/HTMX CDN)
+  dashboard.html         #   Dashboard — lists all knowledge graphs
+  graph_detail.html      #   Graph detail — Cytoscape.js visualization
+  upload.html            #   File upload form
+  query.html             #   Query form (search, context, ask)
+  partials/              #   HTMX partial response fragments
 test_query_graph.py      # Tests for query_graph.py
+test_web_app.py          # Tests for web_app.py
 benchmark_models.py      # Model comparison tool for extraction quality
 convert_to_markdown.py   # Standalone document-to-Markdown converter (single-file)
 README.md                # Project documentation
@@ -37,6 +46,7 @@ knowledge_graph/                  # dedicated graph directory
 - **Required:** `networkx`
 - **Optional:** `pyvis` (for Pyvis visualization export)
 - **Optional (for converter):** `pymupdf4llm`, `mammoth`, `markdownify`, `pymupdf_layout` (improves PDF layout analysis)
+- **Optional (for web frontend):** `fastapi`, `uvicorn`, `python-multipart`, `jinja2`
 - Cytoscape.js is loaded from CDN in exported HTML files and does not need a local install
 
 ## Key classes
@@ -88,6 +98,12 @@ python benchmark_models.py doc.md --models modelA modelB --max-sections 5  # qui
 python convert_to_markdown.py document.pdf -o document.md
 python convert_to_markdown.py file1.pdf file2.docx -d output_dir/
 
+# Web frontend
+pip install fastapi uvicorn python-multipart jinja2
+uvicorn web_app:app --reload                    # http://localhost:8000
+python web_app.py                               # same, starts on port 8000
+ZIPLATTICE_GRAPHS_DIR=./my_graphs uvicorn web_app:app  # custom graphs directory
+
 # Library usage
 python -c "from knowledge_graph import KnowledgeGraph; print('OK')"
 python -c "from convert_to_markdown import convert; print('OK')"
@@ -98,6 +114,9 @@ python -c "from convert_to_markdown import convert; print('OK')"
 ```bash
 # Run query_graph tests (no Ollama needed)
 python -m pytest test_query_graph.py -v
+
+# Run web app tests (no Ollama needed)
+python -m pytest test_web_app.py -v
 
 # Verify modules load
 python -c "from knowledge_graph import KnowledgeGraph"

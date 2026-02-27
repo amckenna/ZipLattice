@@ -1,0 +1,532 @@
+{% extends "base.html" %}
+
+{% block title %}{{ graph_name }} — ZipLattice{% endblock %}
+
+{% block head %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+<style>
+  #cy-container { position: relative; width: 100%; height: 75vh; border: 1px solid #374151; }
+  #cy { width: 100%; height: 100%; background: #0a0a0a; }
+
+  /* Control panel overlay */
+  #controls {
+    position: absolute; top: 10px; left: 10px; width: 240px; z-index: 10;
+    background: rgba(0, 0, 0, 0.9); border: 1px solid #374151;
+    max-height: calc(75vh - 32px); overflow-y: auto; font-size: 12px;
+  }
+  .panel-section { padding: 8px 12px; border-bottom: 1px solid #1f2937; }
+  .panel-section:last-child { border-bottom: none; }
+  .panel-title {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.05em; color: #6b7280; margin-bottom: 4px;
+  }
+
+  /* Search */
+  #search-input {
+    width: 100%; padding: 4px 8px; background: #111; border: 1px solid #374151;
+    color: #fff; font-size: 12px; outline: none; font-family: inherit;
+  }
+  #search-input:focus { border-color: #fff; }
+  #search-results { margin-top: 4px; max-height: 100px; overflow-y: auto; }
+  .search-result {
+    padding: 2px 4px; cursor: pointer; color: #9ca3af;
+  }
+  .search-result:hover { background: #1f2937; color: #fff; }
+
+  /* Layout / action buttons */
+  .btn-grid { display: flex; flex-wrap: wrap; gap: 4px; }
+  .ctrl-btn {
+    padding: 3px 8px; background: #111; border: 1px solid #374151;
+    color: #9ca3af; font-size: 11px; cursor: pointer; font-family: inherit;
+    transition: all 0.15s;
+  }
+  .ctrl-btn:hover { border-color: #fff; color: #fff; }
+  .ctrl-btn.active { background: #fff; color: #000; border-color: #fff; }
+
+  /* Confidence slider */
+  .slider-row { display: flex; align-items: center; gap: 6px; }
+  .slider-row input[type=range] { flex: 1; accent-color: #fff; }
+  .slider-val { font-size: 11px; color: #9ca3af; min-width: 28px; text-align: right; }
+
+  /* Filter checkboxes */
+  .filter-item {
+    display: flex; align-items: center; gap: 5px; font-size: 11px;
+    color: #9ca3af; cursor: pointer; padding: 1px 0;
+  }
+  .filter-item input { accent-color: #fff; }
+  .color-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  }
+  .color-line {
+    display: inline-block; width: 12px; height: 3px; border-radius: 1px; flex-shrink: 0;
+  }
+  .filter-scroll { max-height: 120px; overflow-y: auto; }
+
+  /* Detail panel overlay */
+  #detail-panel {
+    position: absolute; top: 10px; right: 10px; width: 280px; z-index: 10;
+    background: rgba(0, 0, 0, 0.9); border: 1px solid #374151;
+    max-height: calc(75vh - 32px); overflow-y: auto;
+    display: none;
+  }
+  #detail-panel.visible { display: block; }
+  .detail-header {
+    padding: 10px 12px; border-bottom: 1px solid #1f2937;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .detail-header h3 { font-size: 13px; font-weight: 600; }
+  .detail-close {
+    background: none; border: none; color: #6b7280; font-size: 16px;
+    cursor: pointer; padding: 2px 4px;
+  }
+  .detail-close:hover { color: #fff; }
+  .detail-row {
+    display: flex; justify-content: space-between; padding: 3px 0;
+    font-size: 11px; border-bottom: 1px solid #1f2937;
+  }
+  .detail-key { color: #6b7280; }
+  .detail-val { color: #e5e7eb; text-align: right; max-width: 160px; word-break: break-word; }
+  .detail-section { padding: 8px 12px; }
+  .neighbor-item {
+    font-size: 11px; color: #9ca3af; padding: 2px 0; cursor: pointer;
+  }
+  .neighbor-item:hover { color: #fff; }
+  .badge {
+    display: inline-block; padding: 1px 6px; border-radius: 8px;
+    font-size: 10px; font-weight: 600;
+  }
+
+  /* Scrollbar */
+  #controls ::-webkit-scrollbar, #detail-panel ::-webkit-scrollbar { width: 4px; }
+  #controls ::-webkit-scrollbar-thumb, #detail-panel ::-webkit-scrollbar-thumb {
+    background: #374151; border-radius: 2px;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+  <!-- Header -->
+  <div class="flex items-center justify-between">
+    <div>
+      <a href="/" class="text-xs text-gray-400 hover:text-white">&larr; All Graphs</a>
+      <h1 class="text-2xl font-bold mt-1">{{ graph_name }}</h1>
+    </div>
+  </div>
+
+  <!-- Stats cards -->
+  <div class="grid grid-cols-4 gap-4">
+    <div class="border border-gray-800 p-4">
+      <div class="text-2xl font-bold">{{ stats.nodes }}</div>
+      <div class="text-xs text-gray-400 mt-1">Nodes</div>
+    </div>
+    <div class="border border-gray-800 p-4">
+      <div class="text-2xl font-bold">{{ stats.edges }}</div>
+      <div class="text-xs text-gray-400 mt-1">Edges</div>
+    </div>
+    <div class="border border-gray-800 p-4">
+      <div class="text-2xl font-bold">{{ stats.components }}</div>
+      <div class="text-xs text-gray-400 mt-1">Components</div>
+    </div>
+    <div class="border border-gray-800 p-4">
+      <div class="text-2xl font-bold">{{ stats.pending_proposals }}</div>
+      <div class="text-xs text-gray-400 mt-1">Pending Proposals</div>
+    </div>
+  </div>
+
+  <!-- Cytoscape visualization -->
+  <div id="cy-container">
+    <!-- Controls -->
+    <div id="controls">
+      <div class="panel-section">
+        <div class="panel-title">Search</div>
+        <input type="text" id="search-input" placeholder="Type to search…" oninput="onSearch(this.value)">
+        <div id="search-results"></div>
+      </div>
+      <div class="panel-section">
+        <div class="panel-title">Layout</div>
+        <div class="btn-grid">
+          <button class="ctrl-btn" data-layout="cose" onclick="changeLayout('cose')">Force</button>
+          <button class="ctrl-btn" data-layout="circle" onclick="changeLayout('circle')">Circle</button>
+          <button class="ctrl-btn" data-layout="breadthfirst" onclick="changeLayout('breadthfirst')">Tree</button>
+          <button class="ctrl-btn" data-layout="grid" onclick="changeLayout('grid')">Grid</button>
+          <button class="ctrl-btn" data-layout="concentric" onclick="changeLayout('concentric')">Radial</button>
+        </div>
+      </div>
+      <div class="panel-section">
+        <div class="panel-title">Min Confidence</div>
+        <div class="slider-row">
+          <input type="range" id="confidence-slider" min="0" max="100" value="0"
+                 oninput="onConfidenceChange(this.value)">
+          <span class="slider-val" id="confidence-val">0.00</span>
+        </div>
+      </div>
+      <div class="panel-section">
+        <div class="panel-title">Node Types</div>
+        <div class="filter-scroll" id="type-filters"></div>
+      </div>
+      <div class="panel-section">
+        <div class="panel-title">Relations</div>
+        <div class="filter-scroll" id="relation-filters"></div>
+      </div>
+      <div class="panel-section">
+        <div class="btn-grid">
+          <button class="ctrl-btn" onclick="cy.fit(undefined, 40)">Fit</button>
+          <button class="ctrl-btn" onclick="resetFilters()">Reset</button>
+          <button class="ctrl-btn" onclick="highlightHighDegree()">Hubs</button>
+          <button class="ctrl-btn" onclick="exportPNG()">PNG</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Detail panel -->
+    <div id="detail-panel">
+      <div class="detail-header">
+        <h3 id="detail-title">&mdash;</h3>
+        <button class="detail-close" onclick="closeDetail()">&times;</button>
+      </div>
+      <div class="detail-section" id="detail-content"></div>
+      <div class="detail-section">
+        <div class="panel-title">Connections</div>
+        <div id="neighbors-list"></div>
+      </div>
+    </div>
+
+    <!-- Cytoscape canvas -->
+    <div id="cy"></div>
+  </div>
+
+  <!-- Sources -->
+  {% if sources %}
+  <div>
+    <h2 class="text-lg font-bold mb-3">Ingested Sources</h2>
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-gray-800 text-gray-400 text-left">
+          <th class="pb-2 font-normal">Document</th>
+          <th class="pb-2 font-normal text-right">Version</th>
+          <th class="pb-2 font-normal text-right">Characters</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for doc_id, info in sources.items() %}
+        <tr class="border-b border-gray-800">
+          <td class="py-2">{{ doc_id }}</td>
+          <td class="py-2 text-right text-gray-400">v{{ info.get("version", 1) }}</td>
+          <td class="py-2 text-right text-gray-400">{{ info.get("char_count", "—") }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+// --- Data injected from server ---
+const elements = {{ elements_json|safe }};
+const typeColors = {{ type_colors_json|safe }};
+const relationColors = {{ relation_colors_json|safe }};
+const graphStats = {{ stats_json|safe }};
+
+// --- Build filter checkboxes ---
+(function() {
+  const tf = document.getElementById('type-filters');
+  Object.entries(typeColors).forEach(([t, c]) => {
+    tf.innerHTML += `<label class="filter-item"><input type="checkbox" checked data-type="${t}" onchange="applyFilters()"><span class="color-dot" style="background:${c}"></span>${t}</label>`;
+  });
+  const rf = document.getElementById('relation-filters');
+  Object.entries(relationColors).forEach(([r, c]) => {
+    rf.innerHTML += `<label class="filter-item"><input type="checkbox" checked data-relation="${r}" onchange="applyFilters()"><span class="color-line" style="background:${c}"></span>${r}</label>`;
+  });
+})();
+
+// --- Init Cytoscape ---
+const cy = cytoscape({
+  container: document.getElementById('cy'),
+  elements: elements,
+  style: [
+    {
+      selector: 'node',
+      style: {
+        'background-color': 'data(color)',
+        'label': 'data(label)',
+        'color': '#d1d5db',
+        'font-size': '11px',
+        'text-valign': 'bottom',
+        'text-margin-y': 6,
+        'text-outline-color': '#0a0a0a',
+        'text-outline-width': 2,
+        'width': function(ele) { return 16 + Math.min(ele.data('degree') * 3, 40); },
+        'height': function(ele) { return 16 + Math.min(ele.data('degree') * 3, 40); },
+        'border-width': 2,
+        'border-color': '#0a0a0a',
+        'opacity': 1,
+        'transition-property': 'opacity, border-color, border-width, width, height',
+        'transition-duration': '0.2s',
+      }
+    },
+    {
+      selector: 'node:selected',
+      style: { 'border-color': '#fff', 'border-width': 3, 'font-weight': 'bold' }
+    },
+    {
+      selector: 'node.dimmed',
+      style: { 'opacity': 0.15 }
+    },
+    {
+      selector: 'node.highlighted',
+      style: {
+        'border-color': '#fff',
+        'border-width': 4,
+        'font-size': '13px',
+        'font-weight': 'bold',
+        'z-index': 999,
+      }
+    },
+    {
+      selector: 'edge',
+      style: {
+        'line-color': 'data(color)',
+        'target-arrow-color': 'data(color)',
+        'target-arrow-shape': 'triangle',
+        'arrow-scale': 0.8,
+        'width': function(ele) { return Math.max(1, ele.data('confidence') * 3); },
+        'curve-style': 'bezier',
+        'opacity': 0.7,
+        'label': 'data(relation)',
+        'font-size': '9px',
+        'color': '#6b7280',
+        'text-rotation': 'autorotate',
+        'text-outline-color': '#0a0a0a',
+        'text-outline-width': 1.5,
+        'transition-property': 'opacity, line-color, width',
+        'transition-duration': '0.2s',
+      }
+    },
+    { selector: 'edge.dimmed', style: { 'opacity': 0.05 } },
+    { selector: 'edge.highlighted', style: { 'opacity': 1, 'width': 3, 'z-index': 999 } },
+    { selector: 'node.hidden, edge.hidden', style: { 'display': 'none' } },
+  ],
+  layout: { name: 'cose', animate: true, animationDuration: 600,
+            nodeRepulsion: function() { return 8000; }, idealEdgeLength: function() { return 100; },
+            padding: 60 },
+  minZoom: 0.1,
+  maxZoom: 5,
+  wheelSensitivity: 0.3,
+});
+
+// --- Layout ---
+let currentLayout = 'cose';
+document.querySelector('[data-layout="cose"]')?.classList.add('active');
+
+function changeLayout(name) {
+  document.querySelectorAll('.ctrl-btn[data-layout]').forEach(b => b.classList.remove('active'));
+  document.querySelector(`[data-layout="${name}"]`)?.classList.add('active');
+  currentLayout = name;
+  const opts = { name, animate: true, animationDuration: 500, padding: 60 };
+  if (name === 'cose') {
+    opts.nodeRepulsion = function() { return 8000; };
+    opts.idealEdgeLength = function() { return 100; };
+  }
+  if (name === 'breadthfirst') { opts.spacingFactor = 1.2; }
+  if (name === 'concentric') {
+    opts.concentric = function(n) { return n.degree(); };
+    opts.levelWidth = function() { return 2; };
+  }
+  cy.layout(opts).run();
+}
+
+// --- Search ---
+function onSearch(query) {
+  const results = document.getElementById('search-results');
+  if (!query || query.length < 2) {
+    results.innerHTML = '';
+    cy.nodes().removeClass('highlighted dimmed');
+    cy.edges().removeClass('highlighted dimmed');
+    return;
+  }
+  const q = query.toLowerCase();
+  const matches = cy.nodes().filter(n =>
+    n.data('label').toLowerCase().includes(q) ||
+    n.data('id').toLowerCase().includes(q) ||
+    n.data('type').toLowerCase().includes(q)
+  );
+  results.innerHTML = matches.map(n =>
+    `<div class="search-result" onclick="focusNode('${n.id()}')">${n.data('label')} <span style="color:#6b7280">(${n.data('type')})</span></div>`
+  ).join('');
+  cy.nodes().addClass('dimmed');
+  cy.edges().addClass('dimmed');
+  matches.removeClass('dimmed').addClass('highlighted');
+  matches.connectedEdges().removeClass('dimmed');
+}
+
+function focusNode(nodeId) {
+  const node = cy.getElementById(nodeId);
+  if (!node.length) return;
+  cy.nodes().removeClass('highlighted dimmed');
+  cy.edges().removeClass('highlighted dimmed');
+  showNodeNeighborhood(node);
+  cy.animate({ center: { eles: node }, zoom: 1.5 }, { duration: 400 });
+  showDetail(node);
+}
+
+// --- Confidence filter ---
+let minConfidence = 0;
+function onConfidenceChange(val) {
+  minConfidence = val / 100;
+  document.getElementById('confidence-val').textContent = minConfidence.toFixed(2);
+  applyFilters();
+}
+
+// --- Filters ---
+function applyFilters() {
+  const activeTypes = new Set();
+  document.querySelectorAll('#type-filters input:checked').forEach(cb => activeTypes.add(cb.dataset.type));
+  const activeRelations = new Set();
+  document.querySelectorAll('#relation-filters input:checked').forEach(cb => activeRelations.add(cb.dataset.relation));
+  cy.nodes().forEach(node => {
+    const visible = activeTypes.has(node.data('type')) && node.data('confidence') >= minConfidence;
+    node.toggleClass('hidden', !visible);
+  });
+  cy.edges().forEach(edge => {
+    const srcVisible = !edge.source().hasClass('hidden');
+    const tgtVisible = !edge.target().hasClass('hidden');
+    const relVisible = activeRelations.has(edge.data('relation'));
+    const confVisible = edge.data('confidence') >= minConfidence;
+    edge.toggleClass('hidden', !(srcVisible && tgtVisible && relVisible && confVisible));
+  });
+}
+
+function resetFilters() {
+  document.querySelectorAll('#type-filters input, #relation-filters input').forEach(cb => cb.checked = true);
+  document.getElementById('confidence-slider').value = 0;
+  document.getElementById('confidence-val').textContent = '0.00';
+  minConfidence = 0;
+  cy.nodes().removeClass('hidden highlighted dimmed');
+  cy.edges().removeClass('hidden highlighted dimmed');
+  document.getElementById('search-input').value = '';
+  document.getElementById('search-results').innerHTML = '';
+}
+
+// --- Node interaction ---
+function showNodeNeighborhood(node) {
+  const neighborhood = node.neighborhood().add(node);
+  cy.elements().addClass('dimmed');
+  neighborhood.removeClass('dimmed');
+  neighborhood.edges().addClass('highlighted');
+  node.addClass('highlighted');
+}
+
+cy.on('tap', 'node', function(evt) {
+  cy.elements().removeClass('highlighted dimmed');
+  showNodeNeighborhood(evt.target);
+  showDetail(evt.target);
+});
+
+cy.on('tap', 'edge', function(evt) {
+  const edge = evt.target;
+  cy.elements().removeClass('highlighted dimmed').addClass('dimmed');
+  edge.removeClass('dimmed').addClass('highlighted');
+  edge.source().removeClass('dimmed').addClass('highlighted');
+  edge.target().removeClass('dimmed').addClass('highlighted');
+  showEdgeDetail(edge);
+});
+
+cy.on('tap', function(evt) {
+  if (evt.target === cy) {
+    cy.elements().removeClass('highlighted dimmed');
+    closeDetail();
+  }
+});
+
+// --- Detail panel ---
+function showDetail(node) {
+  const panel = document.getElementById('detail-panel');
+  const d = node.data();
+  document.getElementById('detail-title').textContent = d.label;
+  let html = '';
+  html += detailRow('ID', d.id);
+  html += detailRow('Type', `<span class="badge" style="background:${d.color};color:#fff">${d.type}</span>`);
+  html += detailRow('Confidence', d.confidence.toFixed(2));
+  html += detailRow('Source', d.source);
+  html += detailRow('Degree', d.degree);
+  const props = d.properties || {};
+  Object.entries(props).forEach(([k, v]) => {
+    if (k !== 'body_text') html += detailRow(k, typeof v === 'object' ? JSON.stringify(v) : v);
+  });
+  document.getElementById('detail-content').innerHTML = html;
+  const neighbors = node.neighborhood('node');
+  let nhtml = '';
+  neighbors.forEach(n => {
+    const edges = node.edgesWith(n);
+    const relations = edges.map(e => e.data('relation')).join(', ');
+    nhtml += `<div class="neighbor-item" onclick="focusNode('${n.id()}')"><span class="color-dot" style="background:${n.data('color')};display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:3px"></span>${n.data('label')} <span style="color:#6b7280;font-size:10px">(${relations})</span></div>`;
+  });
+  document.getElementById('neighbors-list').innerHTML = nhtml || '<span style="color:#6b7280;font-size:11px">No connections</span>';
+  panel.classList.add('visible');
+}
+
+function showEdgeDetail(edge) {
+  const panel = document.getElementById('detail-panel');
+  const d = edge.data();
+  document.getElementById('detail-title').textContent = d.relation;
+  let html = '';
+  html += detailRow('Source', d.source);
+  html += detailRow('Target', d.target);
+  html += detailRow('Relation', `<span style="color:${d.color};font-weight:600">${d.relation}</span>`);
+  html += detailRow('Confidence', d.confidence.toFixed(2));
+  html += detailRow('Provenance', d.source_tag);
+  html += detailRow('Weight', d.weight);
+  const props = d.properties || {};
+  Object.entries(props).forEach(([k, v]) => {
+    if (v) html += detailRow(k, typeof v === 'object' ? JSON.stringify(v) : v);
+  });
+  document.getElementById('detail-content').innerHTML = html;
+  document.getElementById('neighbors-list').innerHTML = '';
+  panel.classList.add('visible');
+}
+
+function detailRow(key, val) {
+  return `<div class="detail-row"><span class="detail-key">${key}</span><span class="detail-val">${val}</span></div>`;
+}
+
+function closeDetail() {
+  document.getElementById('detail-panel').classList.remove('visible');
+}
+
+// --- Actions ---
+function highlightHighDegree() {
+  cy.elements().removeClass('highlighted dimmed');
+  const nodes = cy.nodes(':visible');
+  if (!nodes.length) return;
+  const degrees = nodes.map(n => n.degree());
+  const maxDeg = Math.max(...degrees);
+  const threshold = Math.max(maxDeg * 0.5, 2);
+  cy.elements().addClass('dimmed');
+  nodes.forEach(n => {
+    if (n.degree() >= threshold) {
+      n.removeClass('dimmed').addClass('highlighted');
+      n.connectedEdges().removeClass('dimmed');
+      n.neighborhood('node').removeClass('dimmed');
+    }
+  });
+}
+
+function exportPNG() {
+  const png = cy.png({ full: true, scale: 2, bg: '#0a0a0a' });
+  const link = document.createElement('a');
+  link.href = png;
+  link.download = '{{ graph_name }}.png';
+  link.click();
+}
+
+// --- Keyboard shortcuts ---
+document.addEventListener('keydown', function(e) {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.key === 'Escape') { cy.elements().removeClass('highlighted dimmed'); closeDetail(); }
+  if (e.key === 'f' || e.key === 'F') { cy.fit(undefined, 40); }
+  if (e.key === '/') { e.preventDefault(); document.getElementById('search-input').focus(); }
+});
+</script>
+{% endblock %}

@@ -3699,6 +3699,104 @@ TEXT:
     # Visualization — Cytoscape.js (detailed interactive view)
     # ------------------------------------------------------------------
 
+    def cytoscape_elements(
+        self,
+        *,
+        center_node: str | None = None,
+        depth: int | None = None,
+        min_confidence: float = 0.0,
+    ) -> dict:
+        """Return Cytoscape.js data needed to render an interactive graph.
+
+        Returns a dict with keys:
+          - ``elements``: list of Cytoscape element dicts (nodes + edges)
+          - ``type_colors``: mapping of node type → hex colour
+          - ``relation_colors``: mapping of relation → hex colour
+          - ``types``: sorted list of node types present
+          - ``relations``: sorted list of relation types present
+          - ``proposals``: list of pending relation proposals
+          - ``stats``: dict with node/edge/component/proposal counts
+        """
+        if center_node and depth:
+            subgraph = self.get_subgraph(center_node, depth=depth)
+            render_nodes = subgraph["nodes"]
+            render_edges = subgraph["edges"]
+        else:
+            render_nodes = self._data["nodes"]
+            render_edges = self._data["edges"]
+
+        if min_confidence > 0:
+            render_edges = [
+                e for e in render_edges
+                if e.get("confidence", 1.0) >= min_confidence
+            ]
+
+        elements: list[dict] = []
+        degree: dict[str, int] = defaultdict(int)
+        for e in render_edges:
+            degree[e["source"]] += 1
+            degree[e["target"]] += 1
+
+        for nid, node in render_nodes.items():
+            ntype = node.get("type", "custom")
+            elements.append({
+                "group": "nodes",
+                "data": {
+                    "id": nid,
+                    "label": node.get("label", nid),
+                    "type": ntype,
+                    "color": self._node_color(ntype),
+                    "confidence": node.get("confidence", 1.0),
+                    "source": node.get("source", "unknown"),
+                    "degree": degree.get(nid, 0),
+                    "properties": node.get("properties", {}),
+                },
+            })
+
+        for i, edge in enumerate(render_edges):
+            src, tgt = edge["source"], edge["target"]
+            if src not in render_nodes or tgt not in render_nodes:
+                continue
+            relation = edge.get("relation", "related_to")
+            elements.append({
+                "group": "edges",
+                "data": {
+                    "id": f"e{i}",
+                    "source": src,
+                    "target": tgt,
+                    "relation": relation,
+                    "color": self._edge_color(relation),
+                    "confidence": edge.get("confidence", 1.0),
+                    "source_tag": edge.get("source_tag", "unknown"),
+                    "weight": edge.get("weight", 1.0),
+                    "properties": edge.get("properties", {}),
+                },
+            })
+
+        types_present = sorted({n.get("type", "custom") for n in render_nodes.values()})
+        relations_present = sorted({e.get("relation", "related_to") for e in render_edges})
+
+        pending_proposals = [
+            {"name": p.name, "confidence": p.confidence,
+             "justification": p.justification, "num_examples": len(p.examples)}
+            for p in self.get_proposals(status=ProposalStatus.PENDING.value)
+        ]
+
+        return {
+            "elements": elements,
+            "type_colors": {t: self._node_color(t) for t in types_present},
+            "relation_colors": {r: self._edge_color(r) for r in relations_present},
+            "types": types_present,
+            "relations": relations_present,
+            "proposals": pending_proposals,
+            "stats": {
+                "nodes": len(render_nodes),
+                "edges": len(render_edges),
+                "components": nx.number_weakly_connected_components(self._G),
+                "pending_proposals": len(pending_proposals),
+            },
+        }
+
     def export_cytoscape(
         self,
         output_path: str | Path = "graph_cytoscape.html",

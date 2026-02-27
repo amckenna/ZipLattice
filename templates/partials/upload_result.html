@@ -1,0 +1,78 @@
+{% if error %}
+<div class="border border-red-900 bg-red-950 p-4 text-sm">
+  <span class="text-red-400 font-bold">Error:</span> {{ error }}
+</div>
+{% else %}
+<div class="space-y-4">
+  <div class="border border-gray-800 p-4">
+    <h3 class="text-sm font-bold mb-2">Converted {{ files|length }} file(s) for graph "{{ graph_name }}"</h3>
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-gray-800 text-gray-400 text-left">
+          <th class="pb-1 font-normal">File</th>
+          <th class="pb-1 font-normal text-right">Characters</th>
+          <th class="pb-1 font-normal text-right">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in files %}
+        <tr class="border-b border-gray-800">
+          <td class="py-1">{{ f.name }}</td>
+          <td class="py-1 text-right text-gray-400">{{ f.chars }}</td>
+          <td class="py-1 text-right">
+            {% if f.error %}
+            <span class="text-red-400">{{ f.error }}</span>
+            {% else %}
+            <span class="text-green-400">OK</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Ingest form -->
+  <form hx-post="/ingest" hx-target="#ingest-result" hx-swap="innerHTML" class="space-y-4">
+    <input type="hidden" name="graph_name" value="{{ graph_name }}">
+    <input type="hidden" name="batch_id" value="{{ batch_id }}">
+
+    <details class="border border-gray-800">
+      <summary class="px-3 py-2 text-sm text-gray-400 cursor-pointer hover:text-white">
+        Ingestion Settings
+      </summary>
+      <div class="px-3 py-3 space-y-3 border-t border-gray-800">
+        <div class="grid grid-cols-2 gap-3">
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">API URL</label>
+            <input type="text" name="api_url" value="http://localhost:11434"
+                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          </div>
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Query Model</label>
+            <input type="text" name="query_model" value="qwen3-coder:30b"
+                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          </div>
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Embed URL</label>
+            <input type="text" name="embed_url" value=""
+                   placeholder="Same as API URL"
+                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          </div>
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Embed Model</label>
+            <input type="text" name="embed_model" value="nomic-embed-text"
+                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <button type="submit"
+            class="border border-white px-6 py-2 text-sm hover:bg-white hover:text-black transition-colors">
+      Ingest into "{{ graph_name }}"
+    </button>
+    <span class="htmx-indicator text-sm text-gray-400 ml-3">Ingesting (this may take a while)…</span>
+  </form>
+</div>
+{% endif %}
