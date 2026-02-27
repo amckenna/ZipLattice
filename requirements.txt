@@ -1,0 +1,22 @@
+# ZipLattice - Python dependencies
+# Install all:  pip install -r requirements.txt
+
+# --- Core ---
+networkx
+
+# --- Web frontend ---
+fastapi
+uvicorn
+python-multipart
+jinja2
+
+# --- Visualization (optional) ---
+# pyvis
+
+# --- Document converter (optional) ---
+# pymupdf4llm
+# mammoth
+# markdownify
+
+# --- Testing ---
+# pytest
