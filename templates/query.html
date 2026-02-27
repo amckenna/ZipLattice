@@ -32,13 +32,16 @@
     <div class="space-y-2">
       <label class="block text-sm text-gray-400">Mode</label>
       <div class="flex gap-4">
-        <label class="flex items-center gap-2 text-sm cursor-pointer">
+        <label class="flex items-center gap-2 text-sm cursor-pointer"
+               title="Semantic similarity search — returns the most relevant nodes ranked by how closely they match your query.">
           <input type="radio" name="mode" value="search" checked class="accent-white"> Search
         </label>
-        <label class="flex items-center gap-2 text-sm cursor-pointer">
+        <label class="flex items-center gap-2 text-sm cursor-pointer"
+               title="Build a RAG context block — searches for relevant nodes, expands their neighborhoods, and formats everything as structured text you can paste into an LLM prompt.">
           <input type="radio" name="mode" value="context" class="accent-white"> Context
         </label>
-        <label class="flex items-center gap-2 text-sm cursor-pointer">
+        <label class="flex items-center gap-2 text-sm cursor-pointer"
+               title="Ask a question — builds context from the graph and sends it along with your question to an LLM for a full natural-language answer. Requires a running model.">
           <input type="radio" name="mode" value="ask" class="accent-white"> Ask
         </label>
       </div>
