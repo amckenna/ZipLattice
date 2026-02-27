@@ -5,55 +5,55 @@
 {% block head %}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
 <style>
-  #cy-container { position: relative; width: 100%; height: 75vh; border: 1px solid #374151; }
-  #cy { width: 100%; height: 100%; background: #0a0a0a; }
+  #cy-container { position: relative; width: 100%; height: 75vh; border: 1px solid var(--border-strong); }
+  #cy { width: 100%; height: 100%; background: var(--graph-bg); }
 
   /* Control panel overlay */
   #controls {
     position: absolute; top: 10px; left: 10px; width: 240px; z-index: 10;
-    background: rgba(0, 0, 0, 0.9); border: 1px solid #374151;
+    background: var(--overlay); border: 1px solid var(--border-strong);
     max-height: calc(75vh - 32px); overflow-y: auto; font-size: 12px;
   }
-  .panel-section { padding: 8px 12px; border-bottom: 1px solid #1f2937; }
+  .panel-section { padding: 8px 12px; border-bottom: 1px solid var(--border); }
   .panel-section:last-child { border-bottom: none; }
   .panel-title {
     font-size: 10px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: 0.05em; color: #6b7280; margin-bottom: 4px;
+    letter-spacing: 0.05em; color: var(--text-4); margin-bottom: 4px;
   }
 
   /* Search */
   #search-input {
-    width: 100%; padding: 4px 8px; background: #111; border: 1px solid #374151;
-    color: #fff; font-size: 12px; outline: none; font-family: inherit;
+    width: 100%; padding: 4px 8px; background: var(--surface); border: 1px solid var(--border-strong);
+    color: var(--text); font-size: 12px; outline: none; font-family: inherit;
   }
-  #search-input:focus { border-color: #fff; }
+  #search-input:focus { border-color: var(--accent); }
   #search-results { margin-top: 4px; max-height: 100px; overflow-y: auto; }
   .search-result {
-    padding: 2px 4px; cursor: pointer; color: #9ca3af;
+    padding: 2px 4px; cursor: pointer; color: var(--text-3);
   }
-  .search-result:hover { background: #1f2937; color: #fff; }
+  .search-result:hover { background: var(--border); color: var(--text); }
 
   /* Layout / action buttons */
   .btn-grid { display: flex; flex-wrap: wrap; gap: 4px; }
   .ctrl-btn {
-    padding: 3px 8px; background: #111; border: 1px solid #374151;
-    color: #9ca3af; font-size: 11px; cursor: pointer; font-family: inherit;
+    padding: 3px 8px; background: var(--surface); border: 1px solid var(--border-strong);
+    color: var(--text-3); font-size: 11px; cursor: pointer; font-family: inherit;
     transition: all 0.15s;
   }
-  .ctrl-btn:hover { border-color: #fff; color: #fff; }
-  .ctrl-btn.active { background: #fff; color: #000; border-color: #fff; }
+  .ctrl-btn:hover { border-color: var(--accent); color: var(--text); }
+  .ctrl-btn.active { background: var(--accent); color: var(--accent-inv); border-color: var(--accent); }
 
   /* Confidence slider */
   .slider-row { display: flex; align-items: center; gap: 6px; }
-  .slider-row input[type=range] { flex: 1; accent-color: #fff; }
-  .slider-val { font-size: 11px; color: #9ca3af; min-width: 28px; text-align: right; }
+  .slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .slider-val { font-size: 11px; color: var(--text-3); min-width: 28px; text-align: right; }
 
   /* Filter checkboxes */
   .filter-item {
     display: flex; align-items: center; gap: 5px; font-size: 11px;
-    color: #9ca3af; cursor: pointer; padding: 1px 0;
+    color: var(--text-3); cursor: pointer; padding: 1px 0;
   }
-  .filter-item input { accent-color: #fff; }
+  .filter-item input { accent-color: var(--accent); }
   .color-dot {
     display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
   }
@@ -65,32 +65,32 @@
   /* Detail panel overlay */
   #detail-panel {
     position: absolute; top: 10px; right: 10px; width: 280px; z-index: 10;
-    background: rgba(0, 0, 0, 0.9); border: 1px solid #374151;
+    background: var(--overlay); border: 1px solid var(--border-strong);
     max-height: calc(75vh - 32px); overflow-y: auto;
     display: none;
   }
   #detail-panel.visible { display: block; }
   .detail-header {
-    padding: 10px 12px; border-bottom: 1px solid #1f2937;
+    padding: 10px 12px; border-bottom: 1px solid var(--border);
     display: flex; justify-content: space-between; align-items: center;
   }
   .detail-header h3 { font-size: 13px; font-weight: 600; }
   .detail-close {
-    background: none; border: none; color: #6b7280; font-size: 16px;
+    background: none; border: none; color: var(--text-4); font-size: 16px;
     cursor: pointer; padding: 2px 4px;
   }
-  .detail-close:hover { color: #fff; }
+  .detail-close:hover { color: var(--text); }
   .detail-row {
     display: flex; justify-content: space-between; padding: 3px 0;
-    font-size: 11px; border-bottom: 1px solid #1f2937;
+    font-size: 11px; border-bottom: 1px solid var(--border);
   }
-  .detail-key { color: #6b7280; }
-  .detail-val { color: #e5e7eb; text-align: right; max-width: 160px; word-break: break-word; }
+  .detail-key { color: var(--text-4); }
+  .detail-val { color: var(--text-2); text-align: right; max-width: 160px; word-break: break-word; }
   .detail-section { padding: 8px 12px; }
   .neighbor-item {
-    font-size: 11px; color: #9ca3af; padding: 2px 0; cursor: pointer;
+    font-size: 11px; color: var(--text-3); padding: 2px 0; cursor: pointer;
   }
-  .neighbor-item:hover { color: #fff; }
+  .neighbor-item:hover { color: var(--text); }
   .badge {
     display: inline-block; padding: 1px 6px; border-radius: 8px;
     font-size: 10px; font-weight: 600;
@@ -99,7 +99,7 @@
   /* Scrollbar */
   #controls ::-webkit-scrollbar, #detail-panel ::-webkit-scrollbar { width: 4px; }
   #controls ::-webkit-scrollbar-thumb, #detail-panel ::-webkit-scrollbar-thumb {
-    background: #374151; border-radius: 2px;
+    background: var(--border-strong); border-radius: 2px;
   }
 </style>
 {% endblock %}
@@ -223,6 +223,11 @@
 </div>
 
 <script>
+// --- Theme helper ---
+function themeVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
 // --- Data injected from server ---
 const elements = {{ elements_json|safe }};
 const typeColors = {{ type_colors_json|safe }};
@@ -251,16 +256,16 @@ const cy = cytoscape({
       style: {
         'background-color': 'data(color)',
         'label': 'data(label)',
-        'color': '#d1d5db',
+        'color': themeVar('--text-2'),
         'font-size': '11px',
         'text-valign': 'bottom',
         'text-margin-y': 6,
-        'text-outline-color': '#0a0a0a',
+        'text-outline-color': themeVar('--graph-bg'),
         'text-outline-width': 2,
         'width': function(ele) { return 16 + Math.min(ele.data('degree') * 3, 40); },
         'height': function(ele) { return 16 + Math.min(ele.data('degree') * 3, 40); },
         'border-width': 2,
-        'border-color': '#0a0a0a',
+        'border-color': themeVar('--graph-bg'),
         'opacity': 1,
         'transition-property': 'opacity, border-color, border-width, width, height',
         'transition-duration': '0.2s',
@@ -268,7 +273,7 @@ const cy = cytoscape({
     },
     {
       selector: 'node:selected',
-      style: { 'border-color': '#fff', 'border-width': 3, 'font-weight': 'bold' }
+      style: { 'border-color': themeVar('--accent'), 'border-width': 3, 'font-weight': 'bold' }
     },
     {
       selector: 'node.dimmed',
@@ -277,7 +282,7 @@ const cy = cytoscape({
     {
       selector: 'node.highlighted',
       style: {
-        'border-color': '#fff',
+        'border-color': themeVar('--accent'),
         'border-width': 4,
         'font-size': '13px',
         'font-weight': 'bold',
@@ -296,9 +301,9 @@ const cy = cytoscape({
         'opacity': 0.7,
         'label': 'data(relation)',
         'font-size': '9px',
-        'color': '#6b7280',
+        'color': themeVar('--text-4'),
         'text-rotation': 'autorotate',
-        'text-outline-color': '#0a0a0a',
+        'text-outline-color': themeVar('--graph-bg'),
         'text-outline-width': 1.5,
         'transition-property': 'opacity, line-color, width',
         'transition-duration': '0.2s',
@@ -353,7 +358,7 @@ function onSearch(query) {
     n.data('type').toLowerCase().includes(q)
   );
   results.innerHTML = matches.map(n =>
-    `<div class="search-result" onclick="focusNode('${n.id()}')">${n.data('label')} <span style="color:#6b7280">(${n.data('type')})</span></div>`
+    `<div class="search-result" onclick="focusNode('${n.id()}')">${n.data('label')} <span style="color:var(--text-4)">(${n.data('type')})</span></div>`
   ).join('');
   cy.nodes().addClass('dimmed');
   cy.edges().addClass('dimmed');
@@ -461,9 +466,9 @@ function showDetail(node) {
   neighbors.forEach(n => {
     const edges = node.edgesWith(n);
     const relations = edges.map(e => e.data('relation')).join(', ');
-    nhtml += `<div class="neighbor-item" onclick="focusNode('${n.id()}')"><span class="color-dot" style="background:${n.data('color')};display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:3px"></span>${n.data('label')} <span style="color:#6b7280;font-size:10px">(${relations})</span></div>`;
+    nhtml += `<div class="neighbor-item" onclick="focusNode('${n.id()}')"><span class="color-dot" style="background:${n.data('color')};display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:3px"></span>${n.data('label')} <span style="color:var(--text-4);font-size:10px">(${relations})</span></div>`;
   });
-  document.getElementById('neighbors-list').innerHTML = nhtml || '<span style="color:#6b7280;font-size:11px">No connections</span>';
+  document.getElementById('neighbors-list').innerHTML = nhtml || '<span style="color:var(--text-4);font-size:11px">No connections</span>';
   panel.classList.add('visible');
 }
 
@@ -514,7 +519,7 @@ function highlightHighDegree() {
 }
 
 function exportPNG() {
-  const png = cy.png({ full: true, scale: 2, bg: '#0a0a0a' });
+  const png = cy.png({ full: true, scale: 2, bg: themeVar('--graph-bg') });
   const link = document.createElement('a');
   link.href = png;
   link.download = '{{ graph_name }}.png';
@@ -527,6 +532,23 @@ document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape') { cy.elements().removeClass('highlighted dimmed'); closeDetail(); }
   if (e.key === 'f' || e.key === 'F') { cy.fit(undefined, 40); }
   if (e.key === '/') { e.preventDefault(); document.getElementById('search-input').focus(); }
+});
+
+// --- Theme change: update Cytoscape styles ---
+window.addEventListener('themechange', function() {
+  cy.style()
+    .selector('node').style({
+      'color': themeVar('--text-2'),
+      'text-outline-color': themeVar('--graph-bg'),
+      'border-color': themeVar('--graph-bg'),
+    })
+    .selector('node:selected').style({ 'border-color': themeVar('--accent') })
+    .selector('node.highlighted').style({ 'border-color': themeVar('--accent') })
+    .selector('edge').style({
+      'color': themeVar('--text-4'),
+      'text-outline-color': themeVar('--graph-bg'),
+    })
+    .update();
 });
 </script>
 {% endblock %}
