@@ -81,7 +81,8 @@ def test_query_page():
 
 def test_create_graph():
     resp = client.post("/graphs/create", data={"name": "Test Graph"}, follow_redirects=False)
-    assert resp.status_code == 303
+    assert resp.status_code == 200
+    assert resp.headers.get("hx-redirect") == "/"
 
     # Verify it appears on dashboard
     resp = client.get("/")

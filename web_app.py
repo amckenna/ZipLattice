@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from knowledge_graph import GraphEncoder, KnowledgeGraph, _strip_thinking, ollama_embed
@@ -219,7 +219,9 @@ async def create_graph(request: Request, name: str = Form(...)):
     graph_dir.mkdir(parents=True, exist_ok=True)
     kg = KnowledgeGraph(graph_dir / f"{slug}.json")
     kg.save()
-    return RedirectResponse(url="/", status_code=303)
+    response = HTMLResponse(content="")
+    response.headers["HX-Redirect"] = "/"
+    return response
 
 
 @app.get("/graphs/{name}", response_class=HTMLResponse)
@@ -309,7 +311,7 @@ async def upload_files(
     })
 
 
-@app.post("/ingest", response_class=HTMLResponse)
+@app.post("/ingest")
 async def ingest_documents(
     request: Request,
     graph_name: str = Form(...),
@@ -319,63 +321,111 @@ async def ingest_documents(
     embed_url: str = Form(""),
     embed_model: str = Form("nomic-embed-text"),
 ):
-    """Run LLM ingestion on previously uploaded documents."""
+    """Run LLM ingestion with streaming progress log."""
     batch = _upload_batches.pop(batch_id, None)
     if not batch:
-        return templates.TemplateResponse("partials/ingest_result.html", {
-            "request": request,
-            "error": "Upload batch not found. Please re-upload your files.",
-        })
+        return HTMLResponse(
+            json.dumps({"type": "error", "message": "Upload batch not found. Please re-upload your files."}) + "\n"
+        )
 
     try:
         kg = _load_graph(graph_name)
     except Exception as exc:
-        return templates.TemplateResponse("partials/ingest_result.html", {
-            "request": request,
-            "error": f"Cannot load graph '{graph_name}': {exc}",
-        })
+        return HTMLResponse(
+            json.dumps({"type": "error", "message": f"Cannot load graph '{graph_name}': {exc}"}) + "\n"
+        )
 
-    extract_fn = _build_llm_extract_fn(query_model, api_url)
+    def _stream():
+        extract_fn = _build_llm_extract_fn(query_model, api_url)
+        results = []
+        total_docs = len(batch)
 
-    results = []
-    for doc in batch:
+        for di, doc in enumerate(batch):
+            yield json.dumps({"type": "log", "message": f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}'..."}) + "\n"
+
+            def _progress(event):
+                pass  # progress events are yielded via the section callbacks below
+
+            try:
+                section_events: list[dict] = []
+
+                def _capture_progress(event: dict):
+                    section_events.append(event)
+
+                stats = kg.ingest_markdown(
+                    doc["text"],
+                    doc["doc_id"],
+                    llm_extract_fn=extract_fn,
+                    original_path=doc.get("filename"),
+                    progress_fn=_capture_progress,
+                )
+                results.append(stats)
+
+                # Replay captured progress events as log lines
+                for ev in section_events:
+                    evt = ev.get("event", "")
+                    idx = ev.get("index", 0) + 1
+                    total = ev.get("total", "?")
+                    heading = ev.get("heading", "")
+                    if evt == "section_start":
+                        yield json.dumps({"type": "log", "message": f"  section {idx}/{total}: {heading} ({ev.get('char_count', 0)} chars)..."}) + "\n"
+                    elif evt == "section_done":
+                        elapsed = ev.get("elapsed_seconds", 0)
+                        triples = ev.get("triples_processed", 0)
+                        nodes = ev.get("nodes_added", 0)
+                        edges = ev.get("edges_added", 0)
+                        yield json.dumps({"type": "log", "message": f"    +{triples} triples, +{nodes} nodes, +{edges} edges ({elapsed}s)"}) + "\n"
+                    elif evt == "section_skip":
+                        yield json.dumps({"type": "log", "message": f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})"}) + "\n"
+
+                yield json.dumps({"type": "log", "message": f"  done: {stats['total_triples']} triples, {stats['total_nodes_added']} nodes, {stats['total_edges_added']} edges"}) + "\n"
+
+                # Auto-accept new relation proposals
+                if stats.get("total_proposals_created"):
+                    pending = kg.get_proposals()
+                    accepted = 0
+                    for p in pending:
+                        kg.accept_proposal(p.name)
+                        accepted += 1
+                    if accepted:
+                        yield json.dumps({"type": "log", "message": f"  auto-accepted {accepted} relation proposal(s)"}) + "\n"
+            except Exception as exc:
+                yield json.dumps({"type": "log", "message": f"  error: {exc}"}) + "\n"
+                results.append({
+                    "doc_id": doc["doc_id"],
+                    "total_sections": 0,
+                    "total_triples": 0,
+                    "total_nodes_added": 0,
+                    "total_edges_added": 0,
+                    "error": str(exc),
+                })
+
+        # Embed new nodes
+        _embed_url = embed_url.strip() or api_url
+        embed_count = 0
+        yield json.dumps({"type": "log", "message": "Embedding new nodes..."}) + "\n"
         try:
-            stats = kg.ingest_markdown(
-                doc["text"],
-                doc["doc_id"],
-                llm_extract_fn=extract_fn,
-                original_path=doc.get("filename"),
-            )
-            results.append(stats)
+            efn = _build_embed_fn(embed_model, _embed_url)
+            embed_stats = kg.embed_nodes(efn, skip_existing=True, model_name=embed_model)
+            embed_count = embed_stats.get("nodes_embedded", 0)
+            yield json.dumps({"type": "log", "message": f"  embedded {embed_count} nodes"}) + "\n"
         except Exception as exc:
-            results.append({
-                "doc_id": doc["doc_id"],
-                "total_sections": 0,
-                "total_triples": 0,
-                "total_nodes_added": 0,
-                "total_edges_added": 0,
-                "error": str(exc),
-            })
+            yield json.dumps({"type": "log", "message": f"  embedding failed: {exc}"}) + "\n"
 
-    # Embed new nodes
-    _embed_url = embed_url.strip() or api_url
-    embed_count = 0
-    try:
-        embed_fn = _build_embed_fn(embed_model, _embed_url)
-        embed_stats = kg.embed_nodes(embed_fn, skip_existing=True, model_name=embed_model)
-        embed_count = embed_stats.get("nodes_embedded", 0)
-    except Exception as exc:
-        logger.warning("Embedding failed: %s", exc)
+        kg.save()
+        kg.save_embeddings()
+        yield json.dumps({"type": "log", "message": "Graph saved."}) + "\n"
 
-    kg.save()
-    kg.save_embeddings()
+        # Render final result HTML
+        tpl = templates.env.get_template("partials/ingest_result.html")
+        html = tpl.render(graph_name=graph_name, results=results, embed_count=embed_count)
+        yield json.dumps({"type": "done", "html": html}) + "\n"
 
-    return templates.TemplateResponse("partials/ingest_result.html", {
-        "request": request,
-        "graph_name": graph_name,
-        "results": results,
-        "embed_count": embed_count,
-    })
+    return StreamingResponse(
+        _stream(),
+        media_type="text/plain",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/query", response_class=HTMLResponse)

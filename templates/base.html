@@ -17,7 +17,61 @@
       },
     }
   </script>
+  <script>
+    // Apply saved theme before first paint to prevent flash
+    (function() {
+      var saved = localStorage.getItem('theme');
+      var theme = saved || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      document.documentElement.setAttribute('data-theme', theme);
+    })();
+  </script>
   <style>
+    /* --- Theme variables --- */
+    :root {
+      --bg: #000; --bg-subtle: #030712; --surface: #111;
+      --text: #fff; --text-2: #d1d5db; --text-3: #9ca3af; --text-4: #4b5563;
+      --border: #1f2937; --border-strong: #374151;
+      --accent: #fff; --accent-inv: #000;
+      --overlay: rgba(0, 0, 0, 0.9); --graph-bg: #0a0a0a;
+      --error-bg: rgba(69, 10, 10, 0.5); --error-border: #7f1d1d; --error-text: #f87171;
+      --success: #4ade80;
+    }
+    [data-theme="light"] {
+      --bg: #fff; --bg-subtle: #f3f4f6; --surface: #e5e7eb;
+      --text: #111827; --text-2: #374151; --text-3: #6b7280; --text-4: #9ca3af;
+      --border: #e5e7eb; --border-strong: #d1d5db;
+      --accent: #111827; --accent-inv: #fff;
+      --overlay: rgba(255, 255, 255, 0.95); --graph-bg: #f9fafb;
+      --error-bg: #fef2f2; --error-border: #fecaca; --error-text: #dc2626;
+      --success: #16a34a;
+    }
+
+    /* --- Override Tailwind color utilities for theming --- */
+    [data-theme] .bg-black { background-color: var(--bg); }
+    [data-theme] .bg-gray-950 { background-color: var(--bg-subtle); }
+    [data-theme] .bg-red-950 { background-color: var(--error-bg); }
+    [data-theme] .text-white { color: var(--text); }
+    [data-theme] .text-gray-300 { color: var(--text-2); }
+    [data-theme] .text-gray-400 { color: var(--text-3); }
+    [data-theme] .text-gray-600 { color: var(--text-4); }
+    [data-theme] .text-red-400 { color: var(--error-text); }
+    [data-theme] .text-green-400 { color: var(--success); }
+    [data-theme] .border-gray-800 { border-color: var(--border); }
+    [data-theme] .border-white { border-color: var(--accent); }
+    [data-theme] .border-red-900 { border-color: var(--error-border); }
+    [data-theme] .hover\:text-gray-300:hover { color: var(--text-2); }
+    [data-theme] .hover\:bg-white:hover { background-color: var(--accent); }
+    [data-theme] .hover\:text-black:hover { color: var(--accent-inv); }
+    [data-theme] .hover\:bg-gray-950:hover { background-color: var(--bg-subtle); }
+    [data-theme] .hover\:text-white:hover { color: var(--text); }
+    [data-theme] .focus\:border-white:focus { border-color: var(--accent); }
+    [data-theme] .accent-white { accent-color: var(--accent); }
+    [data-theme] .file\:border-gray-800::file-selector-button { border-color: var(--border); }
+    [data-theme] .file\:bg-black::file-selector-button { background-color: var(--bg); }
+    [data-theme] .file\:text-white::file-selector-button { color: var(--text); }
+    [data-theme] .hover\:file\:bg-white:hover::file-selector-button { background-color: var(--accent); }
+    [data-theme] .hover\:file\:text-black:hover::file-selector-button { color: var(--accent-inv); }
+
     /* HTMX loading indicator */
     .htmx-request .htmx-indicator { display: inline-block; }
     .htmx-indicator { display: none; }
@@ -28,10 +82,24 @@
   <nav class="border-b border-gray-800 px-6 py-4">
     <div class="max-w-7xl mx-auto flex items-center justify-between">
       <a href="/" class="text-xl font-bold tracking-tight hover:text-gray-300">ZipLattice</a>
-      <div class="flex gap-6 text-sm">
+      <div class="flex items-center gap-6 text-sm">
         <a href="/" class="hover:text-gray-300 {% block nav_dashboard %}{% endblock %}">Dashboard</a>
         <a href="/upload" class="hover:text-gray-300 {% block nav_upload %}{% endblock %}">Upload</a>
         <a href="/query" class="hover:text-gray-300 {% block nav_query %}{% endblock %}">Query</a>
+        <button onclick="toggleTheme()" class="ml-2 p-1 hover:text-gray-300" title="Toggle light/dark mode">
+          <svg id="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
+               fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/>
+            <line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/>
+            <line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+          </svg>
+          <svg id="theme-icon-moon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
+               fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
       </div>
     </div>
   </nav>
@@ -45,5 +113,20 @@
       ZipLattice &mdash; Knowledge Graph Manager
     </div>
   </footer>
+  <script>
+    function toggleTheme() {
+      var current = document.documentElement.getAttribute('data-theme');
+      var next = current === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+      updateThemeIcons(next);
+      window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: next } }));
+    }
+    function updateThemeIcons(theme) {
+      document.getElementById('theme-icon-sun').style.display = theme === 'dark' ? 'block' : 'none';
+      document.getElementById('theme-icon-moon').style.display = theme === 'light' ? 'block' : 'none';
+    }
+    updateThemeIcons(document.documentElement.getAttribute('data-theme') || 'dark');
+  </script>
 </body>
 </html>

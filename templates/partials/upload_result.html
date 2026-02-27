@@ -33,7 +33,7 @@
   </div>
 
   <!-- Ingest form -->
-  <form hx-post="/ingest" hx-target="#ingest-result" hx-swap="innerHTML" class="space-y-4">
+  <form id="ingest-form" class="space-y-4">
     <input type="hidden" name="graph_name" value="{{ graph_name }}">
     <input type="hidden" name="batch_id" value="{{ batch_id }}">
 
@@ -68,11 +68,70 @@
       </div>
     </details>
 
-    <button type="submit"
+    <button type="submit" id="ingest-btn"
             class="border border-white px-6 py-2 text-sm hover:bg-white hover:text-black transition-colors">
       Ingest into "{{ graph_name }}"
     </button>
-    <span class="htmx-indicator text-sm text-gray-400 ml-3">Ingesting (this may take a while)…</span>
   </form>
+
+  <!-- Ingestion log (shown during streaming) -->
+  <div id="ingest-log" class="hidden border border-gray-800 p-4 mt-4">
+    <h3 class="text-sm font-bold mb-2">Ingestion Log</h3>
+    <pre id="ingest-log-content" class="text-xs text-gray-400 whitespace-pre-wrap bg-black border border-gray-800 p-3 max-h-64 overflow-y-auto"></pre>
+  </div>
+
+  <script>
+  document.getElementById('ingest-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    var form = e.target;
+    var btn = document.getElementById('ingest-btn');
+    var logBox = document.getElementById('ingest-log');
+    var logContent = document.getElementById('ingest-log-content');
+    var resultDiv = document.getElementById('ingest-result');
+
+    btn.disabled = true;
+    btn.textContent = 'Ingesting…';
+    logBox.classList.remove('hidden');
+    logContent.textContent = '';
+    if (resultDiv) resultDiv.innerHTML = '';
+
+    try {
+      var response = await fetch('/ingest', {
+        method: 'POST',
+        body: new FormData(form),
+      });
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = '';
+
+      while (true) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        var lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (var i = 0; i < lines.length; i++) {
+          if (!lines[i].trim()) continue;
+          try {
+            var evt = JSON.parse(lines[i]);
+            if (evt.type === 'log') {
+              logContent.textContent += evt.message + '\n';
+              logContent.scrollTop = logContent.scrollHeight;
+            } else if (evt.type === 'done') {
+              if (resultDiv) resultDiv.innerHTML = evt.html;
+            } else if (evt.type === 'error') {
+              logContent.textContent += 'ERROR: ' + evt.message + '\n';
+            }
+          } catch(ex) {}
+        }
+      }
+    } catch(err) {
+      logContent.textContent += 'Network error: ' + err.message + '\n';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Ingest into "{{ graph_name }}"';
+  });
+  </script>
 </div>
 {% endif %}
