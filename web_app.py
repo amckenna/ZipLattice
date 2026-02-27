@@ -379,6 +379,16 @@ async def ingest_documents(
                         yield json.dumps({"type": "log", "message": f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})"}) + "\n"
 
                 yield json.dumps({"type": "log", "message": f"  done: {stats['total_triples']} triples, {stats['total_nodes_added']} nodes, {stats['total_edges_added']} edges"}) + "\n"
+
+                # Auto-accept new relation proposals
+                if stats.get("total_proposals_created"):
+                    pending = kg.get_proposals()
+                    accepted = 0
+                    for p in pending:
+                        kg.accept_proposal(p.name)
+                        accepted += 1
+                    if accepted:
+                        yield json.dumps({"type": "log", "message": f"  auto-accepted {accepted} relation proposal(s)"}) + "\n"
             except Exception as exc:
                 yield json.dumps({"type": "log", "message": f"  error: {exc}"}) + "\n"
                 results.append({
