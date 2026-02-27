@@ -313,30 +313,36 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
 def list_models(url: str) -> list[dict[str, Any]]:
     """Query ``/v1/models`` and return the list of available models.
 
-    Works with Ollama, llama.cpp (router mode), vLLM, LocalAI, etc.
+    Works with Ollama, llama.cpp (router mode), vLLM, LocalAI, exo, etc.
     Returns a list of model dicts (each has at least an ``id`` key).
+    Falls back to ``/models`` if ``/v1/models`` returns no data.
     """
-    endpoint = f"{url.rstrip('/')}/v1/models"
-    req = urllib.request.Request(endpoint, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        detail = ""
+    base = url.rstrip("/")
+    for path in ("/v1/models", "/models"):
+        endpoint = f"{base}{path}"
+        req = urllib.request.Request(endpoint, headers={"Content-Type": "application/json"})
         try:
-            detail = exc.read().decode(errors="replace").strip()
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Failed to list models (HTTP {exc.code}): GET {endpoint}."
-            f"{f'  Server response: {detail}' if detail else ''}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(
-            f"Cannot connect to {endpoint}: {exc.reason}. "
-            f"Is the server running?"
-        ) from exc
-    return body.get("data", [])
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read())
+        except (urllib.error.HTTPError, urllib.error.URLError):
+            continue
+        logger.debug("list_models: GET %s returned: %s", endpoint, json.dumps(body, indent=2)[:2000])
+        # OpenAI format: {"data": [{"id": ..., ...}, ...]}
+        if isinstance(body, dict) and body.get("data"):
+            return body["data"]
+        # Some servers return a bare list
+        if isinstance(body, list) and body:
+            return body
+        # Try "models" key (some servers use this)
+        if isinstance(body, dict) and body.get("models"):
+            return body["models"]
+
+    # If we get here, all attempts returned empty or failed
+    raise RuntimeError(
+        f"Could not list models from {base}. "
+        f"Tried /v1/models and /models. "
+        f"Is the server running and does it have models loaded?"
+    )
 
 
 def _list_models(url: str) -> None:
@@ -346,15 +352,16 @@ def _list_models(url: str) -> None:
     except RuntimeError as exc:
         print(f"Error: {exc}")
         return
-    if not models:
-        print(f"No models found at {url}")
-        return
     print(f"Models available at {url}:")
     for m in models:
-        model_id = m.get("id", "?")
-        owned_by = m.get("owned_by", "")
-        extra = f"  (owned_by: {owned_by})" if owned_by else ""
-        print(f"  {model_id}{extra}")
+        if isinstance(m, dict):
+            model_id = m.get("id", m.get("name", "?"))
+            owned_by = m.get("owned_by", "")
+            extra = f"  (owned_by: {owned_by})" if owned_by else ""
+            print(f"  {model_id}{extra}")
+        else:
+            # Bare string model name
+            print(f"  {m}")
 
 
 # ---------------------------------------------------------------------------
