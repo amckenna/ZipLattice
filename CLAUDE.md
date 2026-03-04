@@ -19,6 +19,7 @@ templates/               # Jinja2 HTML templates for the web frontend
   upload.html            #   File upload form
   query.html             #   Query form (search, context, ask)
   partials/              #   HTMX partial response fragments
+test_knowledge_graph.py  # Tests for knowledge_graph.py
 test_query_graph.py      # Tests for query_graph.py
 test_web_app.py          # Tests for web_app.py
 benchmark_models.py      # Model comparison tool for extraction quality
@@ -51,11 +52,11 @@ knowledge_graph/                  # dedicated graph directory
 
 ## Key classes
 
-- `KnowledgeGraph` (line ~211) -- Primary class. Manages nodes, edges, embeddings, relation proposals, persistence, search, and visualization.
-- `CoreRelation` (line ~51) -- Enum of 25+ built-in relation types (taxonomic, dependency, associative, documentation, functional, contextual).
-- `RelationProposal` (line ~166) -- Dataclass tracking proposed new relation types with examples and confidence scores.
-- `ProposalStatus` (line ~159) -- Enum: PENDING, ACCEPTED, REJECTED.
-- `GraphEncoder` (line ~121) -- Custom JSON encoder for datetime, set, Enum, and Path objects.
+- `KnowledgeGraph` (line ~611) -- Primary class. Manages nodes, edges, embeddings, relation proposals, persistence, search, and visualization.
+- `CoreRelation` (line ~401) -- Enum of 25+ built-in relation types (taxonomic, dependency, associative, documentation, functional, contextual).
+- `RelationProposal` (line ~566) -- Dataclass tracking proposed new relation types with examples and confidence scores.
+- `ProposalStatus` (line ~559) -- Enum: PENDING, ACCEPTED, REJECTED.
+- `GraphEncoder` (line ~521) -- Custom JSON encoder for datetime, set, Enum, and Path objects.
 - `ollama_embed()` (module-level) -- Calls OpenAI-compatible `/v1/embeddings` endpoint. Works with Ollama, llama.cpp, vLLM, LocalAI, etc. Used during ingestion and by `query_graph.py` at query time.
 - `claude_chat()` (module-level) -- Calls the Anthropic Messages API for chat/query. Used when `--provider anthropic` is set.
 - `claude_extract()` (module-level) -- Calls the Anthropic Messages API for JSON entity/relation extraction during ingestion. Same three-tier JSON recovery as the local path.
@@ -121,10 +122,16 @@ python -c "from convert_to_markdown import convert; print('OK')"
 ## Testing
 
 ```bash
-# Run query_graph tests (no Ollama needed)
+# Run all tests (no Ollama needed)
+python -m pytest test_knowledge_graph.py test_query_graph.py test_web_app.py -v
+
+# Run knowledge_graph tests only
+python -m pytest test_knowledge_graph.py -v
+
+# Run query_graph tests only
 python -m pytest test_query_graph.py -v
 
-# Run web app tests (no Ollama needed)
+# Run web app tests only
 python -m pytest test_web_app.py -v
 
 # Verify modules load
@@ -134,7 +141,8 @@ python -c "from query_graph import search_nodes, build_context, ask"
 
 ## Architecture notes
 
-- The graph uses a **dual representation**: raw Python dicts for serialization and a NetworkX `DiGraph` for graph algorithms. These are kept in sync by the class methods.
+- The graph uses a **dual representation**: raw Python dicts for serialization and a NetworkX `MultiDiGraph` for graph algorithms (allowing multiple edges between the same node pair with different relations). These are kept in sync by the class methods.
+- An **edge index** (`_edge_index: set[tuple[str, str, str]]`) provides O(1) duplicate edge detection during ingestion.
 - Node and edge IDs are slugified (lowercase, alphanumeric, hyphens).
 - All nodes and edges carry `confidence` scores in the range [0, 1].
 - Timestamps use ISO 8601 format with UTC timezone.
@@ -145,7 +153,7 @@ python -c "from query_graph import search_nodes, build_context, ask"
 
 ## Common patterns when modifying this code
 
-- All public graph mutation methods (`add_node`, `add_edge`, `remove_node`, etc.) must update both the internal dict representation and the NetworkX DiGraph, and set `self._dirty = True`.
+- All public graph mutation methods (`add_node`, `add_edge`, `remove_node`, etc.) must update the internal dict representation, the NetworkX MultiDiGraph, and the edge index (for edge mutations), and set `self._dirty = True`.
 - The `GraphEncoder` class must handle any new types added to node/edge properties.
 - The `save()`/`load()` round-trip must be lossless. If you add new fields, update both `to_dict()` and the `load()` constructor logic.
 - Embedding operations use a separate dirty flag (`_dirty_embeddings`) and separate persistence file.

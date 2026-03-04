@@ -465,6 +465,56 @@ DEFAULT_NODE_TYPES = {
 
 
 # ---------------------------------------------------------------------------
+# LLM extraction constants (used by ingest_document)
+# ---------------------------------------------------------------------------
+
+# Keys that indicate a valid extraction triple
+_EXPECTED_KEYS = {
+    "source", "subject", "head", "from", "entity1",
+    "target", "object", "tail", "to", "entity2",
+    "relation", "predicate", "relationship", "rel",
+    "Concept", "concept", "Term", "term", "Name", "name",
+}
+
+# Key alias mapping for normalizing LLM output
+_KEY_ALIASES = {
+    "subject": "source",
+    "head": "source",
+    "from": "source",
+    "entity1": "source",
+    "object": "target",
+    "tail": "target",
+    "to": "target",
+    "entity2": "target",
+    "predicate": "relation",
+    "relationship": "relation",
+    "rel": "relation",
+    "type": "relation",
+}
+
+# Source/target key sets for hallucination detection
+_SRC_KEYS = {
+    "source", "subject", "head", "from", "entity1",
+    "Concept", "concept", "Term", "term", "Name", "name",
+}
+_TGT_KEYS = {"target", "object", "tail", "to", "entity2"}
+
+# Stopwords for entity grounding checks
+_STOPWORDS = {
+    "the", "and", "for", "that", "this", "with", "are", "was",
+    "were", "been", "being", "have", "has", "had", "does", "did",
+    "will", "would", "could", "should", "may", "might", "can",
+    "shall", "not", "but", "its", "from", "they", "them",
+    "their", "there", "then", "than", "other", "which", "what",
+    "when", "where", "who", "how", "all", "each", "every",
+    "both", "few", "more", "most", "some", "such", "only",
+    "also", "into", "over", "after", "before", "between",
+    "under", "about", "these", "those", "through", "during",
+    "while", "used", "using",
+}
+
+
+# ---------------------------------------------------------------------------
 # JSON Encoder for graph-specific types
 # ---------------------------------------------------------------------------
 
@@ -570,9 +620,6 @@ class KnowledgeGraph:
     with the raw dict kept in sync for serialization.
     """
 
-    # Class-level registry of valid relations (core + user-registered)
-    _custom_relations: set[str] = set()
-
     def __init__(
         self,
         graph_path: str | Path = "knowledge_graph.json",
@@ -624,11 +671,13 @@ class KnowledgeGraph:
         self.auto_timestamp = auto_timestamp
 
         # Internal state
+        self._custom_relations: set[str] = set()
         self._data: dict[str, Any] = self._empty_graph_data()
         self._embeddings: dict[str, list[float]] = {}
         self._embed_meta: dict[str, Any] = {}
         self._proposals: list[RelationProposal] = []
-        self._G: nx.DiGraph = nx.DiGraph()
+        self._G: nx.MultiDiGraph = nx.MultiDiGraph()
+        self._edge_index: set[tuple[str, str, str]] = set()
         self._dirty = False
         self._dirty_embeddings = False
 
@@ -659,10 +708,9 @@ class KnowledgeGraph:
             "relation_proposals": [],
         }
 
-    @classmethod
-    def register_relation(cls, name: str) -> None:
-        """Register a custom relation type available to all instances."""
-        cls._custom_relations.add(name)
+    def register_relation(self, name: str) -> None:
+        """Register a custom relation type on this graph instance."""
+        self._custom_relations.add(name)
 
     def _valid_relations(self) -> set[str]:
         core = {r.value for r in CoreRelation}
@@ -756,7 +804,7 @@ class KnowledgeGraph:
     def save_all(self) -> None:
         """Save both graph and embeddings."""
         self.save()
-        if self._embeddings:
+        if self._dirty_embeddings or self._embeddings:
             self.save_embeddings()
 
     # ------------------------------------------------------------------
@@ -1244,20 +1292,24 @@ class KnowledgeGraph:
     # ------------------------------------------------------------------
 
     def _rebuild_networkx(self) -> None:
-        """Rebuild the networkx DiGraph from the raw dict."""
-        self._G = nx.DiGraph()
+        """Rebuild the networkx MultiDiGraph and edge index from the raw dict."""
+        self._G = nx.MultiDiGraph()
+        self._edge_index = set()
         for nid, node in self._data["nodes"].items():
             self._G.add_node(nid, **node)
         for edge in self._data["edges"]:
+            rel = edge.get("relation", "related_to")
             self._G.add_edge(
                 edge["source"],
                 edge["target"],
+                key=rel,
                 **{k: v for k, v in edge.items() if k not in ("source", "target")},
             )
+            self._edge_index.add((edge["source"], edge["target"], rel))
 
     @property
-    def graph(self) -> nx.DiGraph:
-        """Direct access to the underlying networkx DiGraph (read-friendly)."""
+    def graph(self) -> nx.MultiDiGraph:
+        """Direct access to the underlying networkx MultiDiGraph (read-friendly)."""
         return self._G
 
     # ------------------------------------------------------------------
@@ -1418,8 +1470,8 @@ class KnowledgeGraph:
 
         relation = self._validate_relation(relation, _skip_auto_register=_skip_auto_register)
 
-        # Check for duplicates
-        if not allow_duplicate:
+        # Check for duplicates using the edge index (O(1) lookup)
+        if not allow_duplicate and (source, target, relation) in self._edge_index:
             for e in self._data["edges"]:
                 if e["source"] == source and e["target"] == target and e["relation"] == relation:
                     # Update existing edge
@@ -1428,7 +1480,8 @@ class KnowledgeGraph:
                     e["weight"] = weight
                     if self.auto_timestamp:
                         e["updated"] = now_iso()
-                    self._G[source][target].update(e)
+                    if self._G.has_edge(source, target, key=relation):
+                        self._G[source][target][relation].update(e)
                     self._dirty = True
                     return e
 
@@ -1447,7 +1500,8 @@ class KnowledgeGraph:
             edge["updated"] = ts
 
         self._data["edges"].append(edge)
-        self._G.add_edge(source, target, **edge)
+        self._edge_index.add((source, target, relation))
+        self._G.add_edge(source, target, key=relation, **edge)
         self._dirty = True
         return edge
 
@@ -1526,15 +1580,13 @@ class KnowledgeGraph:
                 if direction in ("outgoing", "both"):
                     for succ in self._G.successors(nid):
                         if relation:
-                            edge_data = self._G.edges[nid, succ]
-                            if edge_data.get("relation") != relation:
+                            if not self._G.has_edge(nid, succ, key=relation):
                                 continue
                         next_frontier.add(succ)
                 if direction in ("incoming", "both"):
                     for pred in self._G.predecessors(nid):
                         if relation:
-                            edge_data = self._G.edges[pred, nid]
-                            if edge_data.get("relation") != relation:
+                            if not self._G.has_edge(pred, nid, key=relation):
                                 continue
                         next_frontier.add(pred)
             visited.update(frontier)
@@ -2488,15 +2540,9 @@ TEXT:
         # Detect off-topic responses: if no triple has any recognized key,
         # the model returned garbage unrelated to the extraction prompt.
         if triples:
-            _EXPECTED_KEYS = {
-                "source", "subject", "head", "from", "entity1",
-                "target", "object", "tail", "to", "entity2",
-                "relation", "predicate", "relationship", "rel",
-                # Glossary-style keys (converted to triples downstream)
-                "Concept", "concept", "Term", "term", "Name", "name",
-            }
             _has_valid = any(
-                isinstance(t, dict) and _EXPECTED_KEYS & t.keys()
+                (isinstance(t, dict) and _EXPECTED_KEYS & t.keys())
+                or (isinstance(t, (list, tuple)) and len(t) >= 3)
                 for t in triples
             )
             if not _has_valid:
@@ -2521,21 +2567,6 @@ TEXT:
         # Extract entity names from all recognized key aliases and check
         # whether their words appear in the input text.
         if triples:
-            _SRC_KEYS = {"source", "subject", "head", "from", "entity1",
-                         "Concept", "concept", "Term", "term", "Name", "name"}
-            _TGT_KEYS = {"target", "object", "tail", "to", "entity2"}
-            _STOPWORDS = {
-                "the", "and", "for", "that", "this", "with", "are", "was",
-                "were", "been", "being", "have", "has", "had", "does", "did",
-                "will", "would", "could", "should", "may", "might", "can",
-                "shall", "not", "but", "its", "from", "they", "them",
-                "their", "there", "then", "than", "other", "which", "what",
-                "when", "where", "who", "how", "all", "each", "every",
-                "both", "few", "more", "most", "some", "such", "only",
-                "also", "into", "over", "after", "before", "between",
-                "under", "about", "these", "those", "through", "during",
-                "while", "used", "using",
-            }
             _text_lower = text.lower()
             _text_words = set(re.findall(r"[a-z]{3,}", _text_lower)) - _STOPWORDS
             _grounded = 0
@@ -2650,20 +2681,6 @@ TEXT:
                 # Normalize common LLM key aliases so that triples
                 # returned as {"subject": ..., "object": ...} or
                 # {"head": ..., "tail": ...} are accepted.
-                _KEY_ALIASES = {
-                    "subject": "source",
-                    "head": "source",
-                    "from": "source",
-                    "entity1": "source",
-                    "object": "target",
-                    "tail": "target",
-                    "to": "target",
-                    "entity2": "target",
-                    "predicate": "relation",
-                    "relationship": "relation",
-                    "rel": "relation",
-                    "type": "relation",
-                }
                 for old_key, new_key in _KEY_ALIASES.items():
                     if old_key in triple and new_key not in triple:
                         triple[new_key] = triple.pop(old_key)
@@ -2950,8 +2967,8 @@ TEXT:
         # --- Annotate sections ---
         link_re = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
         code_block_re = re.compile(r"```")
-        table_row_re = re.compile(r"^\s*\|.+\|")
-        list_re = re.compile(r"^\s*[-*+]|\s*\d+\.")
+        table_row_re = re.compile(r"^\s*\|.+\|", re.MULTILINE)
+        list_re = re.compile(r"^\s*[-*+]\s|\s*\d+\.", re.MULTILINE)
 
         for section in raw_sections:
             body = section["body"]
@@ -3558,9 +3575,13 @@ TEXT:
         self._data["meta"]["custom_relations"] = sorted(my_customs | other_customs)
 
         # Merge embeddings
+        _emb_changed = False
         for nid, emb in other._embeddings.items():
             if nid not in self._embeddings or prefer == "other":
                 self._embeddings[nid] = emb
+                _emb_changed = True
+        if _emb_changed:
+            self._dirty_embeddings = True
 
         # Merge proposals
         my_proposal_names = {p.name for p in self._proposals}
@@ -3582,7 +3603,6 @@ TEXT:
 
         self._rebuild_networkx()
         self._dirty = True
-        self._dirty_embeddings = bool(other._embeddings)
         return stats
 
     # ------------------------------------------------------------------

@@ -156,11 +156,6 @@ def run_benchmark(
 
                 t0 = time.monotonic()
 
-                # Optionally limit sections for quick comparison
-                extra_kwargs: dict[str, Any] = {}
-                if max_sections is not None:
-                    extra_kwargs["max_section_chars"] = 6000  # default
-
                 stats = kg.ingest_markdown(
                     text,
                     doc_id=doc_id,

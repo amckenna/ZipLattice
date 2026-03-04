@@ -93,6 +93,11 @@ def _list_graphs() -> list[dict[str, Any]]:
 def _load_graph(name: str) -> KnowledgeGraph:
     """Load a KnowledgeGraph by directory name."""
     json_file = GRAPHS_DIR / name / f"{name}.json"
+    # Guard against path traversal from user-supplied graph names
+    try:
+        json_file.resolve().relative_to(GRAPHS_DIR.resolve())
+    except ValueError:
+        raise ValueError(f"Invalid graph name: {name}")
     return KnowledgeGraph(json_file)
 
 
@@ -143,8 +148,18 @@ def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
         tmp_path.unlink(missing_ok=True)
 
 
-# Temporary storage for converted documents (batch_id -> list of docs)
-_upload_batches: dict[str, list[dict[str, Any]]] = {}
+# Temporary storage for converted documents (batch_id -> {docs, created_at})
+_upload_batches: dict[str, dict[str, Any]] = {}
+_BATCH_TTL_SECONDS = 1800  # 30 minutes
+
+
+def _evict_stale_batches() -> None:
+    """Remove upload batches older than _BATCH_TTL_SECONDS."""
+    now = time.time()
+    stale = [k for k, v in _upload_batches.items()
+             if now - v.get("created_at", 0) > _BATCH_TTL_SECONDS]
+    for k in stale:
+        _upload_batches.pop(k, None)
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +266,9 @@ async def upload_files(
         if not err:
             batch_docs.append({"doc_id": doc_id, "text": md_text, "filename": f.filename})
 
+    _evict_stale_batches()
     batch_id = uuid.uuid4().hex[:12]
-    _upload_batches[batch_id] = batch_docs
+    _upload_batches[batch_id] = {"docs": batch_docs, "created_at": time.time()}
 
     return templates.TemplateResponse("partials/upload_result.html", {
         "request": request,
@@ -275,7 +291,8 @@ async def ingest_documents(
     extract_model: str = Form(""),
 ):
     """Run LLM ingestion with streaming progress log."""
-    batch = _upload_batches.pop(batch_id, None)
+    batch_entry = _upload_batches.pop(batch_id, None)
+    batch = batch_entry["docs"] if batch_entry else None
     if not batch:
         return HTMLResponse(
             json.dumps({"type": "error", "message": "Upload batch not found. Please re-upload your files."}) + "\n"
@@ -296,9 +313,6 @@ async def ingest_documents(
 
         for di, doc in enumerate(batch):
             yield json.dumps({"type": "log", "message": f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}'..."}) + "\n"
-
-            def _progress(event):
-                pass  # progress events are yielded via the section callbacks below
 
             try:
                 section_events: list[dict] = []
