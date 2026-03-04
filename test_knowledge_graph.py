@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from knowledge_graph import KnowledgeGraph, CoreRelation
+from knowledge_graph import (
+    KnowledgeGraph,
+    CoreRelation,
+    _merge_description,
+    find_entity_spans,
+    find_context_span,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -600,3 +606,267 @@ def test_stats(populated_graph):
     s = populated_graph.stats()
     assert s["num_nodes"] == 3
     assert s["num_edges"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Description merging — _merge_description()
+# ---------------------------------------------------------------------------
+
+
+def test_merge_description_basic():
+    """Single description seeds both fields."""
+    props: dict = {}
+    _merge_description(props, "A detection system", "doc1", 0.9)
+    assert props["description"] == "A detection system"
+    assert len(props["description_sources"]) == 1
+    assert props["description_sources"][0]["doc_id"] == "doc1"
+
+
+def test_merge_description_accumulates():
+    """Two different doc_ids produce a concatenated description."""
+    props: dict = {}
+    _merge_description(props, "Uses radio waves", "doc1", 0.9)
+    _merge_description(props, "Detects objects at range", "doc2", 0.8)
+    assert len(props["description_sources"]) == 2
+    assert props["description"] == "Uses radio waves; Detects objects at range"
+
+
+def test_merge_description_same_doc_update():
+    """Same doc_id with different text updates in place."""
+    props: dict = {}
+    _merge_description(props, "Version 1", "doc1", 0.9)
+    _merge_description(props, "Version 2", "doc1", 0.95)
+    assert len(props["description_sources"]) == 1
+    assert props["description_sources"][0]["text"] == "Version 2"
+    assert props["description"] == "Version 2"
+
+
+def test_merge_description_same_doc_skip():
+    """Same doc_id with identical text is a no-op."""
+    props: dict = {}
+    _merge_description(props, "Same text", "doc1", 0.9)
+    ts1 = props["description_sources"][0]["updated_at"]
+    _merge_description(props, "Same text", "doc1", 0.9)
+    assert len(props["description_sources"]) == 1
+    # Timestamp unchanged since it was skipped
+    assert props["description_sources"][0]["updated_at"] == ts1
+
+
+def test_merge_description_dedup_text():
+    """Two docs with identical text produce single entry in description."""
+    props: dict = {}
+    _merge_description(props, "Same description", "doc1", 0.9)
+    _merge_description(props, "Same description", "doc2", 0.8)
+    assert len(props["description_sources"]) == 2  # two sources
+    assert props["description"] == "Same description"  # deduplicated text
+
+
+def test_add_node_merge_description(tmp_graph):
+    """Description merging works through add_node() merge path."""
+    tmp_graph.add_node("radar", type="concept", label="Radar",
+                       source="doc:doc1",
+                       properties={"description": "A detection system"})
+    tmp_graph.add_node("radar", type="concept", label="Radar",
+                       source="doc:doc2",
+                       properties={"description": "Uses radio waves"})
+    node = tmp_graph.get_node("radar")
+    assert len(node["properties"]["description_sources"]) == 2
+    assert "A detection system" in node["properties"]["description"]
+    assert "Uses radio waves" in node["properties"]["description"]
+
+
+def test_ingest_description_seeded(tmp_graph):
+    """New node from ingestion has description_sources."""
+    triples = [
+        {"source": "Radar", "target": "Radio waves", "relation": "uses",
+         "source_description": "A detection system", "confidence": 0.9,
+         "context": "Radar uses radio waves."},
+    ]
+    tmp_graph.ingest_document(
+        "Radar uses radio waves for detection.",
+        doc_id="test-doc",
+        llm_extract_fn=lambda _: triples,
+    )
+    node = tmp_graph.get_node("radar")
+    assert node is not None
+    assert node["properties"]["description"] == "A detection system"
+    assert len(node["properties"]["description_sources"]) == 1
+    assert node["properties"]["description_sources"][0]["doc_id"] == "test-doc"
+
+
+def test_ingest_description_multi_doc(tmp_graph):
+    """Two ingestions of same entity accumulate descriptions."""
+    triples1 = [
+        {"source": "Radar", "target": "Radio waves", "relation": "uses",
+         "source_description": "A detection system", "confidence": 0.9,
+         "context": "Radar uses radio waves."},
+    ]
+    triples2 = [
+        {"source": "Radar", "target": "Targets", "relation": "detects",
+         "source_description": "Emits electromagnetic pulses", "confidence": 0.8,
+         "context": "Radar detects targets."},
+    ]
+    tmp_graph.ingest_document(
+        "Radar uses radio waves for detection.",
+        doc_id="doc1",
+        llm_extract_fn=lambda _: triples1,
+    )
+    tmp_graph.ingest_document(
+        "Radar detects targets using electromagnetic pulses.",
+        doc_id="doc2",
+        llm_extract_fn=lambda _: triples2,
+    )
+    node = tmp_graph.get_node("radar")
+    assert len(node["properties"]["description_sources"]) == 2
+    assert "; " in node["properties"]["description"]
+
+
+# ---------------------------------------------------------------------------
+# Span mapping — find_entity_spans()
+# ---------------------------------------------------------------------------
+
+
+def test_find_entity_spans_exact():
+    spans = find_entity_spans("Radar uses radio waves", "Radar")
+    assert len(spans) >= 1
+    assert spans[0]["start"] == 0
+    assert spans[0]["end"] == 5
+    assert spans[0]["match_type"] == "exact"
+
+
+def test_find_entity_spans_case_insensitive():
+    spans = find_entity_spans("Radar uses radio waves", "radar")
+    assert len(spans) >= 1
+    assert spans[0]["matched_text"] == "Radar"
+
+
+def test_find_entity_spans_multiple():
+    spans = find_entity_spans("Radar detects targets. Radar is useful.", "Radar")
+    assert len(spans) == 2
+    assert spans[0]["start"] == 0
+    assert spans[1]["start"] == 23
+
+
+def test_find_entity_spans_partial():
+    """Multi-word entity with partial token match."""
+    spans = find_entity_spans(
+        "Synthetic aperture systems are advanced",
+        "Synthetic Aperture Radar",
+    )
+    # Should match "Synthetic" or "aperture" via partial token
+    assert len(spans) >= 1
+    assert spans[0]["match_type"] in ("exact", "word_boundary", "partial_token")
+
+
+def test_find_entity_spans_no_match():
+    spans = find_entity_spans("Nothing relevant here", "Quantum Entanglement")
+    assert spans == []
+
+
+def test_find_entity_spans_empty():
+    assert find_entity_spans("", "Radar") == []
+    assert find_entity_spans("Radar", "") == []
+
+
+# ---------------------------------------------------------------------------
+# Span mapping — find_context_span()
+# ---------------------------------------------------------------------------
+
+
+def test_find_context_span_exact():
+    text = "Radar uses radio waves for detection."
+    span = find_context_span(text, "uses radio waves")
+    assert span is not None
+    assert span["start"] == 6
+    assert span["end"] == 22
+    assert span["match_type"] == "exact"
+
+
+def test_find_context_span_case_insensitive():
+    text = "Radar uses radio waves."
+    span = find_context_span(text, "USES RADIO WAVES")
+    assert span is not None
+    assert span["match_type"] == "case_insensitive"
+
+
+def test_find_context_span_prefix():
+    text = "Radar uses radio waves for long-range detection of objects."
+    context = "Radar uses radio waves for long-range detection of objects and more stuff added by LLM."
+    span = find_context_span(text, context)
+    assert span is not None
+    assert span["match_type"] == "prefix"
+    assert span["start"] == 0
+
+
+def test_find_context_span_not_found():
+    span = find_context_span("Nothing relevant here", "Quantum computing is fast")
+    assert span is None
+
+
+# ---------------------------------------------------------------------------
+# Span tracking in ingestion
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_creates_mentions(tmp_graph):
+    """After ingestion, nodes have mentions with character offsets."""
+    triples = [
+        {"source": "Radar", "target": "Radio waves", "relation": "uses",
+         "confidence": 0.9, "context": "Radar uses radio waves."},
+    ]
+    tmp_graph.ingest_document(
+        "Radar uses radio waves for detection.",
+        doc_id="test-doc",
+        llm_extract_fn=lambda _: triples,
+    )
+    node = tmp_graph.get_node("radar")
+    assert node is not None
+    mentions = node["properties"].get("mentions", [])
+    assert len(mentions) >= 1
+    assert mentions[0]["doc_id"] == "test-doc"
+    assert mentions[0]["start"] == 0
+    assert mentions[0]["end"] == 5
+
+
+def test_ingest_creates_context_span(tmp_graph):
+    """After ingestion, edges have context_span with offsets."""
+    context_text = "Radar uses radio waves"
+    triples = [
+        {"source": "Radar", "target": "Radio waves", "relation": "uses",
+         "confidence": 0.9, "context": context_text},
+    ]
+    tmp_graph.ingest_document(
+        "Radar uses radio waves for detection.",
+        doc_id="test-doc",
+        llm_extract_fn=lambda _: triples,
+    )
+    edges = tmp_graph.get_edges("radar", direction="outgoing")
+    uses_edges = [e for e in edges if e["relation"] == "uses"]
+    assert len(uses_edges) >= 1
+    ctx_span = uses_edges[0]["properties"].get("context_span")
+    assert ctx_span is not None
+    assert ctx_span["doc_id"] == "test-doc"
+    assert ctx_span["start"] == 0
+    assert ctx_span["match_type"] == "exact"
+
+
+def test_mentions_roundtrip(tmp_path):
+    """Save/load preserves mentions and context_span."""
+    kg = KnowledgeGraph(tmp_path / "spans.json")
+    triples = [
+        {"source": "Radar", "target": "Radio waves", "relation": "uses",
+         "confidence": 0.9, "context": "Radar uses radio waves."},
+    ]
+    kg.ingest_document(
+        "Radar uses radio waves for detection.",
+        doc_id="test-doc",
+        llm_extract_fn=lambda _: triples,
+    )
+    kg.save()
+
+    kg2 = KnowledgeGraph(tmp_path / "spans.json")
+    node = kg2.get_node("radar")
+    assert len(node["properties"].get("mentions", [])) >= 1
+    edges = kg2.get_edges("radar", direction="outgoing")
+    uses_edges = [e for e in edges if e["relation"] == "uses"]
+    assert uses_edges[0]["properties"].get("context_span") is not None

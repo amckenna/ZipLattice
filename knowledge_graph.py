@@ -515,6 +515,216 @@ _STOPWORDS = {
 
 
 # ---------------------------------------------------------------------------
+# Description merging helper
+# ---------------------------------------------------------------------------
+
+
+def _merge_description(
+    existing_props: dict[str, Any],
+    new_text: str,
+    doc_id: str,
+    confidence: float = 1.0,
+) -> None:
+    """Merge a new description into a node's properties.
+
+    Maintains ``description_sources`` (list of per-document entries) and
+    rebuilds ``description`` as a concatenation of all unique description
+    texts joined with ``"; "``.
+    """
+    sources: list[dict[str, Any]] = existing_props.setdefault("description_sources", [])
+
+    # Check if this doc_id already contributed
+    for entry in sources:
+        if entry["doc_id"] == doc_id:
+            if entry["text"] == new_text:
+                return  # identical — nothing to do
+            # Same doc, different text — update in place
+            entry["text"] = new_text
+            entry["confidence"] = confidence
+            entry["updated_at"] = now_iso()
+            break
+    else:
+        # New doc_id
+        sources.append({
+            "text": new_text,
+            "doc_id": doc_id,
+            "confidence": confidence,
+            "updated_at": now_iso(),
+        })
+
+    # Rebuild concatenated description, deduplicating by text content
+    seen_texts: list[str] = []
+    for entry in sources:
+        if entry["text"] not in seen_texts:
+            seen_texts.append(entry["text"])
+    existing_props["description"] = "; ".join(seen_texts)
+
+
+# ---------------------------------------------------------------------------
+# Span-finding helpers
+# ---------------------------------------------------------------------------
+
+
+def find_entity_spans(
+    text: str,
+    entity_label: str,
+    *,
+    case_sensitive: bool = False,
+) -> list[dict[str, Any]]:
+    """Find character spans where *entity_label* appears in *text*.
+
+    Uses tiered matching:
+      1. Exact substring (case-insensitive by default).
+      2. Word-boundary regex match.
+      3. Longest-token partial match (token ≥ 4 chars, not a stopword).
+
+    Returns a list of ``{start, end, matched_text, match_type}`` dicts.
+    """
+    if not text or not entity_label:
+        return []
+
+    results: list[dict[str, Any]] = []
+
+    # --- Tier 1: exact substring ---
+    haystack = text if case_sensitive else text.lower()
+    needle = entity_label if case_sensitive else entity_label.lower()
+
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            break
+        results.append({
+            "start": idx,
+            "end": idx + len(needle),
+            "matched_text": text[idx : idx + len(needle)],
+            "match_type": "exact",
+        })
+        start = idx + 1
+
+    if results:
+        return results
+
+    # --- Tier 2: word-boundary regex ---
+    try:
+        pattern = re.compile(r"\b" + re.escape(entity_label) + r"\b",
+                             0 if case_sensitive else re.IGNORECASE)
+        for m in pattern.finditer(text):
+            results.append({
+                "start": m.start(),
+                "end": m.end(),
+                "matched_text": m.group(),
+                "match_type": "word_boundary",
+            })
+    except re.error:
+        pass
+
+    if results:
+        return results
+
+    # --- Tier 3: longest-token partial match ---
+    tokens = entity_label.split()
+    # Pick the longest token that isn't a stopword and is ≥ 4 chars
+    candidates = sorted(
+        [t for t in tokens if len(t) >= 4 and t.lower() not in _STOPWORDS],
+        key=len,
+        reverse=True,
+    )
+    if candidates:
+        token = candidates[0]
+        pattern = re.compile(re.escape(token), 0 if case_sensitive else re.IGNORECASE)
+        for m in pattern.finditer(text):
+            results.append({
+                "start": m.start(),
+                "end": m.end(),
+                "matched_text": m.group(),
+                "match_type": "partial_token",
+            })
+
+    return results
+
+
+def find_context_span(
+    text: str,
+    context: str,
+) -> dict[str, Any] | None:
+    """Find the character span of a *context* quote within *text*.
+
+    Uses tiered matching:
+      1. Exact substring.
+      2. Case-insensitive exact.
+      3. Prefix match (first 40+ chars).
+
+    Returns ``{start, end, matched_text, match_type}`` or ``None``.
+    """
+    if not text or not context:
+        return None
+
+    # --- Tier 1: exact substring ---
+    idx = text.find(context)
+    if idx != -1:
+        return {
+            "start": idx,
+            "end": idx + len(context),
+            "matched_text": context,
+            "match_type": "exact",
+        }
+
+    # --- Tier 1b: strip trailing punctuation and retry ---
+    stripped = context.rstrip(".,;:!?")
+    if stripped != context and stripped:
+        idx = text.find(stripped)
+        if idx != -1:
+            return {
+                "start": idx,
+                "end": idx + len(stripped),
+                "matched_text": text[idx : idx + len(stripped)],
+                "match_type": "exact",
+            }
+
+    # --- Tier 2: case-insensitive ---
+    lower_text = text.lower()
+    lower_ctx = context.lower()
+    idx = lower_text.find(lower_ctx)
+    if idx != -1:
+        return {
+            "start": idx,
+            "end": idx + len(context),
+            "matched_text": text[idx : idx + len(context)],
+            "match_type": "case_insensitive",
+        }
+
+    # --- Tier 2b: case-insensitive with stripped punctuation ---
+    if stripped != context and stripped:
+        idx = lower_text.find(stripped.lower())
+        if idx != -1:
+            return {
+                "start": idx,
+                "end": idx + len(stripped),
+                "matched_text": text[idx : idx + len(stripped)],
+                "match_type": "case_insensitive",
+            }
+
+    # --- Tier 3: prefix match (first 40+ chars) ---
+    prefix_len = min(len(context), max(40, len(context) // 2))
+    prefix = context[:prefix_len]
+    idx = lower_text.find(prefix.lower())
+    if idx != -1:
+        # Extend to end of sentence or paragraph if possible
+        end = idx + len(context)
+        if end > len(text):
+            end = len(text)
+        return {
+            "start": idx,
+            "end": end,
+            "matched_text": text[idx:end],
+            "match_type": "prefix",
+        }
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # JSON Encoder for graph-specific types
 # ---------------------------------------------------------------------------
 
@@ -1356,9 +1566,37 @@ class KnowledgeGraph:
             "confidence": confidence,
         }
 
+        # Seed description_sources for new nodes with a description
+        if "description" in properties and "description_sources" not in properties:
+            properties["description_sources"] = [{
+                "text": properties["description"],
+                "doc_id": source or "unknown",
+                "confidence": confidence,
+                "updated_at": ts,
+            }]
+
         if node_id in self._data["nodes"] and merge:
             existing = self._data["nodes"][node_id]
+            # Handle description merging separately to avoid overwrite
+            _desc = properties.pop("description", None)
+            _desc_sources = properties.pop("description_sources", None)
             existing["properties"].update(properties)
+            if _desc:
+                _merge_description(
+                    existing["properties"],
+                    _desc,
+                    doc_id=source or "unknown",
+                    confidence=confidence,
+                )
+            elif _desc_sources:
+                # Caller provided pre-built sources (e.g. from merge())
+                for ds in _desc_sources:
+                    _merge_description(
+                        existing["properties"],
+                        ds["text"],
+                        doc_id=ds.get("doc_id", "unknown"),
+                        confidence=ds.get("confidence", confidence),
+                    )
             existing["type"] = type
             existing["label"] = label
             existing["source"] = source
@@ -2751,6 +2989,12 @@ TEXT:
                         node_props: dict[str, Any] = {}
                         if desc:
                             node_props["description"] = desc
+                            node_props["description_sources"] = [{
+                                "text": desc,
+                                "doc_id": doc_id,
+                                "confidence": conf,
+                                "updated_at": now_iso(),
+                            }]
                         if ingestion_id:
                             node_props["ingestion_id"] = ingestion_id
                         if content_hash:
@@ -2765,13 +3009,42 @@ TEXT:
                         )
                         stats["nodes_added"] += 1
                     elif desc:
-                        # Node already exists — backfill description if missing
+                        # Node already exists — merge description
                         existing = self._data["nodes"].get(nid, {})
-                        if not existing.get("properties", {}).get("description"):
-                            existing.setdefault("properties", {})["description"] = desc
+                        existing.setdefault("properties", {})
+                        _merge_description(
+                            existing["properties"], desc, doc_id, conf,
+                        )
+                        # Sync networkx
+                        self._G.nodes[nid].update(existing)
+                        self._dirty = True
+
+                    # --- Entity span tracking ---
+                    spans = find_entity_spans(text, label)
+                    if spans:
+                        node_data = self._data["nodes"].get(nid)
+                        if node_data is not None:
+                            mentions: list[dict[str, Any]] = node_data.setdefault(
+                                "properties", {},
+                            ).setdefault("mentions", [])
+                            existing_keys = {
+                                (m["doc_id"], m["start"], m["end"])
+                                for m in mentions
+                            }
+                            for span in spans:
+                                entry = {
+                                    "doc_id": doc_id,
+                                    "start": span["start"],
+                                    "end": span["end"],
+                                    "matched_text": span["matched_text"],
+                                    "match_type": span["match_type"],
+                                }
+                                if (doc_id, span["start"], span["end"]) not in existing_keys:
+                                    mentions.append(entry)
                             # Sync networkx
-                            self._G.nodes[nid].update(existing)
+                            self._G.nodes[nid].update(node_data)
                             self._dirty = True
+
                     entity_ids.add(nid)
 
                 # Handle novel vs known relations
@@ -2806,6 +3079,11 @@ TEXT:
                 edge_props: dict[str, Any] = {}
                 if context:
                     edge_props["context"] = context
+                    # --- Edge context span tracking ---
+                    ctx_span = find_context_span(text, context)
+                    if ctx_span:
+                        ctx_span["doc_id"] = doc_id
+                        edge_props["context_span"] = ctx_span
                 if ingestion_id:
                     edge_props["ingestion_id"] = ingestion_id
                 if content_hash:
@@ -3253,6 +3531,7 @@ TEXT:
             if section["heading"]:
                 context_prefix += f"Heading: {section['heading']}\n"
             context_prefix += "---\n"
+            context_prefix_len = len(context_prefix)
 
             # Create section node
             if add_structure_nodes:
@@ -3267,6 +3546,7 @@ TEXT:
                     "section_index": i,
                     "ingestion_id": ingestion_id,
                     "content_hash": source_content_hash,
+                    "context_prefix_len": context_prefix_len,
                 }
                 if section["links"]:
                     section_props["link_count"] = len(section["links"])
