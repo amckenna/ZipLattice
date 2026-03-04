@@ -23,7 +23,10 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
-from knowledge_graph import KnowledgeGraph, GraphEncoder, ollama_embed, _strip_thinking
+from knowledge_graph import (
+    KnowledgeGraph, GraphEncoder, ollama_embed, _strip_thinking,
+    claude_chat, _get_anthropic_api_key,
+)
 
 logger = logging.getLogger("query_graph")
 
@@ -386,6 +389,9 @@ def main() -> None:
     shared.add_argument("--embed-model", default=None, metavar="MODEL",
                         help="Embedding model for query embedding "
                              "(default: auto-detect from graph, or nomic-embed-text)")
+    shared.add_argument("--provider", choices=["local", "anthropic"], default="local",
+                        help="LLM provider: 'local' for OpenAI-compatible servers, "
+                             "'anthropic' for the Claude API (default: local)")
     shared.add_argument("--top-k", type=int, default=10, help="Number of search results")
     shared.add_argument("--depth", type=int, default=1, help="Neighborhood expansion depth")
     shared.add_argument("--node-types", nargs="+", metavar="TYPE",
@@ -532,10 +538,17 @@ def main() -> None:
             return
 
         chat_model = args.query_model
-        chat_url = args.ollama_url.rstrip("/")
 
-        def llm_fn(prompt: str) -> str:
-            return ollama_chat(prompt, model=chat_model, url=chat_url)
+        if args.provider == "anthropic":
+            _api_key = _get_anthropic_api_key()
+
+            def llm_fn(prompt: str) -> str:
+                return claude_chat(prompt, model=chat_model, api_key=_api_key)
+        else:
+            chat_url = args.ollama_url.rstrip("/")
+
+            def llm_fn(prompt: str) -> str:
+                return ollama_chat(prompt, model=chat_model, url=chat_url)
 
         answer = ask(kg, args.question, embed_fn, llm_fn, max_nodes=args.top_k)
         if args.json_output:

@@ -57,6 +57,8 @@ knowledge_graph/                  # dedicated graph directory
 - `ProposalStatus` (line ~159) -- Enum: PENDING, ACCEPTED, REJECTED.
 - `GraphEncoder` (line ~121) -- Custom JSON encoder for datetime, set, Enum, and Path objects.
 - `ollama_embed()` (module-level) -- Calls OpenAI-compatible `/v1/embeddings` endpoint. Works with Ollama, llama.cpp, vLLM, LocalAI, etc. Used during ingestion and by `query_graph.py` at query time.
+- `claude_chat()` (module-level) -- Calls the Anthropic Messages API for chat/query. Used when `--provider anthropic` is set.
+- `claude_extract()` (module-level) -- Calls the Anthropic Messages API for JSON entity/relation extraction during ingestion. Same three-tier JSON recovery as the local path.
 
 ## How to run
 
@@ -78,11 +80,17 @@ python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
 python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b --embed-model nomic-embed-text
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --api-url http://exo:11434
 
+# Ingest with Claude API (Haiku for fast extraction, local embeddings)
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-haiku-4-5-20251001 --embed-model nomic-embed-text
+
 # Query graph CLI
 python query_graph.py <path-to-graph.json> search "synthetic aperture radar"
 python query_graph.py <path-to-graph.json> context "how does SAR work?"
 python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-model qwen3-coder:30b
 python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-model qwen3-coder:30b --api-url http://exo:11434
+
+# Query with Claude API (Opus for smartest answers)
+python query_graph.py <path-to-graph.json> ask "how does SAR work?" --provider anthropic --query-model claude-opus-4-0-20250115
 python query_graph.py <path-to-graph.json> node <node-id>
 python query_graph.py <path-to-graph.json> neighbors <node-id> --depth 2
 python query_graph.py <path-to-graph.json> path <source-id> <target-id>
@@ -93,6 +101,7 @@ python benchmark_models.py doc.md --models qwen3-coder:30b gemma3:27b llama3.1:7
 python benchmark_models.py docs/*.md --models modelA modelB --api-url http://exo:11434
 python benchmark_models.py doc.md --models modelA modelB --json
 python benchmark_models.py doc.md --models modelA modelB --max-sections 5  # quick test
+python benchmark_models.py doc.md --models claude-haiku-4-5-20251001 claude-sonnet-4-5-20250514 --provider anthropic
 
 # Document converter CLI
 python convert_to_markdown.py document.pdf -o document.md
@@ -132,6 +141,7 @@ python -c "from query_graph import search_nodes, build_context, ask"
 - The library tracks a `_dirty` flag to avoid unnecessary writes on `save()`.
 - Relation proposals allow the schema to evolve: novel relations discovered during LLM extraction are proposed, accumulated across documents, and accepted or rejected.
 - Source documents are stored with SHA-256 content hashing for deduplication and version tracking.
+- **LLM provider abstraction:** Chat/extraction functions accept callables (`llm_fn`, `llm_extract_fn`), making the core logic provider-agnostic. The `--provider` flag selects between `local` (OpenAI-compatible servers) and `anthropic` (Claude API via `ANTHROPIC_API_KEY` env var). Embeddings always use a local server since Anthropic does not offer an embeddings API.
 
 ## Common patterns when modifying this code
 

@@ -196,3 +196,46 @@ def test_dashboard_lists_multiple_graphs():
     assert resp.status_code == 200
     assert "alpha" in resp.text
     assert "beta" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Provider parameter tests
+# ---------------------------------------------------------------------------
+
+
+def test_query_accepts_provider_param():
+    """Query endpoint accepts the provider parameter without error."""
+    resp = client.post(
+        "/query",
+        data={
+            "graph_name": "nonexistent",
+            "query": "test",
+            "mode": "search",
+            "api_url": "http://localhost:11434",
+            "query_model": "test",
+            "embed_url": "",
+            "embed_model": "",
+            "provider": "local",
+        },
+    )
+    assert resp.status_code == 200
+
+
+def test_query_accepts_anthropic_provider():
+    """Query endpoint accepts provider=anthropic without a validation error."""
+    resp = client.post(
+        "/query",
+        data={
+            "graph_name": "nonexistent",
+            "query": "test",
+            "mode": "search",
+            "api_url": "http://localhost:11434",
+            "query_model": "claude-haiku-4-5-20251001",
+            "embed_url": "",
+            "embed_model": "",
+            "provider": "anthropic",
+        },
+    )
+    assert resp.status_code == 200
+    # Should show an error (graph not found or embed connection), not a provider validation error
+    assert "Error" in resp.text

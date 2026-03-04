@@ -38,7 +38,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from knowledge_graph import KnowledgeGraph, _salvage_truncated_json, _strip_thinking
+from knowledge_graph import (
+    KnowledgeGraph, _salvage_truncated_json, _strip_thinking,
+    claude_extract, _get_anthropic_api_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +50,17 @@ def _make_extract_fn(
     model: str,
     ollama_url: str,
     verbose: bool = False,
+    provider: str = "local",
 ) -> Callable[[str], list[dict[str, Any]]]:
     """Build an LLM extraction function for the given model.
 
-    Uses the OpenAI-compatible ``/v1/chat/completions`` endpoint, which
-    works with Ollama (>=0.1.14), llama.cpp, vLLM, LocalAI, etc.
+    When *provider* is ``"local"``, uses the OpenAI-compatible
+    ``/v1/chat/completions`` endpoint (Ollama, llama.cpp, vLLM, etc.).
+    When ``"anthropic"``, uses the Claude Messages API.
     """
+    if provider == "anthropic":
+        api_key = _get_anthropic_api_key()
+        return lambda prompt: claude_extract(prompt, model=model, api_key=api_key)
 
     def extract(prompt: str) -> list[dict[str, Any]]:
         if verbose:
@@ -154,6 +162,7 @@ def run_benchmark(
     max_sections: int | None = None,
     verbose: bool = False,
     quiet: bool = False,
+    provider: str = "local",
 ) -> list[dict[str, Any]]:
     """Run each model against the same file(s) and collect stats.
 
@@ -179,7 +188,7 @@ def run_benchmark(
             print(f"  Model {model_idx + 1}/{len(models)}: {model}")
             print(f"{'='*60}")
 
-        extract_fn = _make_extract_fn(model, ollama_url, verbose=verbose)
+        extract_fn = _make_extract_fn(model, ollama_url, verbose=verbose, provider=provider)
 
         model_result: dict[str, Any] = {
             "model": model,
@@ -439,6 +448,9 @@ def main():
                              "(default: http://localhost:11434)")
     parser.add_argument("--max-sections", type=int, default=None, metavar="N",
                         help="Limit to first N sections per file (quick test)")
+    parser.add_argument("--provider", choices=["local", "anthropic"], default="local",
+                        help="LLM provider: 'local' for OpenAI-compatible servers, "
+                             "'anthropic' for the Claude API (default: local)")
     parser.add_argument("--json", action="store_true", dest="json_output",
                         help="Output results as JSON")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -492,6 +504,7 @@ def main():
             max_sections=args.max_sections,
             verbose=args.verbose,
             quiet=args.quiet,
+            provider=args.provider,
         )
     finally:
         # Restore original method

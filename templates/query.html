@@ -53,7 +53,23 @@
         Model Configuration
       </summary>
       <div class="px-3 py-3 space-y-3 border-t border-gray-800">
-        <div class="grid grid-cols-2 gap-3">
+        <!-- Provider toggle -->
+        <div class="space-y-1">
+          <label class="block text-xs text-gray-400">Provider</label>
+          <div class="flex gap-4">
+            <label class="flex items-center gap-1 text-xs cursor-pointer">
+              <input type="radio" name="provider" value="local" checked
+                     class="accent-white" onchange="document.getElementById('query-local-cfg').classList.remove('hidden'); document.getElementById('query-anthropic-cfg').classList.add('hidden')"> Local (Ollama / llama.cpp)
+            </label>
+            <label class="flex items-center gap-1 text-xs cursor-pointer">
+              <input type="radio" name="provider" value="anthropic"
+                     class="accent-white" onchange="document.getElementById('query-local-cfg').classList.add('hidden'); document.getElementById('query-anthropic-cfg').classList.remove('hidden')"> Anthropic (Claude)
+            </label>
+          </div>
+        </div>
+
+        <!-- Local provider config -->
+        <div id="query-local-cfg" class="grid grid-cols-2 gap-3">
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">API URL</label>
             <input type="text" name="api_url" value="http://localhost:11434"
@@ -76,6 +92,32 @@
                    placeholder="From graph or nomic-embed-text"
                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
           </div>
+        </div>
+
+        <!-- Anthropic provider config -->
+        <div id="query-anthropic-cfg" class="hidden grid grid-cols-2 gap-3">
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Query Model (for Ask)</label>
+            <select name="query_model"
+                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+              <option value="claude-opus-4-0-20250115">claude-opus-4 (smartest)</option>
+              <option value="claude-sonnet-4-5-20250514">claude-sonnet-4-5</option>
+              <option value="claude-haiku-4-5-20251001">claude-haiku-4-5 (fast)</option>
+            </select>
+          </div>
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Embed URL</label>
+            <input type="text" name="embed_url" value="http://localhost:11434"
+                   placeholder="Local embed server"
+                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          </div>
+          <div class="space-y-1 col-span-2">
+            <label class="block text-xs text-gray-400">Embed Model</label>
+            <input type="text" name="embed_model" value=""
+                   placeholder="From graph or nomic-embed-text"
+                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          </div>
+          <p class="text-xs text-gray-600 col-span-2">API key is read from the ANTHROPIC_API_KEY environment variable. Embeddings always use a local server.</p>
         </div>
       </div>
     </details>

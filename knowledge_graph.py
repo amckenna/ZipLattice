@@ -107,6 +107,203 @@ def ollama_embed(
 
 
 # ---------------------------------------------------------------------------
+# Claude (Anthropic) API helpers
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_API_URL = "https://api.anthropic.com"
+_ANTHROPIC_VERSION = "2023-06-01"
+
+
+def _get_anthropic_api_key() -> str:
+    """Return the Anthropic API key from the environment.
+
+    Raises ``RuntimeError`` with a clear message if the key is not set.
+    """
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY environment variable is not set. "
+            "Set it to your Anthropic API key to use the 'anthropic' provider."
+        )
+    return key
+
+
+def claude_chat(prompt: str, *, model: str, api_key: str | None = None) -> str:
+    """Call the Anthropic Messages API and return the assistant's text.
+
+    Args:
+        prompt: The user message to send.
+        model: Anthropic model ID (e.g. ``claude-haiku-4-5-20251001``).
+        api_key: API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
+
+    Returns:
+        The assistant's response text.
+    """
+    if not api_key:
+        api_key = _get_anthropic_api_key()
+
+    endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 16384,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": _ANTHROPIC_VERSION,
+        },
+    )
+    logger.debug("claude_chat: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=1200) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode(errors="replace").strip()
+        except Exception:
+            pass
+        msg = (
+            f"Claude chat request failed (HTTP {exc.code}): "
+            f"POST {endpoint} with model '{model}'."
+        )
+        if detail:
+            msg += f"\nServer response: {detail}"
+        if exc.code == 401:
+            msg += "\nHint: check that ANTHROPIC_API_KEY is valid."
+        elif exc.code == 404:
+            msg += f"\nHint: model '{model}' may not exist. Check the model ID."
+        elif exc.code == 429:
+            msg += "\nHint: rate limited. Wait and retry."
+        raise RuntimeError(msg) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Cannot connect to {endpoint}: {exc.reason}."
+        ) from exc
+
+    elapsed = time.monotonic() - t0
+    # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
+    answer = body["content"][0]["text"].strip()
+    logger.debug("claude_chat: response=%d chars (%.1fs)", len(answer), elapsed)
+    return answer
+
+
+def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> list[dict[str, Any]]:
+    """Call the Anthropic Messages API for JSON extraction.
+
+    Mirrors the extraction pattern used by the OpenAI-compatible path:
+    sends a system prompt requesting pure JSON, then parses the response
+    with the same three-tier recovery logic.
+
+    Args:
+        prompt: The user-facing extraction prompt (section text).
+        model: Anthropic model ID (e.g. ``claude-haiku-4-5-20251001``).
+        api_key: API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
+
+    Returns:
+        List of extracted triple dicts, or ``[]`` on failure.
+    """
+    if not api_key:
+        api_key = _get_anthropic_api_key()
+
+    endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 32768,
+        "temperature": 0.1,
+        "system": (
+            "You are a JSON extraction engine. "
+            "Respond with ONLY a valid JSON array. "
+            "No explanations, no markdown."
+        ),
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": _ANTHROPIC_VERSION,
+        },
+    )
+    logger.debug("claude_extract: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
+    try:
+        with urllib.request.urlopen(req, timeout=1200) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode(errors="replace").strip()
+        except Exception:
+            pass
+        logger.error(
+            "Claude extraction request failed (HTTP %d): %s",
+            exc.code, detail or "(no detail)",
+        )
+        return []
+    except urllib.error.URLError as exc:
+        logger.error("Cannot connect to %s: %s", endpoint, exc.reason)
+        return []
+
+    # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
+    raw = body["content"][0]["text"].strip()
+    logger.debug("claude_extract: raw response=%d chars", len(raw))
+
+    # Safety-net strip of thinking tags (Claude doesn't emit them, but harmless)
+    raw = _strip_thinking(raw)
+
+    if not raw:
+        logger.warning("Claude returned empty response")
+        return []
+
+    # --- Three-tier JSON recovery (same as local-model path) ---
+
+    # 1. Direct parse
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+
+    # 2. Bracket extraction
+    if parsed is None:
+        start = raw.find("[")
+        if start != -1:
+            end = raw.rfind("]")
+            if end > start:
+                try:
+                    parsed = json.loads(raw[start:end + 1])
+                except json.JSONDecodeError:
+                    pass
+
+    # 3. Salvage truncated JSON
+    if parsed is None:
+        salvaged = _salvage_truncated_json(raw)
+        if salvaged is not None:
+            logger.warning(
+                "JSON truncated, salvaged %d complete triple(s)", len(salvaged),
+            )
+            return salvaged
+        logger.error("JSON parse failed (%d chars): %s", len(raw), raw[:500])
+        return []
+
+    # Unwrap dict-wrapped arrays
+    if isinstance(parsed, dict):
+        for v in parsed.values():
+            if isinstance(v, list):
+                return v
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Schema: Relation types
 # ---------------------------------------------------------------------------
 
@@ -4749,6 +4946,13 @@ def main():
     parser.add_argument("--embed-model", default=None, metavar="MODEL",
                         help="Embedding model for node embeddings during ingestion "
                              "(default: auto-detect from graph, or nomic-embed-text)")
+    parser.add_argument("--provider", choices=["local", "anthropic"], default="local",
+                        help="LLM provider: 'local' for OpenAI-compatible servers (Ollama, llama.cpp, etc.), "
+                             "'anthropic' for the Claude API (default: local)")
+    parser.add_argument("--extract-model", default=None, metavar="MODEL",
+                        help="Dedicated model for entity/relation extraction during ingestion. "
+                             "When set, --query-model is used only for querying. "
+                             "Useful for using a fast model (e.g. Haiku) for extraction.")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip automatic visualization export after ingestion")
     parser.add_argument("--auto-accept", action="store_true",
@@ -4912,114 +5116,125 @@ def main():
         _quiet = args.quiet
         _verbose = args.verbose
 
-        if args.query_model:
-            _extract_model = args.query_model
-            _extract_url = args.ollama_url.rstrip("/")
+        # Resolve which model to use for extraction
+        _has_model = args.query_model or args.extract_model
+        if _has_model:
+            _extract_model = args.extract_model or args.query_model
+            _provider = args.provider
 
-            def _llm_extract(prompt: str) -> list[dict[str, Any]]:
-                """Call OpenAI-compatible /v1/chat/completions and parse JSON."""
-                if _verbose:
-                    logger.debug("Prompt length: %d chars", len(prompt))
-
-                payload = json.dumps({
-                    "model": _extract_model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a JSON extraction engine. "
-                                "Respond with ONLY a valid JSON array. "
-                                "No explanations, no markdown."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "stream": False,
-                    "temperature": 0.1,
-                    "max_tokens": 32768,
-                }).encode()
-                req = urllib.request.Request(
-                    f"{_extract_url}/v1/chat/completions",
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
+            if _provider == "anthropic":
+                _api_key = _get_anthropic_api_key()
+                extract_fn: Callable[[str], list[dict[str, Any]]] = (
+                    lambda prompt: claude_extract(prompt, model=_extract_model, api_key=_api_key)
                 )
-                try:
-                    with urllib.request.urlopen(req, timeout=1200) as resp:
-                        body = json.loads(resp.read())
-                except urllib.error.HTTPError as exc:
-                    detail = ""
+                print(f"  Using model: {_extract_model} (provider: anthropic)")
+            else:
+                _extract_url = args.ollama_url.rstrip("/")
+
+                def _llm_extract(prompt: str) -> list[dict[str, Any]]:
+                    """Call OpenAI-compatible /v1/chat/completions and parse JSON."""
+                    if _verbose:
+                        logger.debug("Prompt length: %d chars", len(prompt))
+
+                    payload = json.dumps({
+                        "model": _extract_model,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a JSON extraction engine. "
+                                    "Respond with ONLY a valid JSON array. "
+                                    "No explanations, no markdown."
+                                ),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        "stream": False,
+                        "temperature": 0.1,
+                        "max_tokens": 32768,
+                    }).encode()
+                    req = urllib.request.Request(
+                        f"{_extract_url}/v1/chat/completions",
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
                     try:
-                        detail = exc.read().decode(errors="replace").strip()
-                    except Exception:
-                        pass
-                    logger.error(
-                        "Extraction request failed (HTTP %d): %s",
-                        exc.code, detail or "(no detail)",
-                    )
-                    return []
-                except urllib.error.URLError as exc:
-                    logger.error("Cannot connect to %s: %s", _extract_url, exc.reason)
-                    return []
-
-                # OpenAI format: choices[0].message.content
-                raw = body["choices"][0]["message"]["content"].strip()
-                if _verbose:
-                    logger.debug("Raw response length: %d chars", len(raw))
-
-                # Strip <think>...</think> blocks from thinking models
-                raw = _strip_thinking(raw)
-                if _verbose and len(raw) != len(body["choices"][0]["message"]["content"].strip()):
-                    logger.debug("After stripping thinking: %d chars", len(raw))
-
-                if not raw:
-                    logger.warning("LLM returned empty response")
-                    return []
-
-                # Try direct parse first (works when response_format is honored)
-                try:
-                    parsed = json.loads(raw)
-                except json.JSONDecodeError:
-                    parsed = None
-
-                # If direct parse failed, try to extract JSON from the text
-                # (model may have produced thinking/prose around the JSON)
-                if parsed is None:
-                    start = raw.find("[")
-                    if start != -1:
-                        end = raw.rfind("]")
-                        if end > start:
-                            try:
-                                parsed = json.loads(raw[start:end + 1])
-                            except json.JSONDecodeError:
-                                pass
-
-                # Last resort: salvage truncated JSON array
-                if parsed is None:
-                    salvaged = _salvage_truncated_json(raw)
-                    if salvaged is not None:
-                        logger.warning(
-                            "JSON truncated, salvaged %d complete triple(s)",
-                            len(salvaged),
+                        with urllib.request.urlopen(req, timeout=1200) as resp:
+                            body = json.loads(resp.read())
+                    except urllib.error.HTTPError as exc:
+                        detail = ""
+                        try:
+                            detail = exc.read().decode(errors="replace").strip()
+                        except Exception:
+                            pass
+                        logger.error(
+                            "Extraction request failed (HTTP %d): %s",
+                            exc.code, detail or "(no detail)",
                         )
-                        return salvaged
-                    logger.error(
-                        "JSON parse failed (%d chars): %s",
-                        len(raw), raw[:500],
-                    )
+                        return []
+                    except urllib.error.URLError as exc:
+                        logger.error("Cannot connect to %s: %s", _extract_url, exc.reason)
+                        return []
+
+                    # OpenAI format: choices[0].message.content
+                    raw = body["choices"][0]["message"]["content"].strip()
+                    if _verbose:
+                        logger.debug("Raw response length: %d chars", len(raw))
+
+                    # Strip <think>...</think> blocks from thinking models
+                    raw = _strip_thinking(raw)
+                    if _verbose and len(raw) != len(body["choices"][0]["message"]["content"].strip()):
+                        logger.debug("After stripping thinking: %d chars", len(raw))
+
+                    if not raw:
+                        logger.warning("LLM returned empty response")
+                        return []
+
+                    # Try direct parse first (works when response_format is honored)
+                    try:
+                        parsed = json.loads(raw)
+                    except json.JSONDecodeError:
+                        parsed = None
+
+                    # If direct parse failed, try to extract JSON from the text
+                    # (model may have produced thinking/prose around the JSON)
+                    if parsed is None:
+                        start = raw.find("[")
+                        if start != -1:
+                            end = raw.rfind("]")
+                            if end > start:
+                                try:
+                                    parsed = json.loads(raw[start:end + 1])
+                                except json.JSONDecodeError:
+                                    pass
+
+                    # Last resort: salvage truncated JSON array
+                    if parsed is None:
+                        salvaged = _salvage_truncated_json(raw)
+                        if salvaged is not None:
+                            logger.warning(
+                                "JSON truncated, salvaged %d complete triple(s)",
+                                len(salvaged),
+                            )
+                            return salvaged
+                        logger.error(
+                            "JSON parse failed (%d chars): %s",
+                            len(raw), raw[:500],
+                        )
+                        return []
+
+                    # Handle models that wrap the array in an object
+                    if isinstance(parsed, dict):
+                        for v in parsed.values():
+                            if isinstance(v, list):
+                                return v
+                        return []
+                    if isinstance(parsed, list):
+                        return parsed
                     return []
 
-                # Handle models that wrap the array in an object
-                if isinstance(parsed, dict):
-                    for v in parsed.values():
-                        if isinstance(v, list):
-                            return v
-                    return []
-                if isinstance(parsed, list):
-                    return parsed
-                return []
-
-            extract_fn: Callable[[str], list[dict[str, Any]]] = _llm_extract
-            print(f"  Using model: {_extract_model} at {_extract_url}")
+                extract_fn = _llm_extract
+                print(f"  Using model: {_extract_model} at {_extract_url}")
         else:
             # Structure-only ingestion: no LLM, build document/section
             # nodes and store the source. Entity extraction is skipped.
@@ -5064,7 +5279,7 @@ def main():
         # Resolve embed model once (shared across all files)
         _embed_model = None
         _embed_url = None
-        if args.query_model:
+        if _has_model:
             if args.embed_model is not None:
                 _embed_model = args.embed_model
             elif kg.embed_model:

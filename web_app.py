@@ -31,7 +31,10 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-from knowledge_graph import GraphEncoder, KnowledgeGraph, _strip_thinking, ollama_embed
+from knowledge_graph import (
+    GraphEncoder, KnowledgeGraph, _strip_thinking, ollama_embed,
+    claude_chat, claude_extract, _get_anthropic_api_key,
+)
 from query_graph import ask, build_context, ollama_chat, search_nodes
 
 logger = logging.getLogger("web_app")
@@ -166,6 +169,22 @@ def _build_llm_extract_fn(model: str, url: str):
         return []
 
     return _extract
+
+
+def _build_extract_fn(provider: str, model: str, api_url: str):
+    """Build an extraction callable for the given provider."""
+    if provider == "anthropic":
+        api_key = _get_anthropic_api_key()
+        return lambda prompt: claude_extract(prompt, model=model, api_key=api_key)
+    return _build_llm_extract_fn(model, api_url)
+
+
+def _build_llm_fn(provider: str, model: str, api_url: str):
+    """Build a chat callable for the given provider (used by 'ask' mode)."""
+    if provider == "anthropic":
+        api_key = _get_anthropic_api_key()
+        return partial(claude_chat, model=model, api_key=api_key)
+    return partial(ollama_chat, model=model, url=api_url)
 
 
 def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
@@ -320,6 +339,8 @@ async def ingest_documents(
     query_model: str = Form("qwen3-coder:30b"),
     embed_url: str = Form(""),
     embed_model: str = Form("nomic-embed-text"),
+    provider: str = Form("local"),
+    extract_model: str = Form(""),
 ):
     """Run LLM ingestion with streaming progress log."""
     batch = _upload_batches.pop(batch_id, None)
@@ -336,7 +357,8 @@ async def ingest_documents(
         )
 
     def _stream():
-        extract_fn = _build_llm_extract_fn(query_model, api_url)
+        _model = extract_model.strip() or query_model
+        extract_fn = _build_extract_fn(provider, _model, api_url)
         results = []
         total_docs = len(batch)
 
@@ -448,6 +470,7 @@ async def run_query(
     query_model: str = Form("qwen3-coder:30b"),
     embed_url: str = Form(""),
     embed_model: str = Form(""),
+    provider: str = Form("local"),
 ):
     """Execute a query against a knowledge graph."""
     try:
@@ -483,7 +506,7 @@ async def run_query(
                 "context": ctx,
             })
         elif mode == "ask":
-            llm_fn = partial(ollama_chat, model=query_model, url=api_url)
+            llm_fn = _build_llm_fn(provider, query_model, api_url)
             answer = ask(kg, query, embed_fn, llm_fn)
             return templates.TemplateResponse("partials/query_result.html", {
                 "request": request,
