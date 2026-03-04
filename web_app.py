@@ -32,7 +32,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from knowledge_graph import (
-    GraphEncoder, KnowledgeGraph, _strip_thinking, ollama_embed,
+    GraphEncoder, KnowledgeGraph, ollama_embed, local_extract,
     claude_chat, claude_extract, _get_anthropic_api_key,
 )
 from query_graph import ask, build_context, ollama_chat, search_nodes
@@ -103,80 +103,12 @@ def _build_embed_fn(
     return partial(ollama_embed, model=embed_model, url=embed_url)
 
 
-def _build_llm_extract_fn(model: str, url: str):
-    """Build an LLM extraction callable matching knowledge_graph.py's pattern."""
-    import urllib.request
-
-    def _extract(prompt: str) -> list[dict[str, Any]]:
-        payload = json.dumps({
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a JSON extraction engine. "
-                        "Respond with ONLY a valid JSON array. "
-                        "No explanations, no markdown."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "stream": False,
-            "temperature": 0.1,
-            "max_tokens": 32768,
-        }).encode()
-        req = urllib.request.Request(
-            f"{url.rstrip('/')}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=1200) as resp:
-                body = json.loads(resp.read())
-        except Exception as exc:
-            logger.error("Extraction request failed: %s", exc)
-            return []
-
-        raw = body["choices"][0]["message"]["content"].strip()
-        raw = _strip_thinking(raw)
-        if not raw:
-            return []
-
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            parsed = None
-
-        if parsed is None:
-            start = raw.find("[")
-            if start != -1:
-                end = raw.rfind("]")
-                if end > start:
-                    try:
-                        parsed = json.loads(raw[start : end + 1])
-                    except json.JSONDecodeError:
-                        pass
-
-        if parsed is None:
-            return []
-        if isinstance(parsed, dict):
-            for v in parsed.values():
-                if isinstance(v, list):
-                    return v
-            return []
-        if isinstance(parsed, list):
-            return parsed
-        return []
-
-    return _extract
-
-
 def _build_extract_fn(provider: str, model: str, api_url: str):
     """Build an extraction callable for the given provider."""
     if provider == "anthropic":
         api_key = _get_anthropic_api_key()
-        return lambda prompt: claude_extract(prompt, model=model, api_key=api_key)
-    return _build_llm_extract_fn(model, api_url)
+        return partial(claude_extract, model=model, api_key=api_key)
+    return partial(local_extract, model=model, url=api_url)
 
 
 def _build_llm_fn(provider: str, model: str, api_url: str):

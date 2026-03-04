@@ -34,12 +34,11 @@ import os
 import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
 from knowledge_graph import (
-    KnowledgeGraph, _salvage_truncated_json, _strip_thinking,
+    KnowledgeGraph, local_extract,
     claude_extract, _get_anthropic_api_key,
 )
 
@@ -61,98 +60,7 @@ def _make_extract_fn(
     if provider == "anthropic":
         api_key = _get_anthropic_api_key()
         return lambda prompt: claude_extract(prompt, model=model, api_key=api_key)
-
-    def extract(prompt: str) -> list[dict[str, Any]]:
-        if verbose:
-            logger.debug("[%s] Prompt length: %d chars", model, len(prompt))
-
-        payload = json.dumps({
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a JSON extraction engine. "
-                        "Respond with ONLY a valid JSON array. "
-                        "No explanations, no markdown."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "stream": False,
-            "temperature": 0.1,
-            "max_tokens": 32768,
-        }).encode()
-
-        req = urllib.request.Request(
-            f"{ollama_url}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=1200) as resp:
-                body = json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode(errors="replace").strip()
-            except Exception:
-                pass
-            logger.error("[%s] Request failed (HTTP %d): %s", model, exc.code, detail or "(no detail)")
-            return []
-        except urllib.error.URLError as exc:
-            logger.error("[%s] Cannot connect to %s: %s", model, ollama_url, exc.reason)
-            return []
-
-        # OpenAI format: choices[0].message.content
-        raw = body["choices"][0]["message"]["content"].strip()
-        if verbose:
-            logger.debug("[%s] Raw response length: %d chars", model, len(raw))
-
-        # Strip <think>...</think> blocks from thinking models
-        raw = _strip_thinking(raw)
-
-        if not raw:
-            logger.warning("[%s] Empty response", model)
-            return []
-
-        # Try direct parse
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            parsed = None
-
-        # Try bracket extraction
-        if parsed is None:
-            start = raw.find("[")
-            if start != -1:
-                end = raw.rfind("]")
-                if end > start:
-                    try:
-                        parsed = json.loads(raw[start:end + 1])
-                    except json.JSONDecodeError:
-                        pass
-
-        # Salvage truncated JSON
-        if parsed is None:
-            salvaged = _salvage_truncated_json(raw)
-            if salvaged is not None:
-                logger.warning("[%s] Salvaged %d items from truncated JSON", model, len(salvaged))
-                return salvaged
-            logger.error("[%s] JSON parse failed (%d chars)", model, len(raw))
-            return []
-
-        # Unwrap dict-wrapped arrays
-        if isinstance(parsed, dict):
-            for v in parsed.values():
-                if isinstance(v, list):
-                    return v
-            return []
-        if isinstance(parsed, list):
-            return parsed
-        return []
-
-    return extract
+    return lambda prompt: local_extract(prompt, model=model, url=ollama_url)
 
 
 def run_benchmark(

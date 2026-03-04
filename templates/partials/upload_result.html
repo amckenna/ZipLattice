@@ -48,11 +48,11 @@
           <div class="flex gap-4">
             <label class="flex items-center gap-1 text-xs cursor-pointer">
               <input type="radio" name="provider" value="local" checked
-                     class="accent-white" onchange="document.getElementById('ingest-local-cfg').classList.remove('hidden'); document.getElementById('ingest-anthropic-cfg').classList.add('hidden')"> Local (Ollama / llama.cpp)
+                     class="accent-white" onchange="togglePanel('ingest-local-cfg','ingest-anthropic-cfg')"> Local (Ollama / llama.cpp)
             </label>
             <label class="flex items-center gap-1 text-xs cursor-pointer">
               <input type="radio" name="provider" value="anthropic"
-                     class="accent-white" onchange="document.getElementById('ingest-local-cfg').classList.add('hidden'); document.getElementById('ingest-anthropic-cfg').classList.remove('hidden')"> Anthropic (Claude)
+                     class="accent-white" onchange="togglePanel('ingest-anthropic-cfg','ingest-local-cfg')"> Anthropic (Claude)
             </label>
           </div>
         </div>
@@ -82,26 +82,26 @@
           </div>
         </div>
 
-        <!-- Anthropic provider config -->
+        <!-- Anthropic provider config (disabled by default so fields don't submit) -->
         <div id="ingest-anthropic-cfg" class="hidden grid grid-cols-2 gap-3">
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Extraction Model</label>
-            <select name="extract_model"
+            <select name="extract_model" disabled
                     class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
               <option value="claude-haiku-4-5-20251001">claude-haiku-4-5 (fast)</option>
-              <option value="claude-sonnet-4-5-20250514">claude-sonnet-4-5</option>
-              <option value="claude-opus-4-0-20250115">claude-opus-4</option>
+              <option value="claude-sonnet-4-6-20250610">claude-sonnet-4.6</option>
+              <option value="claude-opus-4-6-20250610">claude-opus-4.6</option>
             </select>
           </div>
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Embed URL</label>
-            <input type="text" name="embed_url" value="http://localhost:11434"
+            <input type="text" name="embed_url" value="http://localhost:11434" disabled
                    placeholder="Local embed server"
                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
           </div>
           <div class="space-y-1 col-span-2">
             <label class="block text-xs text-gray-400">Embed Model</label>
-            <input type="text" name="embed_model" value="nomic-embed-text"
+            <input type="text" name="embed_model" value="nomic-embed-text" disabled
                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
           </div>
           <p class="text-xs text-gray-600 col-span-2">API key is read from the ANTHROPIC_API_KEY environment variable. Embeddings always use a local server.</p>
@@ -122,6 +122,15 @@
   </div>
 
   <script>
+  function togglePanel(showId, hideId) {
+    var show = document.getElementById(showId);
+    var hide = document.getElementById(hideId);
+    show.classList.remove('hidden');
+    hide.classList.add('hidden');
+    show.querySelectorAll('input, select').forEach(function(el) { el.disabled = false; });
+    hide.querySelectorAll('input, select').forEach(function(el) { el.disabled = true; });
+  }
+
   document.getElementById('ingest-form').addEventListener('submit', async function(e) {
     e.preventDefault();
     var form = e.target;

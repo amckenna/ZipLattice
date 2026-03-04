@@ -239,3 +239,42 @@ def test_query_accepts_anthropic_provider():
     assert resp.status_code == 200
     # Should show an error (graph not found or embed connection), not a provider validation error
     assert "Error" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Factory function tests
+# ---------------------------------------------------------------------------
+
+
+def test_build_extract_fn_local():
+    """_build_extract_fn returns a callable for local provider."""
+    from web_app import _build_extract_fn
+    fn = _build_extract_fn("local", "test-model", "http://localhost:11434")
+    assert callable(fn)
+
+
+def test_build_extract_fn_anthropic():
+    """_build_extract_fn returns a callable for anthropic provider."""
+    import os
+    from unittest.mock import patch
+    from web_app import _build_extract_fn
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
+        fn = _build_extract_fn("anthropic", "claude-haiku-4-5-20251001", "http://localhost:11434")
+    assert callable(fn)
+
+
+def test_build_llm_fn_local():
+    """_build_llm_fn returns a callable for local provider."""
+    from web_app import _build_llm_fn
+    fn = _build_llm_fn("local", "test-model", "http://localhost:11434")
+    assert callable(fn)
+
+
+def test_build_llm_fn_anthropic():
+    """_build_llm_fn returns a callable for anthropic provider."""
+    import os
+    from unittest.mock import patch
+    from web_app import _build_llm_fn
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
+        fn = _build_llm_fn("anthropic", "claude-haiku-4-5-20251001", "http://localhost:11434")
+    assert callable(fn)
