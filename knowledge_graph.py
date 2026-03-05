@@ -257,6 +257,26 @@ def _get_anthropic_api_key() -> str:
     return key
 
 
+def _rate_limit_wait(detail: str, attempt: int) -> float:
+    """Compute wait time for a 429 retry.
+
+    Tries to parse ``retry-after`` from the error body, otherwise uses
+    exponential backoff: 30s, 60s, 120s, 240s, ...
+    """
+    # Try to extract retry-after hint from JSON error body
+    try:
+        err = json.loads(detail) if detail else {}
+        msg = err.get("error", {}).get("message", "")
+        # Some APIs include "retry after X seconds" in the message
+        import re as _re
+        m = _re.search(r"retry.after\D*(\d+)", msg, _re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return min(30 * (2 ** attempt), 300)
+
+
 def claude_chat(prompt: str, *, model: str, api_key: str | None = None) -> str:
     """Call the Anthropic Messages API and return the assistant's text.
 
@@ -288,32 +308,54 @@ def claude_chat(prompt: str, *, model: str, api_key: str | None = None) -> str:
     )
     logger.debug("claude_chat: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
     t0 = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=1200) as resp:
-            body = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        detail = ""
+    body = None
+    max_retries = 5
+    for attempt in range(max_retries):
         try:
-            detail = exc.read().decode(errors="replace").strip()
-        except Exception:
-            pass
-        msg = (
-            f"Claude chat request failed (HTTP {exc.code}): "
-            f"POST {endpoint} with model '{model}'."
-        )
-        if detail:
-            msg += f"\nServer response: {detail}"
-        if exc.code == 401:
-            msg += "\nHint: check that ANTHROPIC_API_KEY is valid."
-        elif exc.code == 404:
-            msg += f"\nHint: model '{model}' may not exist. Check the model ID."
-        elif exc.code == 429:
-            msg += "\nHint: rate limited. Wait and retry."
-        raise RuntimeError(msg) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(
-            f"Cannot connect to {endpoint}: {exc.reason}."
-        ) from exc
+            with urllib.request.urlopen(req, timeout=1200) as resp:
+                body = json.loads(resp.read())
+            break
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode(errors="replace").strip()
+            except Exception:
+                pass
+            if exc.code == 429 and attempt < max_retries - 1:
+                wait = _rate_limit_wait(detail, attempt)
+                logger.warning(
+                    "Claude chat rate-limited (429), retry %d/%d in %.0fs",
+                    attempt + 1, max_retries - 1, wait,
+                )
+                time.sleep(wait)
+                req = urllib.request.Request(
+                    endpoint, data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-api-key": api_key,
+                        "anthropic-version": _ANTHROPIC_VERSION,
+                    },
+                )
+                continue
+            msg = (
+                f"Claude chat request failed (HTTP {exc.code}): "
+                f"POST {endpoint} with model '{model}'."
+            )
+            if detail:
+                msg += f"\nServer response: {detail}"
+            if exc.code == 401:
+                msg += "\nHint: check that ANTHROPIC_API_KEY is valid."
+            elif exc.code == 404:
+                msg += f"\nHint: model '{model}' may not exist. Check the model ID."
+            elif exc.code == 429:
+                msg += "\nHint: rate limited. Wait and retry."
+            raise RuntimeError(msg) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"Cannot connect to {endpoint}: {exc.reason}."
+            ) from exc
+    if body is None:
+        raise RuntimeError("Claude chat failed after retries.")
 
     elapsed = time.monotonic() - t0
     # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
@@ -362,22 +404,45 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
         },
     )
     logger.debug("claude_extract: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
-    try:
-        with urllib.request.urlopen(req, timeout=1200) as resp:
-            body = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        detail = ""
+    body = None
+    max_retries = 5
+    for attempt in range(max_retries):
         try:
-            detail = exc.read().decode(errors="replace").strip()
-        except Exception:
-            pass
-        logger.error(
-            "Claude extraction request failed (HTTP %d): %s",
-            exc.code, detail or "(no detail)",
-        )
-        return []
-    except urllib.error.URLError as exc:
-        logger.error("Cannot connect to %s: %s", endpoint, exc.reason)
+            with urllib.request.urlopen(req, timeout=1200) as resp:
+                body = json.loads(resp.read())
+            break
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode(errors="replace").strip()
+            except Exception:
+                pass
+            if exc.code == 429 and attempt < max_retries - 1:
+                wait = _rate_limit_wait(detail, attempt)
+                logger.warning(
+                    "Claude extraction rate-limited (429), retry %d/%d in %.0fs",
+                    attempt + 1, max_retries - 1, wait,
+                )
+                time.sleep(wait)
+                # Rebuild request (stream may be consumed)
+                req = urllib.request.Request(
+                    endpoint, data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-api-key": api_key,
+                        "anthropic-version": _ANTHROPIC_VERSION,
+                    },
+                )
+                continue
+            logger.error(
+                "Claude extraction request failed (HTTP %d): %s",
+                exc.code, detail or "(no detail)",
+            )
+            return []
+        except urllib.error.URLError as exc:
+            logger.error("Cannot connect to %s: %s", endpoint, exc.reason)
+            return []
+    if body is None:
         return []
 
     # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
