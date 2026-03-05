@@ -78,11 +78,11 @@ python knowledge_graph.py <path-to-graph.json> --pyvis output.html
 python knowledge_graph.py <path-to-graph.json> --cytoscape output.html
 python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
-python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b --embed-model nomic-embed-text
+python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b --embed-model qwen3-embedding
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --api-url http://exo:11434
 
 # Ingest with Claude API (Haiku for fast extraction, local embeddings)
-python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-haiku-4-5-20251001 --embed-model nomic-embed-text
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-haiku-4-5-20251001 --embed-model qwen3-embedding
 
 # Query graph CLI
 python query_graph.py <path-to-graph.json> search "synthetic aperture radar"

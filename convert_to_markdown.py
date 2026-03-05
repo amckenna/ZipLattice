@@ -130,6 +130,9 @@ def convert(source: str | Path, output: str | Path | None = None) -> str:
 
     md = converter(source)
 
+    # Strip inline base64 data-URI images (e.g. ![alt](data:image/png;base64,...))
+    md = re.sub(r"!\[[^\]]*\]\(data:[^)]+\)", "", md)
+
     if output is not None:
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)

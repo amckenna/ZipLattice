@@ -38,8 +38,11 @@
           <td class="py-3 text-right text-gray-400">{{ g.nodes }}</td>
           <td class="py-3 text-right text-gray-400">{{ g.edges }}</td>
           <td class="py-3 text-right text-gray-400">{{ g.sources }}</td>
-          <td class="py-3 text-right">
+          <td class="py-3 text-right space-x-3">
             <a href="/graphs/{{ g.name }}" class="text-gray-400 hover:text-white text-xs">View →</a>
+            <button hx-delete="/graphs/{{ g.name }}"
+                    hx-confirm="Delete '{{ g.name }}'? This cannot be undone."
+                    class="text-gray-600 hover:text-red-500 text-xs">Delete</button>
           </td>
         </tr>
         {% endfor %}
