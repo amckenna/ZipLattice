@@ -196,3 +196,85 @@ def test_dashboard_lists_multiple_graphs():
     assert resp.status_code == 200
     assert "alpha" in resp.text
     assert "beta" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Provider parameter tests
+# ---------------------------------------------------------------------------
+
+
+def test_query_accepts_provider_param():
+    """Query endpoint accepts the provider parameter without error."""
+    resp = client.post(
+        "/query",
+        data={
+            "graph_name": "nonexistent",
+            "query": "test",
+            "mode": "search",
+            "api_url": "http://localhost:11434",
+            "query_model": "test",
+            "embed_url": "",
+            "embed_model": "",
+            "provider": "local",
+        },
+    )
+    assert resp.status_code == 200
+
+
+def test_query_accepts_anthropic_provider():
+    """Query endpoint accepts provider=anthropic without a validation error."""
+    resp = client.post(
+        "/query",
+        data={
+            "graph_name": "nonexistent",
+            "query": "test",
+            "mode": "search",
+            "api_url": "http://localhost:11434",
+            "query_model": "claude-haiku-4-5-20251001",
+            "embed_url": "",
+            "embed_model": "",
+            "provider": "anthropic",
+        },
+    )
+    assert resp.status_code == 200
+    # Should show an error (graph not found or embed connection), not a provider validation error
+    assert "Error" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Factory function tests
+# ---------------------------------------------------------------------------
+
+
+def test_build_extract_fn_local():
+    """_build_extract_fn returns a callable for local provider."""
+    from web_app import _build_extract_fn
+    fn = _build_extract_fn("local", "test-model", "http://localhost:11434")
+    assert callable(fn)
+
+
+def test_build_extract_fn_anthropic():
+    """_build_extract_fn returns a callable for anthropic provider."""
+    import os
+    from unittest.mock import patch
+    from web_app import _build_extract_fn
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
+        fn = _build_extract_fn("anthropic", "claude-haiku-4-5-20251001", "http://localhost:11434")
+    assert callable(fn)
+
+
+def test_build_llm_fn_local():
+    """_build_llm_fn returns a callable for local provider."""
+    from web_app import _build_llm_fn
+    fn = _build_llm_fn("local", "test-model", "http://localhost:11434")
+    assert callable(fn)
+
+
+def test_build_llm_fn_anthropic():
+    """_build_llm_fn returns a callable for anthropic provider."""
+    import os
+    from unittest.mock import patch
+    from web_app import _build_llm_fn
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
+        fn = _build_llm_fn("anthropic", "claude-haiku-4-5-20251001", "http://localhost:11434")
+    assert callable(fn)

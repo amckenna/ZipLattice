@@ -31,7 +31,10 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-from knowledge_graph import GraphEncoder, KnowledgeGraph, _strip_thinking, ollama_embed
+from knowledge_graph import (
+    GraphEncoder, KnowledgeGraph, ollama_embed, local_extract,
+    claude_chat, claude_extract, _get_anthropic_api_key,
+)
 from query_graph import ask, build_context, ollama_chat, search_nodes
 
 logger = logging.getLogger("web_app")
@@ -90,6 +93,11 @@ def _list_graphs() -> list[dict[str, Any]]:
 def _load_graph(name: str) -> KnowledgeGraph:
     """Load a KnowledgeGraph by directory name."""
     json_file = GRAPHS_DIR / name / f"{name}.json"
+    # Guard against path traversal from user-supplied graph names
+    try:
+        json_file.resolve().relative_to(GRAPHS_DIR.resolve())
+    except ValueError:
+        raise ValueError(f"Invalid graph name: {name}")
     return KnowledgeGraph(json_file)
 
 
@@ -100,72 +108,20 @@ def _build_embed_fn(
     return partial(ollama_embed, model=embed_model, url=embed_url)
 
 
-def _build_llm_extract_fn(model: str, url: str):
-    """Build an LLM extraction callable matching knowledge_graph.py's pattern."""
-    import urllib.request
+def _build_extract_fn(provider: str, model: str, api_url: str):
+    """Build an extraction callable for the given provider."""
+    if provider == "anthropic":
+        api_key = _get_anthropic_api_key()
+        return partial(claude_extract, model=model, api_key=api_key)
+    return partial(local_extract, model=model, url=api_url)
 
-    def _extract(prompt: str) -> list[dict[str, Any]]:
-        payload = json.dumps({
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a JSON extraction engine. "
-                        "Respond with ONLY a valid JSON array. "
-                        "No explanations, no markdown."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "stream": False,
-            "temperature": 0.1,
-            "max_tokens": 32768,
-        }).encode()
-        req = urllib.request.Request(
-            f"{url.rstrip('/')}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=1200) as resp:
-                body = json.loads(resp.read())
-        except Exception as exc:
-            logger.error("Extraction request failed: %s", exc)
-            return []
 
-        raw = body["choices"][0]["message"]["content"].strip()
-        raw = _strip_thinking(raw)
-        if not raw:
-            return []
-
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            parsed = None
-
-        if parsed is None:
-            start = raw.find("[")
-            if start != -1:
-                end = raw.rfind("]")
-                if end > start:
-                    try:
-                        parsed = json.loads(raw[start : end + 1])
-                    except json.JSONDecodeError:
-                        pass
-
-        if parsed is None:
-            return []
-        if isinstance(parsed, dict):
-            for v in parsed.values():
-                if isinstance(v, list):
-                    return v
-            return []
-        if isinstance(parsed, list):
-            return parsed
-        return []
-
-    return _extract
+def _build_llm_fn(provider: str, model: str, api_url: str):
+    """Build a chat callable for the given provider (used by 'ask' mode)."""
+    if provider == "anthropic":
+        api_key = _get_anthropic_api_key()
+        return partial(claude_chat, model=model, api_key=api_key)
+    return partial(ollama_chat, model=model, url=api_url)
 
 
 def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
@@ -192,8 +148,18 @@ def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
         tmp_path.unlink(missing_ok=True)
 
 
-# Temporary storage for converted documents (batch_id -> list of docs)
-_upload_batches: dict[str, list[dict[str, Any]]] = {}
+# Temporary storage for converted documents (batch_id -> {docs, created_at})
+_upload_batches: dict[str, dict[str, Any]] = {}
+_BATCH_TTL_SECONDS = 1800  # 30 minutes
+
+
+def _evict_stale_batches() -> None:
+    """Remove upload batches older than _BATCH_TTL_SECONDS."""
+    now = time.time()
+    stale = [k for k, v in _upload_batches.items()
+             if now - v.get("created_at", 0) > _BATCH_TTL_SECONDS]
+    for k in stale:
+        _upload_batches.pop(k, None)
 
 
 # ---------------------------------------------------------------------------
@@ -300,8 +266,9 @@ async def upload_files(
         if not err:
             batch_docs.append({"doc_id": doc_id, "text": md_text, "filename": f.filename})
 
+    _evict_stale_batches()
     batch_id = uuid.uuid4().hex[:12]
-    _upload_batches[batch_id] = batch_docs
+    _upload_batches[batch_id] = {"docs": batch_docs, "created_at": time.time()}
 
     return templates.TemplateResponse("partials/upload_result.html", {
         "request": request,
@@ -320,9 +287,12 @@ async def ingest_documents(
     query_model: str = Form("qwen3-coder:30b"),
     embed_url: str = Form(""),
     embed_model: str = Form("nomic-embed-text"),
+    provider: str = Form("local"),
+    extract_model: str = Form(""),
 ):
     """Run LLM ingestion with streaming progress log."""
-    batch = _upload_batches.pop(batch_id, None)
+    batch_entry = _upload_batches.pop(batch_id, None)
+    batch = batch_entry["docs"] if batch_entry else None
     if not batch:
         return HTMLResponse(
             json.dumps({"type": "error", "message": "Upload batch not found. Please re-upload your files."}) + "\n"
@@ -336,15 +306,13 @@ async def ingest_documents(
         )
 
     def _stream():
-        extract_fn = _build_llm_extract_fn(query_model, api_url)
+        _model = extract_model.strip() or query_model
+        extract_fn = _build_extract_fn(provider, _model, api_url)
         results = []
         total_docs = len(batch)
 
         for di, doc in enumerate(batch):
             yield json.dumps({"type": "log", "message": f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}'..."}) + "\n"
-
-            def _progress(event):
-                pass  # progress events are yielded via the section callbacks below
 
             try:
                 section_events: list[dict] = []
@@ -448,6 +416,7 @@ async def run_query(
     query_model: str = Form("qwen3-coder:30b"),
     embed_url: str = Form(""),
     embed_model: str = Form(""),
+    provider: str = Form("local"),
 ):
     """Execute a query against a knowledge graph."""
     try:
@@ -483,7 +452,7 @@ async def run_query(
                 "context": ctx,
             })
         elif mode == "ask":
-            llm_fn = partial(ollama_chat, model=query_model, url=api_url)
+            llm_fn = _build_llm_fn(provider, query_model, api_url)
             answer = ask(kg, query, embed_fn, llm_fn)
             return templates.TemplateResponse("partials/query_result.html", {
                 "request": request,

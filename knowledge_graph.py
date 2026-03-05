@@ -107,6 +107,294 @@ def ollama_embed(
 
 
 # ---------------------------------------------------------------------------
+# Shared LLM response parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_llm_json(raw: str) -> list[dict[str, Any]]:
+    """Three-tier JSON recovery for LLM extraction responses.
+
+    Handles the common failure modes when asking an LLM to return a JSON
+    array of triples:
+
+    1. **Direct parse** — works when the model returns clean JSON.
+    2. **Bracket extraction** — finds ``[…]`` inside surrounding prose.
+    3. **Truncation salvage** — recovers complete objects when the model
+       hit its token limit mid-array.
+
+    Also unwraps dict-wrapped arrays (e.g. ``{"entities": [...]}``) into
+    a plain list.
+
+    Returns an empty list if all recovery strategies fail.
+    """
+    # 1. Direct parse
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+
+    # 2. Bracket extraction
+    if parsed is None:
+        start = raw.find("[")
+        if start != -1:
+            end = raw.rfind("]")
+            if end > start:
+                try:
+                    parsed = json.loads(raw[start:end + 1])
+                except json.JSONDecodeError:
+                    pass
+
+    # 3. Salvage truncated JSON
+    if parsed is None:
+        salvaged = _salvage_truncated_json(raw)
+        if salvaged is not None:
+            logger.warning(
+                "JSON truncated, salvaged %d complete triple(s)", len(salvaged),
+            )
+            return salvaged
+        logger.error("JSON parse failed (%d chars): %s", len(raw), raw[:500])
+        return []
+
+    # Unwrap dict-wrapped arrays
+    if isinstance(parsed, dict):
+        for v in parsed.values():
+            if isinstance(v, list):
+                return v
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    return []
+
+
+def local_extract(
+    prompt: str, *, model: str, url: str = "http://localhost:11434"
+) -> list[dict[str, Any]]:
+    """Call an OpenAI-compatible ``/v1/chat/completions`` endpoint for extraction.
+
+    Sends the extraction system prompt, parses the JSON response with
+    :func:`_parse_llm_json`, and returns a list of triple dicts.
+
+    Args:
+        prompt: The user-facing extraction prompt (section text).
+        model: Model name (e.g. ``qwen3-coder:30b``).
+        url: Server base URL.
+
+    Returns:
+        List of extracted triple dicts, or ``[]`` on failure.
+    """
+    endpoint = f"{url.rstrip('/')}/v1/chat/completions"
+    payload = json.dumps({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a JSON extraction engine. "
+                    "Respond with ONLY a valid JSON array. "
+                    "No explanations, no markdown."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "temperature": 0.1,
+        "max_tokens": 32768,
+    }).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    logger.debug("local_extract: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
+    try:
+        with urllib.request.urlopen(req, timeout=1200) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode(errors="replace").strip()
+        except Exception:
+            pass
+        logger.error(
+            "Extraction request failed (HTTP %d): %s",
+            exc.code, detail or "(no detail)",
+        )
+        return []
+    except urllib.error.URLError as exc:
+        logger.error("Cannot connect to %s: %s", url, exc.reason)
+        return []
+
+    # OpenAI format: choices[0].message.content
+    raw = body["choices"][0]["message"]["content"].strip()
+    raw = _strip_thinking(raw)
+
+    if not raw:
+        logger.warning("LLM returned empty response")
+        return []
+
+    return _parse_llm_json(raw)
+
+
+# ---------------------------------------------------------------------------
+# Claude (Anthropic) API helpers
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_API_URL = "https://api.anthropic.com"
+_ANTHROPIC_VERSION = "2023-06-01"
+
+
+def _get_anthropic_api_key() -> str:
+    """Return the Anthropic API key from the environment.
+
+    Raises ``RuntimeError`` with a clear message if the key is not set.
+    """
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY environment variable is not set. "
+            "Set it to your Anthropic API key to use the 'anthropic' provider."
+        )
+    return key
+
+
+def claude_chat(prompt: str, *, model: str, api_key: str | None = None) -> str:
+    """Call the Anthropic Messages API and return the assistant's text.
+
+    Args:
+        prompt: The user message to send.
+        model: Anthropic model ID (e.g. ``claude-haiku-4-5-20251001``).
+        api_key: API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
+
+    Returns:
+        The assistant's response text.
+    """
+    if not api_key:
+        api_key = _get_anthropic_api_key()
+
+    endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 16384,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": _ANTHROPIC_VERSION,
+        },
+    )
+    logger.debug("claude_chat: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=1200) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode(errors="replace").strip()
+        except Exception:
+            pass
+        msg = (
+            f"Claude chat request failed (HTTP {exc.code}): "
+            f"POST {endpoint} with model '{model}'."
+        )
+        if detail:
+            msg += f"\nServer response: {detail}"
+        if exc.code == 401:
+            msg += "\nHint: check that ANTHROPIC_API_KEY is valid."
+        elif exc.code == 404:
+            msg += f"\nHint: model '{model}' may not exist. Check the model ID."
+        elif exc.code == 429:
+            msg += "\nHint: rate limited. Wait and retry."
+        raise RuntimeError(msg) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Cannot connect to {endpoint}: {exc.reason}."
+        ) from exc
+
+    elapsed = time.monotonic() - t0
+    # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
+    answer = body["content"][0]["text"].strip()
+    logger.debug("claude_chat: response=%d chars (%.1fs)", len(answer), elapsed)
+    return answer
+
+
+def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> list[dict[str, Any]]:
+    """Call the Anthropic Messages API for JSON extraction.
+
+    Mirrors the extraction pattern used by the OpenAI-compatible path:
+    sends a system prompt requesting pure JSON, then parses the response
+    with the same three-tier recovery logic.
+
+    Args:
+        prompt: The user-facing extraction prompt (section text).
+        model: Anthropic model ID (e.g. ``claude-haiku-4-5-20251001``).
+        api_key: API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
+
+    Returns:
+        List of extracted triple dicts, or ``[]`` on failure.
+    """
+    if not api_key:
+        api_key = _get_anthropic_api_key()
+
+    endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 32768,
+        "temperature": 0.1,
+        "system": (
+            "You are a JSON extraction engine. "
+            "Respond with ONLY a valid JSON array. "
+            "No explanations, no markdown."
+        ),
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": _ANTHROPIC_VERSION,
+        },
+    )
+    logger.debug("claude_extract: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
+    try:
+        with urllib.request.urlopen(req, timeout=1200) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode(errors="replace").strip()
+        except Exception:
+            pass
+        logger.error(
+            "Claude extraction request failed (HTTP %d): %s",
+            exc.code, detail or "(no detail)",
+        )
+        return []
+    except urllib.error.URLError as exc:
+        logger.error("Cannot connect to %s: %s", endpoint, exc.reason)
+        return []
+
+    # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
+    raw = body["content"][0]["text"].strip()
+    logger.debug("claude_extract: raw response=%d chars", len(raw))
+
+    # Safety-net strip of thinking tags (Claude doesn't emit them, but harmless)
+    raw = _strip_thinking(raw)
+
+    if not raw:
+        logger.warning("Claude returned empty response")
+        return []
+
+    return _parse_llm_json(raw)
+
+
+# ---------------------------------------------------------------------------
 # Schema: Relation types
 # ---------------------------------------------------------------------------
 
@@ -174,6 +462,266 @@ DEFAULT_NODE_TYPES = {
     "artifact",
     "custom",
 }
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction constants (used by ingest_document)
+# ---------------------------------------------------------------------------
+
+# Keys that indicate a valid extraction triple
+_EXPECTED_KEYS = {
+    "source", "subject", "head", "from", "entity1",
+    "target", "object", "tail", "to", "entity2",
+    "relation", "predicate", "relationship", "rel",
+    "Concept", "concept", "Term", "term", "Name", "name",
+}
+
+# Key alias mapping for normalizing LLM output
+_KEY_ALIASES = {
+    "subject": "source",
+    "head": "source",
+    "from": "source",
+    "entity1": "source",
+    "object": "target",
+    "tail": "target",
+    "to": "target",
+    "entity2": "target",
+    "predicate": "relation",
+    "relationship": "relation",
+    "rel": "relation",
+    "type": "relation",
+}
+
+# Source/target key sets for hallucination detection
+_SRC_KEYS = {
+    "source", "subject", "head", "from", "entity1",
+    "Concept", "concept", "Term", "term", "Name", "name",
+}
+_TGT_KEYS = {"target", "object", "tail", "to", "entity2"}
+
+# Stopwords for entity grounding checks
+_STOPWORDS = {
+    "the", "and", "for", "that", "this", "with", "are", "was",
+    "were", "been", "being", "have", "has", "had", "does", "did",
+    "will", "would", "could", "should", "may", "might", "can",
+    "shall", "not", "but", "its", "from", "they", "them",
+    "their", "there", "then", "than", "other", "which", "what",
+    "when", "where", "who", "how", "all", "each", "every",
+    "both", "few", "more", "most", "some", "such", "only",
+    "also", "into", "over", "after", "before", "between",
+    "under", "about", "these", "those", "through", "during",
+    "while", "used", "using",
+}
+
+
+# ---------------------------------------------------------------------------
+# Description merging helper
+# ---------------------------------------------------------------------------
+
+
+def _merge_description(
+    existing_props: dict[str, Any],
+    new_text: str,
+    doc_id: str,
+    confidence: float = 1.0,
+) -> None:
+    """Merge a new description into a node's properties.
+
+    Maintains ``description_sources`` (list of per-document entries) and
+    rebuilds ``description`` as a concatenation of all unique description
+    texts joined with ``"; "``.
+    """
+    sources: list[dict[str, Any]] = existing_props.setdefault("description_sources", [])
+
+    # Check if this doc_id already contributed
+    for entry in sources:
+        if entry["doc_id"] == doc_id:
+            if entry["text"] == new_text:
+                return  # identical — nothing to do
+            # Same doc, different text — update in place
+            entry["text"] = new_text
+            entry["confidence"] = confidence
+            entry["updated_at"] = now_iso()
+            break
+    else:
+        # New doc_id
+        sources.append({
+            "text": new_text,
+            "doc_id": doc_id,
+            "confidence": confidence,
+            "updated_at": now_iso(),
+        })
+
+    # Rebuild concatenated description, deduplicating by text content
+    seen_texts: list[str] = []
+    for entry in sources:
+        if entry["text"] not in seen_texts:
+            seen_texts.append(entry["text"])
+    existing_props["description"] = "; ".join(seen_texts)
+
+
+# ---------------------------------------------------------------------------
+# Span-finding helpers
+# ---------------------------------------------------------------------------
+
+
+def find_entity_spans(
+    text: str,
+    entity_label: str,
+    *,
+    case_sensitive: bool = False,
+) -> list[dict[str, Any]]:
+    """Find character spans where *entity_label* appears in *text*.
+
+    Uses tiered matching:
+      1. Exact substring (case-insensitive by default).
+      2. Word-boundary regex match.
+      3. Longest-token partial match (token ≥ 4 chars, not a stopword).
+
+    Returns a list of ``{start, end, matched_text, match_type}`` dicts.
+    """
+    if not text or not entity_label:
+        return []
+
+    results: list[dict[str, Any]] = []
+
+    # --- Tier 1: exact substring ---
+    haystack = text if case_sensitive else text.lower()
+    needle = entity_label if case_sensitive else entity_label.lower()
+
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            break
+        results.append({
+            "start": idx,
+            "end": idx + len(needle),
+            "matched_text": text[idx : idx + len(needle)],
+            "match_type": "exact",
+        })
+        start = idx + 1
+
+    if results:
+        return results
+
+    # --- Tier 2: word-boundary regex ---
+    try:
+        pattern = re.compile(r"\b" + re.escape(entity_label) + r"\b",
+                             0 if case_sensitive else re.IGNORECASE)
+        for m in pattern.finditer(text):
+            results.append({
+                "start": m.start(),
+                "end": m.end(),
+                "matched_text": m.group(),
+                "match_type": "word_boundary",
+            })
+    except re.error:
+        pass
+
+    if results:
+        return results
+
+    # --- Tier 3: longest-token partial match ---
+    tokens = entity_label.split()
+    # Pick the longest token that isn't a stopword and is ≥ 4 chars
+    candidates = sorted(
+        [t for t in tokens if len(t) >= 4 and t.lower() not in _STOPWORDS],
+        key=len,
+        reverse=True,
+    )
+    if candidates:
+        token = candidates[0]
+        pattern = re.compile(re.escape(token), 0 if case_sensitive else re.IGNORECASE)
+        for m in pattern.finditer(text):
+            results.append({
+                "start": m.start(),
+                "end": m.end(),
+                "matched_text": m.group(),
+                "match_type": "partial_token",
+            })
+
+    return results
+
+
+def find_context_span(
+    text: str,
+    context: str,
+) -> dict[str, Any] | None:
+    """Find the character span of a *context* quote within *text*.
+
+    Uses tiered matching:
+      1. Exact substring.
+      2. Case-insensitive exact.
+      3. Prefix match (first 40+ chars).
+
+    Returns ``{start, end, matched_text, match_type}`` or ``None``.
+    """
+    if not text or not context:
+        return None
+
+    # --- Tier 1: exact substring ---
+    idx = text.find(context)
+    if idx != -1:
+        return {
+            "start": idx,
+            "end": idx + len(context),
+            "matched_text": context,
+            "match_type": "exact",
+        }
+
+    # --- Tier 1b: strip trailing punctuation and retry ---
+    stripped = context.rstrip(".,;:!?")
+    if stripped != context and stripped:
+        idx = text.find(stripped)
+        if idx != -1:
+            return {
+                "start": idx,
+                "end": idx + len(stripped),
+                "matched_text": text[idx : idx + len(stripped)],
+                "match_type": "exact",
+            }
+
+    # --- Tier 2: case-insensitive ---
+    lower_text = text.lower()
+    lower_ctx = context.lower()
+    idx = lower_text.find(lower_ctx)
+    if idx != -1:
+        return {
+            "start": idx,
+            "end": idx + len(context),
+            "matched_text": text[idx : idx + len(context)],
+            "match_type": "case_insensitive",
+        }
+
+    # --- Tier 2b: case-insensitive with stripped punctuation ---
+    if stripped != context and stripped:
+        idx = lower_text.find(stripped.lower())
+        if idx != -1:
+            return {
+                "start": idx,
+                "end": idx + len(stripped),
+                "matched_text": text[idx : idx + len(stripped)],
+                "match_type": "case_insensitive",
+            }
+
+    # --- Tier 3: prefix match (first 40+ chars) ---
+    prefix_len = min(len(context), max(40, len(context) // 2))
+    prefix = context[:prefix_len]
+    idx = lower_text.find(prefix.lower())
+    if idx != -1:
+        # Extend to end of sentence or paragraph if possible
+        end = idx + len(context)
+        if end > len(text):
+            end = len(text)
+        return {
+            "start": idx,
+            "end": end,
+            "matched_text": text[idx:end],
+            "match_type": "prefix",
+        }
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -282,9 +830,6 @@ class KnowledgeGraph:
     with the raw dict kept in sync for serialization.
     """
 
-    # Class-level registry of valid relations (core + user-registered)
-    _custom_relations: set[str] = set()
-
     def __init__(
         self,
         graph_path: str | Path = "knowledge_graph.json",
@@ -336,11 +881,13 @@ class KnowledgeGraph:
         self.auto_timestamp = auto_timestamp
 
         # Internal state
+        self._custom_relations: set[str] = set()
         self._data: dict[str, Any] = self._empty_graph_data()
         self._embeddings: dict[str, list[float]] = {}
         self._embed_meta: dict[str, Any] = {}
         self._proposals: list[RelationProposal] = []
-        self._G: nx.DiGraph = nx.DiGraph()
+        self._G: nx.MultiDiGraph = nx.MultiDiGraph()
+        self._edge_index: set[tuple[str, str, str]] = set()
         self._dirty = False
         self._dirty_embeddings = False
 
@@ -371,10 +918,9 @@ class KnowledgeGraph:
             "relation_proposals": [],
         }
 
-    @classmethod
-    def register_relation(cls, name: str) -> None:
-        """Register a custom relation type available to all instances."""
-        cls._custom_relations.add(name)
+    def register_relation(self, name: str) -> None:
+        """Register a custom relation type on this graph instance."""
+        self._custom_relations.add(name)
 
     def _valid_relations(self) -> set[str]:
         core = {r.value for r in CoreRelation}
@@ -468,7 +1014,7 @@ class KnowledgeGraph:
     def save_all(self) -> None:
         """Save both graph and embeddings."""
         self.save()
-        if self._embeddings:
+        if self._dirty_embeddings or self._embeddings:
             self.save_embeddings()
 
     # ------------------------------------------------------------------
@@ -956,20 +1502,24 @@ class KnowledgeGraph:
     # ------------------------------------------------------------------
 
     def _rebuild_networkx(self) -> None:
-        """Rebuild the networkx DiGraph from the raw dict."""
-        self._G = nx.DiGraph()
+        """Rebuild the networkx MultiDiGraph and edge index from the raw dict."""
+        self._G = nx.MultiDiGraph()
+        self._edge_index = set()
         for nid, node in self._data["nodes"].items():
             self._G.add_node(nid, **node)
         for edge in self._data["edges"]:
+            rel = edge.get("relation", "related_to")
             self._G.add_edge(
                 edge["source"],
                 edge["target"],
+                key=rel,
                 **{k: v for k, v in edge.items() if k not in ("source", "target")},
             )
+            self._edge_index.add((edge["source"], edge["target"], rel))
 
     @property
-    def graph(self) -> nx.DiGraph:
-        """Direct access to the underlying networkx DiGraph (read-friendly)."""
+    def graph(self) -> nx.MultiDiGraph:
+        """Direct access to the underlying networkx MultiDiGraph (read-friendly)."""
         return self._G
 
     # ------------------------------------------------------------------
@@ -1016,9 +1566,37 @@ class KnowledgeGraph:
             "confidence": confidence,
         }
 
+        # Seed description_sources for new nodes with a description
+        if "description" in properties and "description_sources" not in properties:
+            properties["description_sources"] = [{
+                "text": properties["description"],
+                "doc_id": source or "unknown",
+                "confidence": confidence,
+                "updated_at": ts,
+            }]
+
         if node_id in self._data["nodes"] and merge:
             existing = self._data["nodes"][node_id]
+            # Handle description merging separately to avoid overwrite
+            _desc = properties.pop("description", None)
+            _desc_sources = properties.pop("description_sources", None)
             existing["properties"].update(properties)
+            if _desc:
+                _merge_description(
+                    existing["properties"],
+                    _desc,
+                    doc_id=source or "unknown",
+                    confidence=confidence,
+                )
+            elif _desc_sources:
+                # Caller provided pre-built sources (e.g. from merge())
+                for ds in _desc_sources:
+                    _merge_description(
+                        existing["properties"],
+                        ds["text"],
+                        doc_id=ds.get("doc_id", "unknown"),
+                        confidence=ds.get("confidence", confidence),
+                    )
             existing["type"] = type
             existing["label"] = label
             existing["source"] = source
@@ -1130,8 +1708,8 @@ class KnowledgeGraph:
 
         relation = self._validate_relation(relation, _skip_auto_register=_skip_auto_register)
 
-        # Check for duplicates
-        if not allow_duplicate:
+        # Check for duplicates using the edge index (O(1) lookup)
+        if not allow_duplicate and (source, target, relation) in self._edge_index:
             for e in self._data["edges"]:
                 if e["source"] == source and e["target"] == target and e["relation"] == relation:
                     # Update existing edge
@@ -1140,7 +1718,8 @@ class KnowledgeGraph:
                     e["weight"] = weight
                     if self.auto_timestamp:
                         e["updated"] = now_iso()
-                    self._G[source][target].update(e)
+                    if self._G.has_edge(source, target, key=relation):
+                        self._G[source][target][relation].update(e)
                     self._dirty = True
                     return e
 
@@ -1159,7 +1738,8 @@ class KnowledgeGraph:
             edge["updated"] = ts
 
         self._data["edges"].append(edge)
-        self._G.add_edge(source, target, **edge)
+        self._edge_index.add((source, target, relation))
+        self._G.add_edge(source, target, key=relation, **edge)
         self._dirty = True
         return edge
 
@@ -1238,15 +1818,13 @@ class KnowledgeGraph:
                 if direction in ("outgoing", "both"):
                     for succ in self._G.successors(nid):
                         if relation:
-                            edge_data = self._G.edges[nid, succ]
-                            if edge_data.get("relation") != relation:
+                            if not self._G.has_edge(nid, succ, key=relation):
                                 continue
                         next_frontier.add(succ)
                 if direction in ("incoming", "both"):
                     for pred in self._G.predecessors(nid):
                         if relation:
-                            edge_data = self._G.edges[pred, nid]
-                            if edge_data.get("relation") != relation:
+                            if not self._G.has_edge(pred, nid, key=relation):
                                 continue
                         next_frontier.add(pred)
             visited.update(frontier)
@@ -2200,15 +2778,9 @@ TEXT:
         # Detect off-topic responses: if no triple has any recognized key,
         # the model returned garbage unrelated to the extraction prompt.
         if triples:
-            _EXPECTED_KEYS = {
-                "source", "subject", "head", "from", "entity1",
-                "target", "object", "tail", "to", "entity2",
-                "relation", "predicate", "relationship", "rel",
-                # Glossary-style keys (converted to triples downstream)
-                "Concept", "concept", "Term", "term", "Name", "name",
-            }
             _has_valid = any(
-                isinstance(t, dict) and _EXPECTED_KEYS & t.keys()
+                (isinstance(t, dict) and _EXPECTED_KEYS & t.keys())
+                or (isinstance(t, (list, tuple)) and len(t) >= 3)
                 for t in triples
             )
             if not _has_valid:
@@ -2233,21 +2805,6 @@ TEXT:
         # Extract entity names from all recognized key aliases and check
         # whether their words appear in the input text.
         if triples:
-            _SRC_KEYS = {"source", "subject", "head", "from", "entity1",
-                         "Concept", "concept", "Term", "term", "Name", "name"}
-            _TGT_KEYS = {"target", "object", "tail", "to", "entity2"}
-            _STOPWORDS = {
-                "the", "and", "for", "that", "this", "with", "are", "was",
-                "were", "been", "being", "have", "has", "had", "does", "did",
-                "will", "would", "could", "should", "may", "might", "can",
-                "shall", "not", "but", "its", "from", "they", "them",
-                "their", "there", "then", "than", "other", "which", "what",
-                "when", "where", "who", "how", "all", "each", "every",
-                "both", "few", "more", "most", "some", "such", "only",
-                "also", "into", "over", "after", "before", "between",
-                "under", "about", "these", "those", "through", "during",
-                "while", "used", "using",
-            }
             _text_lower = text.lower()
             _text_words = set(re.findall(r"[a-z]{3,}", _text_lower)) - _STOPWORDS
             _grounded = 0
@@ -2362,20 +2919,6 @@ TEXT:
                 # Normalize common LLM key aliases so that triples
                 # returned as {"subject": ..., "object": ...} or
                 # {"head": ..., "tail": ...} are accepted.
-                _KEY_ALIASES = {
-                    "subject": "source",
-                    "head": "source",
-                    "from": "source",
-                    "entity1": "source",
-                    "object": "target",
-                    "tail": "target",
-                    "to": "target",
-                    "entity2": "target",
-                    "predicate": "relation",
-                    "relationship": "relation",
-                    "rel": "relation",
-                    "type": "relation",
-                }
                 for old_key, new_key in _KEY_ALIASES.items():
                     if old_key in triple and new_key not in triple:
                         triple[new_key] = triple.pop(old_key)
@@ -2446,6 +2989,12 @@ TEXT:
                         node_props: dict[str, Any] = {}
                         if desc:
                             node_props["description"] = desc
+                            node_props["description_sources"] = [{
+                                "text": desc,
+                                "doc_id": doc_id,
+                                "confidence": conf,
+                                "updated_at": now_iso(),
+                            }]
                         if ingestion_id:
                             node_props["ingestion_id"] = ingestion_id
                         if content_hash:
@@ -2460,13 +3009,42 @@ TEXT:
                         )
                         stats["nodes_added"] += 1
                     elif desc:
-                        # Node already exists — backfill description if missing
+                        # Node already exists — merge description
                         existing = self._data["nodes"].get(nid, {})
-                        if not existing.get("properties", {}).get("description"):
-                            existing.setdefault("properties", {})["description"] = desc
+                        existing.setdefault("properties", {})
+                        _merge_description(
+                            existing["properties"], desc, doc_id, conf,
+                        )
+                        # Sync networkx
+                        self._G.nodes[nid].update(existing)
+                        self._dirty = True
+
+                    # --- Entity span tracking ---
+                    spans = find_entity_spans(text, label)
+                    if spans:
+                        node_data = self._data["nodes"].get(nid)
+                        if node_data is not None:
+                            mentions: list[dict[str, Any]] = node_data.setdefault(
+                                "properties", {},
+                            ).setdefault("mentions", [])
+                            existing_keys = {
+                                (m["doc_id"], m["start"], m["end"])
+                                for m in mentions
+                            }
+                            for span in spans:
+                                entry = {
+                                    "doc_id": doc_id,
+                                    "start": span["start"],
+                                    "end": span["end"],
+                                    "matched_text": span["matched_text"],
+                                    "match_type": span["match_type"],
+                                }
+                                if (doc_id, span["start"], span["end"]) not in existing_keys:
+                                    mentions.append(entry)
                             # Sync networkx
-                            self._G.nodes[nid].update(existing)
+                            self._G.nodes[nid].update(node_data)
                             self._dirty = True
+
                     entity_ids.add(nid)
 
                 # Handle novel vs known relations
@@ -2501,6 +3079,11 @@ TEXT:
                 edge_props: dict[str, Any] = {}
                 if context:
                     edge_props["context"] = context
+                    # --- Edge context span tracking ---
+                    ctx_span = find_context_span(text, context)
+                    if ctx_span:
+                        ctx_span["doc_id"] = doc_id
+                        edge_props["context_span"] = ctx_span
                 if ingestion_id:
                     edge_props["ingestion_id"] = ingestion_id
                 if content_hash:
@@ -2662,8 +3245,8 @@ TEXT:
         # --- Annotate sections ---
         link_re = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
         code_block_re = re.compile(r"```")
-        table_row_re = re.compile(r"^\s*\|.+\|")
-        list_re = re.compile(r"^\s*[-*+]|\s*\d+\.")
+        table_row_re = re.compile(r"^\s*\|.+\|", re.MULTILINE)
+        list_re = re.compile(r"^\s*[-*+]\s|\s*\d+\.", re.MULTILINE)
 
         for section in raw_sections:
             body = section["body"]
@@ -2948,6 +3531,7 @@ TEXT:
             if section["heading"]:
                 context_prefix += f"Heading: {section['heading']}\n"
             context_prefix += "---\n"
+            context_prefix_len = len(context_prefix)
 
             # Create section node
             if add_structure_nodes:
@@ -2962,6 +3546,7 @@ TEXT:
                     "section_index": i,
                     "ingestion_id": ingestion_id,
                     "content_hash": source_content_hash,
+                    "context_prefix_len": context_prefix_len,
                 }
                 if section["links"]:
                     section_props["link_count"] = len(section["links"])
@@ -3270,9 +3855,13 @@ TEXT:
         self._data["meta"]["custom_relations"] = sorted(my_customs | other_customs)
 
         # Merge embeddings
+        _emb_changed = False
         for nid, emb in other._embeddings.items():
             if nid not in self._embeddings or prefer == "other":
                 self._embeddings[nid] = emb
+                _emb_changed = True
+        if _emb_changed:
+            self._dirty_embeddings = True
 
         # Merge proposals
         my_proposal_names = {p.name for p in self._proposals}
@@ -3294,7 +3883,6 @@ TEXT:
 
         self._rebuild_networkx()
         self._dirty = True
-        self._dirty_embeddings = bool(other._embeddings)
         return stats
 
     # ------------------------------------------------------------------
@@ -4749,6 +5337,13 @@ def main():
     parser.add_argument("--embed-model", default=None, metavar="MODEL",
                         help="Embedding model for node embeddings during ingestion "
                              "(default: auto-detect from graph, or nomic-embed-text)")
+    parser.add_argument("--provider", choices=["local", "anthropic"], default="local",
+                        help="LLM provider: 'local' for OpenAI-compatible servers (Ollama, llama.cpp, etc.), "
+                             "'anthropic' for the Claude API (default: local)")
+    parser.add_argument("--extract-model", default=None, metavar="MODEL",
+                        help="Dedicated model for entity/relation extraction during ingestion. "
+                             "When set, --query-model is used only for querying. "
+                             "Useful for using a fast model (e.g. Haiku) for extraction.")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip automatic visualization export after ingestion")
     parser.add_argument("--auto-accept", action="store_true",
@@ -4912,114 +5507,24 @@ def main():
         _quiet = args.quiet
         _verbose = args.verbose
 
-        if args.query_model:
-            _extract_model = args.query_model
-            _extract_url = args.ollama_url.rstrip("/")
+        # Resolve which model to use for extraction
+        _has_model = args.query_model or args.extract_model
+        if _has_model:
+            _extract_model = args.extract_model or args.query_model
+            _provider = args.provider
 
-            def _llm_extract(prompt: str) -> list[dict[str, Any]]:
-                """Call OpenAI-compatible /v1/chat/completions and parse JSON."""
-                if _verbose:
-                    logger.debug("Prompt length: %d chars", len(prompt))
-
-                payload = json.dumps({
-                    "model": _extract_model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a JSON extraction engine. "
-                                "Respond with ONLY a valid JSON array. "
-                                "No explanations, no markdown."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "stream": False,
-                    "temperature": 0.1,
-                    "max_tokens": 32768,
-                }).encode()
-                req = urllib.request.Request(
-                    f"{_extract_url}/v1/chat/completions",
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
+            if _provider == "anthropic":
+                _api_key = _get_anthropic_api_key()
+                extract_fn: Callable[[str], list[dict[str, Any]]] = (
+                    lambda prompt: claude_extract(prompt, model=_extract_model, api_key=_api_key)
                 )
-                try:
-                    with urllib.request.urlopen(req, timeout=1200) as resp:
-                        body = json.loads(resp.read())
-                except urllib.error.HTTPError as exc:
-                    detail = ""
-                    try:
-                        detail = exc.read().decode(errors="replace").strip()
-                    except Exception:
-                        pass
-                    logger.error(
-                        "Extraction request failed (HTTP %d): %s",
-                        exc.code, detail or "(no detail)",
-                    )
-                    return []
-                except urllib.error.URLError as exc:
-                    logger.error("Cannot connect to %s: %s", _extract_url, exc.reason)
-                    return []
-
-                # OpenAI format: choices[0].message.content
-                raw = body["choices"][0]["message"]["content"].strip()
-                if _verbose:
-                    logger.debug("Raw response length: %d chars", len(raw))
-
-                # Strip <think>...</think> blocks from thinking models
-                raw = _strip_thinking(raw)
-                if _verbose and len(raw) != len(body["choices"][0]["message"]["content"].strip()):
-                    logger.debug("After stripping thinking: %d chars", len(raw))
-
-                if not raw:
-                    logger.warning("LLM returned empty response")
-                    return []
-
-                # Try direct parse first (works when response_format is honored)
-                try:
-                    parsed = json.loads(raw)
-                except json.JSONDecodeError:
-                    parsed = None
-
-                # If direct parse failed, try to extract JSON from the text
-                # (model may have produced thinking/prose around the JSON)
-                if parsed is None:
-                    start = raw.find("[")
-                    if start != -1:
-                        end = raw.rfind("]")
-                        if end > start:
-                            try:
-                                parsed = json.loads(raw[start:end + 1])
-                            except json.JSONDecodeError:
-                                pass
-
-                # Last resort: salvage truncated JSON array
-                if parsed is None:
-                    salvaged = _salvage_truncated_json(raw)
-                    if salvaged is not None:
-                        logger.warning(
-                            "JSON truncated, salvaged %d complete triple(s)",
-                            len(salvaged),
-                        )
-                        return salvaged
-                    logger.error(
-                        "JSON parse failed (%d chars): %s",
-                        len(raw), raw[:500],
-                    )
-                    return []
-
-                # Handle models that wrap the array in an object
-                if isinstance(parsed, dict):
-                    for v in parsed.values():
-                        if isinstance(v, list):
-                            return v
-                    return []
-                if isinstance(parsed, list):
-                    return parsed
-                return []
-
-            extract_fn: Callable[[str], list[dict[str, Any]]] = _llm_extract
-            print(f"  Using model: {_extract_model} at {_extract_url}")
+                print(f"  Using model: {_extract_model} (provider: anthropic)")
+            else:
+                _extract_url = args.ollama_url.rstrip("/")
+                extract_fn = (
+                    lambda prompt: local_extract(prompt, model=_extract_model, url=_extract_url)
+                )
+                print(f"  Using model: {_extract_model} at {_extract_url}")
         else:
             # Structure-only ingestion: no LLM, build document/section
             # nodes and store the source. Entity extraction is skipped.
@@ -5064,7 +5569,7 @@ def main():
         # Resolve embed model once (shared across all files)
         _embed_model = None
         _embed_url = None
-        if args.query_model:
+        if _has_model:
             if args.embed_model is not None:
                 _embed_model = args.embed_model
             elif kg.embed_model:

@@ -13,7 +13,10 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from knowledge_graph import KnowledgeGraph, ollama_embed
+from knowledge_graph import (
+    KnowledgeGraph, ollama_embed, claude_chat, claude_extract,
+    _get_anthropic_api_key, _parse_llm_json, local_extract,
+)
 from query_graph import search_nodes, build_context, ask, ollama_chat
 
 
@@ -800,3 +803,305 @@ def test_build_context_fallback_description_from_edge_context(tmp_path):
     # Check it appears in the nodes section (not just in the edge)
     nodes_section = ctx.split("### Relationships")[0]
     assert "The Kalman filter is widely used in navigation systems." in nodes_section
+
+
+# ---------------------------------------------------------------------------
+# Claude API tests (all mocked, no real API calls)
+# ---------------------------------------------------------------------------
+
+
+def _anthropic_chat_response(text):
+    """Build an Anthropic Messages API response dict."""
+    return {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+        "model": "claude-haiku-4-5-20251001",
+        "stop_reason": "end_turn",
+    }
+
+
+def test_claude_chat_basic():
+    """Verify claude_chat extracts response text correctly."""
+    mock_resp = _mock_urlopen_response(_anthropic_chat_response("Hello from Claude"))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = claude_chat("test prompt", model="claude-haiku-4-5-20251001", api_key="sk-test-key")
+    assert result == "Hello from Claude"
+
+
+def test_claude_chat_payload_format():
+    """Verify the JSON payload and headers sent to the Anthropic API."""
+    mock_resp = _mock_urlopen_response(_anthropic_chat_response("ok"))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        claude_chat("test prompt", model="claude-haiku-4-5-20251001", api_key="sk-test-key")
+
+    req = mock_urlopen.call_args[0][0]
+    assert req.full_url == "https://api.anthropic.com/v1/messages"
+    assert req.get_header("X-api-key") == "sk-test-key"
+    assert req.get_header("Anthropic-version") == "2023-06-01"
+    body = json.loads(req.data)
+    assert body["model"] == "claude-haiku-4-5-20251001"
+    assert body["messages"] == [{"role": "user", "content": "test prompt"}]
+    assert body["max_tokens"] == 16384
+
+
+def test_claude_chat_strips_whitespace():
+    """Verify leading/trailing whitespace is stripped."""
+    mock_resp = _mock_urlopen_response(_anthropic_chat_response("  spaced  \n"))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = claude_chat("test", model="m", api_key="sk-test")
+    assert result == "spaced"
+
+
+def test_claude_chat_http_401():
+    """Verify HTTPError with 401 gives an API key hint."""
+    exc = urllib.error.HTTPError(
+        "https://api.anthropic.com/v1/messages", 401, "Unauthorized", {}, None
+    )
+    with patch("knowledge_graph.urllib.request.urlopen", side_effect=exc):
+        with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+            claude_chat("test", model="m", api_key="bad-key")
+
+
+def test_claude_chat_http_429():
+    """Verify HTTPError with 429 gives a rate-limit hint."""
+    exc = urllib.error.HTTPError(
+        "https://api.anthropic.com/v1/messages", 429, "Too Many Requests", {}, None
+    )
+    with patch("knowledge_graph.urllib.request.urlopen", side_effect=exc):
+        with pytest.raises(RuntimeError, match="rate limited"):
+            claude_chat("test", model="m", api_key="sk-test")
+
+
+def test_claude_chat_connection_error():
+    """Verify URLError is wrapped in RuntimeError."""
+    exc = urllib.error.URLError("Connection refused")
+    with patch("knowledge_graph.urllib.request.urlopen", side_effect=exc):
+        with pytest.raises(RuntimeError, match="Cannot connect"):
+            claude_chat("test", model="m", api_key="sk-test")
+
+
+def test_claude_extract_basic():
+    """Verify claude_extract parses a JSON array from the response."""
+    triples = [{"source": "a", "target": "b", "relation": "uses"}]
+    mock_resp = _mock_urlopen_response(_anthropic_chat_response(json.dumps(triples)))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = claude_extract("extract from this text", model="claude-haiku-4-5-20251001", api_key="sk-test")
+    assert result == triples
+
+
+def test_claude_extract_payload_format():
+    """Verify extraction sends system prompt and correct parameters."""
+    mock_resp = _mock_urlopen_response(_anthropic_chat_response("[]"))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        claude_extract("some text", model="claude-haiku-4-5-20251001", api_key="sk-test")
+
+    req = mock_urlopen.call_args[0][0]
+    body = json.loads(req.data)
+    assert body["system"] == (
+        "You are a JSON extraction engine. "
+        "Respond with ONLY a valid JSON array. "
+        "No explanations, no markdown."
+    )
+    assert body["temperature"] == 0.1
+    assert body["max_tokens"] == 32768
+
+
+def test_claude_extract_bracket_recovery():
+    """Verify bracket extraction works when the response has surrounding prose."""
+    triples = [{"source": "x", "target": "y", "relation": "part_of"}]
+    text_with_prose = f"Here is the result:\n{json.dumps(triples)}\nDone."
+    mock_resp = _mock_urlopen_response(_anthropic_chat_response(text_with_prose))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = claude_extract("text", model="m", api_key="sk-test")
+    assert result == triples
+
+
+def test_claude_extract_dict_wrapped():
+    """Verify dict-wrapped arrays are unwrapped."""
+    triples = [{"source": "a", "target": "b", "relation": "uses"}]
+    wrapped = json.dumps({"entities": triples})
+    mock_resp = _mock_urlopen_response(_anthropic_chat_response(wrapped))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = claude_extract("text", model="m", api_key="sk-test")
+    assert result == triples
+
+
+def test_claude_extract_empty_response():
+    """Verify empty response returns empty list."""
+    mock_resp = _mock_urlopen_response(_anthropic_chat_response(""))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = claude_extract("text", model="m", api_key="sk-test")
+    assert result == []
+
+
+def test_claude_extract_http_error():
+    """Verify HTTP errors return empty list (not exception)."""
+    exc = urllib.error.HTTPError(
+        "https://api.anthropic.com/v1/messages", 500, "Server Error", {}, None
+    )
+    with patch("knowledge_graph.urllib.request.urlopen", side_effect=exc):
+        result = claude_extract("text", model="m", api_key="sk-test")
+    assert result == []
+
+
+def test_claude_chat_env_fallback():
+    """Verify claude_chat falls back to ANTHROPIC_API_KEY env var."""
+    mock_resp = _mock_urlopen_response(_anthropic_chat_response("ok"))
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-from-env"}):
+        with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+            claude_chat("test", model="m")
+
+    req = mock_urlopen.call_args[0][0]
+    assert req.get_header("X-api-key") == "sk-from-env"
+
+
+def test_get_anthropic_api_key_missing():
+    """Verify missing env var raises RuntimeError."""
+    with patch.dict(os.environ, {}, clear=True):
+        # Also clear any existing ANTHROPIC_API_KEY
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+            _get_anthropic_api_key()
+
+
+def test_ask_with_claude_llm_fn(kg):
+    """Verify ask() works when given a Claude-based llm_fn."""
+    def mock_claude_llm(prompt: str) -> str:
+        assert "Radar" in prompt
+        return "Claude says: Radar uses radio waves."
+
+    answer = ask(kg, "What is radar?", fake_embed, mock_claude_llm, max_nodes=5)
+    assert answer == "Claude says: Radar uses radio waves."
+
+
+# ---------------------------------------------------------------------------
+# _parse_llm_json tests
+# ---------------------------------------------------------------------------
+
+
+def test_parse_llm_json_direct():
+    """Direct JSON array is parsed correctly."""
+    raw = '[{"source": "a", "target": "b", "relation": "uses"}]'
+    result = _parse_llm_json(raw)
+    assert result == [{"source": "a", "target": "b", "relation": "uses"}]
+
+
+def test_parse_llm_json_bracket_extraction():
+    """Array embedded in prose is extracted via bracket recovery."""
+    triples = [{"source": "x", "target": "y", "relation": "part_of"}]
+    raw = f"Here are the results:\n{json.dumps(triples)}\nAll done."
+    result = _parse_llm_json(raw)
+    assert result == triples
+
+
+def test_parse_llm_json_dict_wrapped():
+    """Dict-wrapped array (e.g. {\"entities\": [...]}) is unwrapped."""
+    triples = [{"source": "a", "target": "b", "relation": "uses"}]
+    raw = json.dumps({"entities": triples})
+    result = _parse_llm_json(raw)
+    assert result == triples
+
+
+def test_parse_llm_json_dict_no_list():
+    """Dict without any list value returns empty list."""
+    raw = json.dumps({"status": "ok", "count": 5})
+    result = _parse_llm_json(raw)
+    assert result == []
+
+
+def test_parse_llm_json_truncated_salvage():
+    """Truncated JSON array with complete objects is salvaged."""
+    # Simulate a truncated response: two complete objects, one cut off
+    raw = '[{"source":"a","target":"b","relation":"uses"},{"source":"c","target":"d","relation":"part_of"},{"source":"e","targ'
+    result = _parse_llm_json(raw)
+    assert len(result) == 2
+    assert result[0]["source"] == "a"
+    assert result[1]["source"] == "c"
+
+
+def test_parse_llm_json_unparseable():
+    """Completely unparseable text returns empty list."""
+    raw = "This is just plain English with no JSON at all."
+    result = _parse_llm_json(raw)
+    assert result == []
+
+
+def test_parse_llm_json_empty_array():
+    """Empty array returns empty list."""
+    result = _parse_llm_json("[]")
+    assert result == []
+
+
+def test_parse_llm_json_scalar():
+    """Non-list, non-dict JSON (e.g. a string) returns empty list."""
+    result = _parse_llm_json('"just a string"')
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# local_extract tests
+# ---------------------------------------------------------------------------
+
+
+def test_local_extract_basic():
+    """Verify local_extract sends correct request and parses response."""
+    triples = [{"source": "a", "target": "b", "relation": "uses"}]
+    mock_resp = _mock_urlopen_response(_openai_chat_response(json.dumps(triples)))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = local_extract("extract entities", model="test-model", url="http://localhost:11434")
+    assert result == triples
+
+
+def test_local_extract_payload_format():
+    """Verify the payload includes system prompt and correct params."""
+    mock_resp = _mock_urlopen_response(_openai_chat_response("[]"))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        local_extract("some text", model="qwen3:30b", url="http://localhost:11434")
+
+    req = mock_urlopen.call_args[0][0]
+    assert req.full_url == "http://localhost:11434/v1/chat/completions"
+    body = json.loads(req.data)
+    assert body["model"] == "qwen3:30b"
+    assert body["messages"][0]["role"] == "system"
+    assert "JSON" in body["messages"][0]["content"]
+    assert body["messages"][1] == {"role": "user", "content": "some text"}
+    assert body["temperature"] == 0.1
+    assert body["stream"] is False
+
+
+def test_local_extract_http_error():
+    """HTTP errors return empty list (not exception)."""
+    exc = urllib.error.HTTPError(
+        "http://localhost:11434/v1/chat/completions", 500, "Server Error", {}, None
+    )
+    with patch("knowledge_graph.urllib.request.urlopen", side_effect=exc):
+        result = local_extract("text", model="m", url="http://localhost:11434")
+    assert result == []
+
+
+def test_local_extract_connection_error():
+    """Connection errors return empty list (not exception)."""
+    exc = urllib.error.URLError("Connection refused")
+    with patch("knowledge_graph.urllib.request.urlopen", side_effect=exc):
+        result = local_extract("text", model="m", url="http://localhost:11434")
+    assert result == []
+
+
+def test_local_extract_empty_response():
+    """Empty LLM response returns empty list."""
+    mock_resp = _mock_urlopen_response(_openai_chat_response(""))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp):
+        result = local_extract("text", model="m", url="http://localhost:11434")
+    assert result == []
+
+
+def test_local_extract_trailing_slash():
+    """Trailing slash in URL is handled correctly."""
+    mock_resp = _mock_urlopen_response(_openai_chat_response("[]"))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        local_extract("text", model="m", url="http://localhost:11434/")
+
+    req = mock_urlopen.call_args[0][0]
+    assert req.full_url == "http://localhost:11434/v1/chat/completions"
