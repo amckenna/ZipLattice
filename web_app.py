@@ -38,6 +38,11 @@ from knowledge_graph import (
 )
 from query_graph import ask, build_context, ollama_chat, search_nodes
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger("web_app")
 
 # ---------------------------------------------------------------------------
@@ -172,6 +177,7 @@ def _evict_stale_batches() -> None:
 async def dashboard(request: Request):
     """Dashboard — list all knowledge graphs."""
     graphs = _list_graphs()
+    logger.info("GET / — dashboard, %d graph(s) found", len(graphs))
     return templates.TemplateResponse("dashboard.html", {
         "request": request,
         "graphs": graphs,
@@ -181,6 +187,7 @@ async def dashboard(request: Request):
 @app.post("/graphs/create", response_class=HTMLResponse)
 async def create_graph(request: Request, name: str = Form(...)):
     """Create a new empty knowledge graph."""
+    logger.info("POST /graphs/create name=%r", name)
     slug = _slugify(name)
     graph_dir = GRAPHS_DIR / slug
     graph_dir.mkdir(parents=True, exist_ok=True)
@@ -194,6 +201,7 @@ async def create_graph(request: Request, name: str = Form(...)):
 @app.get("/graphs/{name}", response_class=HTMLResponse)
 async def graph_detail(request: Request, name: str):
     """Graph detail page with Cytoscape visualization."""
+    logger.info("GET /graphs/%s — detail page", name)
     json_file = GRAPHS_DIR / name / f"{name}.json"
     if not json_file.exists():
         return RedirectResponse(url="/", status_code=303)
@@ -220,6 +228,7 @@ async def graph_detail(request: Request, name: str):
 @app.get("/upload", response_class=HTMLResponse)
 async def upload_page(request: Request):
     """Upload form page."""
+    logger.info("GET /upload — upload page")
     graphs = _list_graphs()
     return templates.TemplateResponse("upload.html", {
         "request": request,
@@ -235,6 +244,11 @@ async def upload_files(
     files: list[UploadFile] = File(...),
 ):
     """Handle file uploads — convert to markdown."""
+    filenames = [f.filename for f in files]
+    logger.info(
+        "POST /upload graph=%r new_graph=%r files=%s",
+        graph_name, new_graph_name, filenames,
+    )
     # Determine target graph
     target = graph_name.strip()
     if new_graph_name.strip():
@@ -270,6 +284,10 @@ async def upload_files(
     _evict_stale_batches()
     batch_id = uuid.uuid4().hex[:12]
     _upload_batches[batch_id] = {"docs": batch_docs, "created_at": time.time()}
+    logger.info(
+        "Upload batch %s created: %d doc(s) converted for graph %r",
+        batch_id, len(batch_docs), target,
+    )
 
     return templates.TemplateResponse("partials/upload_result.html", {
         "request": request,
@@ -290,11 +308,20 @@ async def ingest_documents(
     embed_model: str = Form("qwen3-embedding"),
     provider: str = Form("local"),
     extract_model: str = Form(""),
+    verbose: str = Form(""),
 ):
     """Run LLM ingestion with streaming progress log."""
+    _verbose = verbose.strip() == "1"
+    logger.info(
+        "POST /ingest graph=%s batch=%s provider=%s model=%s embed=%s verbose=%s",
+        graph_name, batch_id, provider,
+        extract_model.strip() or query_model, embed_model, _verbose,
+    )
+
     batch_entry = _upload_batches.pop(batch_id, None)
     batch = batch_entry["docs"] if batch_entry else None
     if not batch:
+        logger.warning("Batch %s not found for graph %s", batch_id, graph_name)
         return HTMLResponse(
             json.dumps({"type": "error", "message": "Upload batch not found. Please re-upload your files."}) + "\n"
         )
@@ -302,18 +329,40 @@ async def ingest_documents(
     try:
         kg = _load_graph(graph_name)
     except Exception as exc:
+        logger.error("Cannot load graph '%s': %s", graph_name, exc)
         return HTMLResponse(
             json.dumps({"type": "error", "message": f"Cannot load graph '{graph_name}': {exc}"}) + "\n"
         )
+
+    def _log(msg: str) -> str:
+        """Build a JSON log line and also emit to server logger."""
+        logger.info("[ingest %s] %s", graph_name, msg)
+        return json.dumps({"type": "log", "message": msg}) + "\n"
 
     def _stream():
         _model = extract_model.strip() or query_model
         extract_fn = _build_extract_fn(provider, _model, api_url)
         results = []
         total_docs = len(batch)
+        graph_stats_before = kg.stats()
+
+        if _verbose:
+            yield _log(
+                f"Config: provider={provider} extract_model={_model} "
+                f"embed_model={embed_model} api_url={api_url} "
+                f"embed_url={embed_url.strip() or api_url}"
+            )
+            yield _log(
+                f"Graph before: {graph_stats_before.get('num_nodes', 0)} nodes, "
+                f"{graph_stats_before.get('num_edges', 0)} edges"
+            )
 
         for di, doc in enumerate(batch):
-            yield json.dumps({"type": "log", "message": f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}'..."}) + "\n"
+            doc_chars = len(doc.get("text", ""))
+            if _verbose:
+                yield _log(f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}' ({doc_chars} chars)...")
+            else:
+                yield _log(f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}'...")
 
             try:
                 section_events: list[dict] = []
@@ -337,17 +386,38 @@ async def ingest_documents(
                     total = ev.get("total", "?")
                     heading = ev.get("heading", "")
                     if evt == "section_start":
-                        yield json.dumps({"type": "log", "message": f"  section {idx}/{total}: {heading} ({ev.get('char_count', 0)} chars)..."}) + "\n"
+                        yield _log(f"  section {idx}/{total}: {heading} ({ev.get('char_count', 0)} chars)...")
                     elif evt == "section_done":
                         elapsed = ev.get("elapsed_seconds", 0)
                         triples = ev.get("triples_processed", 0)
                         nodes = ev.get("nodes_added", 0)
                         edges = ev.get("edges_added", 0)
-                        yield json.dumps({"type": "log", "message": f"    +{triples} triples, +{nodes} nodes, +{edges} edges ({elapsed}s)"}) + "\n"
+                        yield _log(f"    +{triples} triples, +{nodes} nodes, +{edges} edges ({elapsed}s)")
+                        if _verbose:
+                            nodes_skipped = ev.get("nodes_skipped", 0)
+                            edges_skipped = ev.get("edges_skipped", 0)
+                            proposals = ev.get("proposals_created", 0)
+                            extra_parts = []
+                            if nodes_skipped:
+                                extra_parts.append(f"{nodes_skipped} duplicate nodes skipped")
+                            if edges_skipped:
+                                extra_parts.append(f"{edges_skipped} duplicate edges skipped")
+                            if proposals:
+                                extra_parts.append(f"{proposals} new relation proposal(s)")
+                            if extra_parts:
+                                yield _log(f"    ({', '.join(extra_parts)})")
                     elif evt == "section_skip":
-                        yield json.dumps({"type": "log", "message": f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})"}) + "\n"
+                        yield _log(f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})")
 
-                yield json.dumps({"type": "log", "message": f"  done: {stats['total_triples']} triples, {stats['total_nodes_added']} nodes, {stats['total_edges_added']} edges"}) + "\n"
+                yield _log(f"  done: {stats['total_triples']} triples, {stats['total_nodes_added']} nodes, {stats['total_edges_added']} edges")
+
+                if _verbose:
+                    yield _log(
+                        f"  detail: {stats.get('total_sections', 0)} sections processed, "
+                        f"{stats.get('total_nodes_skipped', 0)} nodes skipped (dup), "
+                        f"{stats.get('total_edges_skipped', 0)} edges skipped (dup), "
+                        f"{stats.get('total_proposals_created', 0)} proposals"
+                    )
 
                 # Auto-accept new relation proposals
                 if stats.get("total_proposals_created"):
@@ -357,9 +427,10 @@ async def ingest_documents(
                         kg.accept_proposal(p.name)
                         accepted += 1
                     if accepted:
-                        yield json.dumps({"type": "log", "message": f"  auto-accepted {accepted} relation proposal(s)"}) + "\n"
+                        yield _log(f"  auto-accepted {accepted} relation proposal(s)")
             except Exception as exc:
-                yield json.dumps({"type": "log", "message": f"  error: {exc}"}) + "\n"
+                logger.error("Ingestion error for doc '%s': %s", doc["doc_id"], exc, exc_info=_verbose)
+                yield _log(f"  error: {exc}")
                 results.append({
                     "doc_id": doc["doc_id"],
                     "total_sections": 0,
@@ -372,18 +443,32 @@ async def ingest_documents(
         # Embed new nodes
         _embed_url = embed_url.strip() or api_url
         embed_count = 0
-        yield json.dumps({"type": "log", "message": "Embedding new nodes..."}) + "\n"
+        yield _log("Embedding new nodes...")
+        if _verbose:
+            yield _log(f"  embed config: model={embed_model} url={_embed_url}")
         try:
             efn = _build_embed_fn(embed_model, _embed_url)
             embed_stats = kg.embed_nodes(efn, skip_existing=True, model_name=embed_model)
             embed_count = embed_stats.get("nodes_embedded", 0)
-            yield json.dumps({"type": "log", "message": f"  embedded {embed_count} nodes"}) + "\n"
+            yield _log(f"  embedded {embed_count} nodes")
+            if _verbose:
+                skipped = embed_stats.get("nodes_skipped", 0)
+                if skipped:
+                    yield _log(f"  skipped {skipped} already-embedded nodes")
         except Exception as exc:
-            yield json.dumps({"type": "log", "message": f"  embedding failed: {exc}"}) + "\n"
+            logger.error("Embedding failed for graph '%s': %s", graph_name, exc)
+            yield _log(f"  embedding failed: {exc}")
 
         kg.save()
         kg.save_embeddings()
-        yield json.dumps({"type": "log", "message": "Graph saved."}) + "\n"
+        yield _log("Graph saved.")
+
+        if _verbose:
+            graph_stats_after = kg.stats()
+            yield _log(
+                f"Graph after: {graph_stats_after.get('num_nodes', 0)} nodes, "
+                f"{graph_stats_after.get('num_edges', 0)} edges"
+            )
 
         # Render final result HTML
         tpl = templates.env.get_template("partials/ingest_result.html")
@@ -400,6 +485,7 @@ async def ingest_documents(
 @app.get("/query", response_class=HTMLResponse)
 async def query_page(request: Request):
     """Query form page."""
+    logger.info("GET /query — query page")
     graphs = _list_graphs()
     return templates.TemplateResponse("query.html", {
         "request": request,
@@ -420,6 +506,10 @@ async def run_query(
     provider: str = Form("local"),
 ):
     """Execute a query against a knowledge graph."""
+    logger.info(
+        "POST /query graph=%s mode=%s provider=%s model=%s query=%r",
+        graph_name, mode, provider, query_model, query[:80],
+    )
     try:
         kg = _load_graph(graph_name)
     except Exception as exc:
@@ -475,6 +565,7 @@ async def run_query(
 @app.delete("/graphs/{name}")
 async def delete_graph(name: str):
     """Delete a knowledge graph and all its artifacts."""
+    logger.info("DELETE /graphs/%s — deleting graph", name)
     graph_dir = GRAPHS_DIR / name
     # Guard against path traversal
     try:
