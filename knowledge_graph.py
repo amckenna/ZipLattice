@@ -55,7 +55,7 @@ def ollama_embed(
 
     Args:
         texts: List of strings to embed.
-        model: Model name (e.g. ``nomic-embed-text``).
+        model: Model name (e.g. ``qwen3-embedding``).
         url: Server base URL.
 
     Returns:
@@ -5336,7 +5336,7 @@ def main():
                         help="API server URL for embeddings (default: same as --api-url)")
     parser.add_argument("--embed-model", default=None, metavar="MODEL",
                         help="Embedding model for node embeddings during ingestion "
-                             "(default: auto-detect from graph, or nomic-embed-text)")
+                             "(default: auto-detect from graph, or qwen3-embedding)")
     parser.add_argument("--provider", choices=["local", "anthropic"], default="local",
                         help="LLM provider: 'local' for OpenAI-compatible servers (Ollama, llama.cpp, etc.), "
                              "'anthropic' for the Claude API (default: local)")
@@ -5577,7 +5577,7 @@ def main():
                 if not _quiet:
                     print(f"  Using embed model '{_embed_model}' from graph metadata")
             else:
-                _embed_model = "nomic-embed-text"
+                _embed_model = "qwen3-embedding"
             _embed_url = args.embed_url.rstrip("/")
 
         _all_stats: list[dict[str, Any]] = []

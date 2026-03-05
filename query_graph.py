@@ -388,7 +388,7 @@ def main() -> None:
                         help="API server URL for embeddings (default: same as --api-url)")
     shared.add_argument("--embed-model", default=None, metavar="MODEL",
                         help="Embedding model for query embedding "
-                             "(default: auto-detect from graph, or nomic-embed-text)")
+                             "(default: auto-detect from graph, or qwen3-embedding)")
     shared.add_argument("--provider", choices=["local", "anthropic"], default="local",
                         help="LLM provider: 'local' for OpenAI-compatible servers, "
                              "'anthropic' for the Claude API (default: local)")
@@ -486,7 +486,7 @@ def main() -> None:
         embed_model = kg.embed_model
         logger.info("Using embed model '%s' from graph metadata", embed_model)
     else:
-        embed_model = "nomic-embed-text"
+        embed_model = "qwen3-embedding"
         logger.info("No embed model in graph metadata, falling back to '%s'", embed_model)
 
     logger.info("Embed config: model='%s' url='%s'", embed_model, embed_url)

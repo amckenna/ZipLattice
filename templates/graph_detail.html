@@ -112,6 +112,11 @@
       <a href="/" class="text-xs text-gray-400 hover:text-white">&larr; All Graphs</a>
       <h1 class="text-2xl font-bold mt-1">{{ graph_name }}</h1>
     </div>
+    <button hx-delete="/graphs/{{ graph_name }}"
+            hx-confirm="Delete '{{ graph_name }}'? This cannot be undone."
+            class="border border-gray-800 px-4 py-1.5 text-sm text-gray-400 hover:border-red-500 hover:text-red-500 transition-colors">
+      Delete Graph
+    </button>
   </div>
 
   <!-- Stats cards -->

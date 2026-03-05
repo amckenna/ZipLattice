@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 import uuid
@@ -286,7 +287,7 @@ async def ingest_documents(
     api_url: str = Form("http://localhost:11434"),
     query_model: str = Form("qwen3-coder:30b"),
     embed_url: str = Form(""),
-    embed_model: str = Form("nomic-embed-text"),
+    embed_model: str = Form("qwen3-embedding"),
     provider: str = Form("local"),
     extract_model: str = Form(""),
 ):
@@ -430,7 +431,7 @@ async def run_query(
     # Determine embed model
     _embed_model = embed_model.strip()
     if not _embed_model:
-        _embed_model = kg._embed_meta.get("model", "nomic-embed-text")
+        _embed_model = kg._embed_meta.get("model", "qwen3-embedding")
     _embed_url = embed_url.strip() or api_url
 
     embed_fn = _build_embed_fn(_embed_model, _embed_url)
@@ -469,6 +470,23 @@ async def run_query(
             "request": request,
             "error": str(exc),
         })
+
+
+@app.delete("/graphs/{name}")
+async def delete_graph(name: str):
+    """Delete a knowledge graph and all its artifacts."""
+    graph_dir = GRAPHS_DIR / name
+    # Guard against path traversal
+    try:
+        graph_dir.resolve().relative_to(GRAPHS_DIR.resolve())
+    except ValueError:
+        return HTMLResponse(status_code=400, content="Invalid graph name")
+    if not graph_dir.is_dir():
+        return HTMLResponse(status_code=404, content="Graph not found")
+    shutil.rmtree(graph_dir)
+    response = HTMLResponse(content="")
+    response.headers["HX-Redirect"] = "/"
+    return response
 
 
 @app.get("/health")
