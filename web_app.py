@@ -16,6 +16,7 @@ Run with::
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ import shutil
 import tempfile
 import time
 import uuid
+import zipfile
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -565,6 +567,63 @@ async def delete_graph(name: str):
     response = HTMLResponse(content="")
     response.headers["HX-Redirect"] = "/"
     return response
+
+
+@app.get("/graphs/{name}/export")
+async def export_graph(name: str):
+    """Export a knowledge graph as a portable .zip archive."""
+    logger.info("GET /graphs/%s/export — exporting graph", name)
+    graph_dir = GRAPHS_DIR / name
+    try:
+        graph_dir.resolve().relative_to(GRAPHS_DIR.resolve())
+    except ValueError:
+        return HTMLResponse(status_code=400, content="Invalid graph name")
+    json_file = graph_dir / f"{name}.json"
+    if not json_file.exists():
+        return HTMLResponse(status_code=404, content="Graph not found")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in sorted(graph_dir.rglob("*")):
+            if not file_path.is_file():
+                continue
+            arcname = str(Path(name) / file_path.relative_to(graph_dir))
+            if file_path == json_file:
+                # Rewrite absolute paths to relative for portability
+                data = json.loads(json_file.read_text(encoding="utf-8"))
+                sources = data.get("meta", {}).get("sources", {})
+                for entry in sources.values():
+                    entry["stored_path"] = _make_relative(
+                        entry.get("stored_path", ""), graph_dir
+                    )
+                    for ver in entry.get("versions", []):
+                        if "archived_to" in ver:
+                            ver["archived_to"] = _make_relative(
+                                ver["archived_to"], graph_dir
+                            )
+                zf.writestr(arcname, json.dumps(data, indent=2, cls=GraphEncoder))
+            else:
+                zf.write(file_path, arcname)
+
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{name}.zip"'},
+    )
+
+
+def _make_relative(path_str: str, base: Path) -> str:
+    """Convert an absolute path to be relative to base, if it's under base."""
+    if not path_str:
+        return path_str
+    p = Path(path_str)
+    if p.is_absolute():
+        try:
+            return str(p.relative_to(base))
+        except ValueError:
+            return path_str
+    return path_str
 
 
 @app.get("/health")
