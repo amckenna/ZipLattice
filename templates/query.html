@@ -50,9 +50,9 @@
                 class="w-full bg-black border border-gray-800 px-3 py-2 text-sm focus:outline-none focus:border-white resize-y"></textarea>
     </div>
 
-    <!-- Query mode -->
+    <!-- Context generation mode -->
     <div class="space-y-2">
-      <label class="block text-sm text-gray-400">Mode</label>
+      <label class="block text-sm text-gray-400">Context Generation Mode</label>
       <div class="flex gap-4">
         <label class="flex items-center gap-2 text-sm cursor-pointer">
           <input type="radio" name="mode" value="search" class="accent-white" onchange="updateModeHint(this.value)"> Search
@@ -65,6 +65,20 @@
         </label>
       </div>
       <p id="mode-hint" class="text-xs text-gray-400"></p>
+    </div>
+
+    <!-- Response mode (only relevant for Ask) -->
+    <div id="response-mode-section" class="space-y-2">
+      <label class="block text-sm text-gray-400">Response Mode</label>
+      <div class="flex gap-4">
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="response_mode" value="single" checked class="accent-white" onchange="updateResponseHint(this.value)"> Single-shot
+        </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="response_mode" value="chat" class="accent-white" onchange="updateResponseHint(this.value)"> Chat
+        </label>
+      </div>
+      <p id="response-hint" class="text-xs text-gray-400"></p>
     </div>
 
     <!-- Model config (collapsible) -->
@@ -168,9 +182,23 @@ var modeHints = {
   context: "Builds a RAG context block — searches for relevant nodes, expands their neighborhoods, and formats everything as structured text you can paste into an LLM prompt.",
   ask: "Asks a question — builds context from the graph and sends it along with your question to an LLM for a full natural-language answer. Requires a running model."
 };
+var responseHints = {
+  single: "Get a single answer and stop. Good for one-off questions.",
+  chat: "Start a conversation — after the initial answer you can ask follow-up questions with full conversation history."
+};
 function updateModeHint(mode) {
   document.getElementById('mode-hint').textContent = modeHints[mode] || '';
+  var rms = document.getElementById('response-mode-section');
+  if (mode === 'ask') {
+    rms.style.display = '';
+  } else {
+    rms.style.display = 'none';
+  }
+}
+function updateResponseHint(val) {
+  document.getElementById('response-hint').textContent = responseHints[val] || '';
 }
 updateModeHint('ask');
+updateResponseHint('single');
 </script>
 {% endblock %}

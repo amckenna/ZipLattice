@@ -1,0 +1,28 @@
+{% if error %}
+<div class="border border-red-900 bg-red-950 p-3 text-sm">
+  <span class="text-red-400 font-bold">Error:</span> {{ error }}
+</div>
+{% else %}
+{% if user_message %}
+<div class="border border-gray-800 bg-gray-950 p-3 space-y-1">
+  <p class="text-xs text-gray-500">You</p>
+  <p class="text-sm text-gray-300 whitespace-pre-wrap">{{ user_message }}</p>
+</div>
+{% endif %}
+<div class="border border-gray-800 p-3 space-y-1">
+  <p class="text-xs text-gray-500">Assistant</p>
+  <div class="chat-answer text-sm text-gray-300 prose"></div>
+</div>
+<script>
+(function() {
+  var raw = {{ answer|tojson }};
+  var els = document.querySelectorAll('.chat-answer');
+  var el = els[els.length - 1];
+  if (typeof marked !== 'undefined') {
+    el.innerHTML = marked.parse(raw);
+  } else {
+    el.textContent = raw;
+  }
+})();
+</script>
+{% endif %}

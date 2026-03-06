@@ -55,4 +55,26 @@
   }
 })();
 </script>
+{% if chat_session_id %}
+<!-- Chat follow-up area -->
+<div id="chat-history" class="mt-4 space-y-3"></div>
+<form id="chat-form" hx-post="/chat" hx-target="#chat-history" hx-swap="beforeend"
+      hx-indicator="#chat-thinking"
+      class="mt-4 flex gap-2">
+  <input type="hidden" name="session_id" value="{{ chat_session_id }}">
+  <textarea name="message" rows="2" required placeholder="Ask a follow-up question…"
+            class="flex-1 bg-black border border-gray-800 px-3 py-2 text-sm focus:outline-none focus:border-white resize-y"
+            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();this.form.requestSubmit();}"></textarea>
+  <button type="submit"
+          class="border border-white px-4 py-2 text-sm hover:bg-white hover:text-black transition-colors self-end">
+    Send
+  </button>
+</form>
+<span id="chat-thinking" class="htmx-indicator text-sm text-gray-400 mt-1 block">Thinking…</span>
+<script>
+document.getElementById('chat-form').addEventListener('htmx:afterRequest', function() {
+  this.querySelector('textarea').value = '';
+});
+</script>
+{% endif %}
 {% endif %}

@@ -132,6 +132,68 @@ def _build_llm_fn(provider: str, model: str, api_url: str):
     return partial(ollama_chat, model=model, url=api_url)
 
 
+def _chat_multi_turn_local(
+    messages: list[dict[str, str]], *, model: str, url: str
+) -> str:
+    """Call an OpenAI-compatible chat completions endpoint with full history."""
+    import urllib.request
+    endpoint = f"{url.rstrip('/')}/v1/chat/completions"
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }).encode()
+    req = urllib.request.Request(
+        endpoint, data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=1200) as resp:
+        body = json.loads(resp.read())
+    return body["choices"][0]["message"]["content"]
+
+
+def _chat_multi_turn_anthropic(
+    messages: list[dict[str, str]], *, model: str, api_key: str
+) -> str:
+    """Call the Anthropic Messages API with full conversation history."""
+    import urllib.request
+    from knowledge_graph import _ANTHROPIC_API_URL, _ANTHROPIC_VERSION
+
+    # Anthropic requires alternating user/assistant messages.
+    # The first message must be a user message.  If we have a system-like
+    # preamble we pass it via the ``system`` parameter.
+    system_text = ""
+    api_messages = []
+    for m in messages:
+        role = m["role"]
+        if role == "system":
+            system_text += m["content"] + "\n"
+        else:
+            api_messages.append({"role": role, "content": m["content"]})
+
+    endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
+    body_dict: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 16384,
+        "messages": api_messages,
+    }
+    if system_text.strip():
+        body_dict["system"] = system_text.strip()
+
+    payload = json.dumps(body_dict).encode()
+    req = urllib.request.Request(
+        endpoint, data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": _ANTHROPIC_VERSION,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=1200) as resp:
+        body = json.loads(resp.read())
+    return body["content"][0]["text"]
+
+
 def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
     """Convert an uploaded file to markdown. Returns (markdown, error)."""
     ext = Path(filename).suffix.lower()
@@ -160,6 +222,10 @@ def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
 _upload_batches: dict[str, dict[str, Any]] = {}
 _BATCH_TTL_SECONDS = 1800  # 30 minutes
 
+# Chat session storage (session_id -> {messages, config, created_at})
+_chat_sessions: dict[str, dict[str, Any]] = {}
+_CHAT_SESSION_TTL_SECONDS = 3600  # 1 hour
+
 
 def _evict_stale_batches() -> None:
     """Remove upload batches older than _BATCH_TTL_SECONDS."""
@@ -168,6 +234,15 @@ def _evict_stale_batches() -> None:
              if now - v.get("created_at", 0) > _BATCH_TTL_SECONDS]
     for k in stale:
         _upload_batches.pop(k, None)
+
+
+def _evict_stale_chat_sessions() -> None:
+    """Remove chat sessions older than _CHAT_SESSION_TTL_SECONDS."""
+    now = time.time()
+    stale = [k for k, v in _chat_sessions.items()
+             if now - v.get("created_at", 0) > _CHAT_SESSION_TTL_SECONDS]
+    for k in stale:
+        _chat_sessions.pop(k, None)
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +563,7 @@ async def run_query(
     graph_name: str = Form(...),
     query: str = Form(...),
     mode: str = Form("search"),
+    response_mode: str = Form("single"),
     api_url: str = Form("http://localhost:11434"),
     query_model: str = Form("qwen3-coder:30b"),
     embed_url: str = Form(""),
@@ -496,8 +572,8 @@ async def run_query(
 ):
     """Execute a query against a knowledge graph."""
     logger.info(
-        "POST /query graph=%s mode=%s provider=%s model=%s query=%r",
-        graph_name, mode, provider, query_model, query[:80],
+        "POST /query graph=%s mode=%s response_mode=%s provider=%s model=%s query=%r",
+        graph_name, mode, response_mode, provider, query_model, query[:80],
     )
     try:
         kg = _load_graph(graph_name)
@@ -534,10 +610,38 @@ async def run_query(
         elif mode == "ask":
             llm_fn = _build_llm_fn(provider, query_model, api_url)
             answer = ask(kg, query, embed_fn, llm_fn)
+
+            # If chat mode, create a session so the user can follow up
+            chat_session_id = None
+            if response_mode == "chat":
+                _evict_stale_chat_sessions()
+                # Build the RAG context that was used for this answer
+                rag_context = build_context(kg, query, embed_fn)
+                chat_session_id = uuid.uuid4().hex[:12]
+                _chat_sessions[chat_session_id] = {
+                    "messages": [
+                        {"role": "system", "content": (
+                            "You are a helpful assistant. Use the following knowledge graph "
+                            "context to answer questions. If the context doesn't contain "
+                            "enough information, say so.\n\n" + rag_context
+                        )},
+                        {"role": "user", "content": query},
+                        {"role": "assistant", "content": answer},
+                    ],
+                    "config": {
+                        "provider": provider,
+                        "query_model": query_model,
+                        "api_url": api_url,
+                    },
+                    "created_at": time.time(),
+                }
+                logger.info("Chat session %s created for graph %s", chat_session_id, graph_name)
+
             return templates.TemplateResponse("partials/query_result.html", {
                 "request": request,
                 "mode": "ask",
                 "answer": answer,
+                "chat_session_id": chat_session_id,
             })
         else:
             return templates.TemplateResponse("partials/query_result.html", {
@@ -549,6 +653,61 @@ async def run_query(
             "request": request,
             "error": str(exc),
         })
+
+
+@app.post("/chat", response_class=HTMLResponse)
+async def chat_follow_up(
+    request: Request,
+    session_id: str = Form(...),
+    message: str = Form(...),
+):
+    """Handle a follow-up message in an active chat session."""
+    logger.info("POST /chat session=%s message=%r", session_id, message[:80])
+
+    session = _chat_sessions.get(session_id)
+    if not session:
+        return templates.TemplateResponse("partials/chat_message.html", {
+            "request": request,
+            "error": "Chat session expired. Please start a new query.",
+        })
+
+    # Append user message
+    session["messages"].append({"role": "user", "content": message})
+
+    cfg = session["config"]
+    provider = cfg["provider"]
+    model = cfg["query_model"]
+    api_url = cfg["api_url"]
+
+    try:
+        if provider == "anthropic":
+            api_key = _get_anthropic_api_key()
+            answer = _chat_multi_turn_anthropic(
+                session["messages"], model=model, api_key=api_key,
+            )
+        else:
+            answer = _chat_multi_turn_local(
+                session["messages"], model=model, url=api_url,
+            )
+    except Exception as exc:
+        # Remove the failed user message so they can retry
+        session["messages"].pop()
+        logger.error("Chat error session=%s: %s", session_id, exc)
+        return templates.TemplateResponse("partials/chat_message.html", {
+            "request": request,
+            "error": str(exc),
+        })
+
+    # Append assistant response
+    session["messages"].append({"role": "assistant", "content": answer})
+    session["created_at"] = time.time()  # refresh TTL
+
+    return templates.TemplateResponse("partials/chat_message.html", {
+        "request": request,
+        "user_message": message,
+        "answer": answer,
+        "session_id": session_id,
+    })
 
 
 @app.delete("/graphs/{name}")
