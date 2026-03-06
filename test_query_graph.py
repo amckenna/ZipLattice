@@ -817,7 +817,7 @@ def _anthropic_chat_response(text):
         "type": "message",
         "role": "assistant",
         "content": [{"type": "text", "text": text}],
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-4-5",
         "stop_reason": "end_turn",
     }
 
@@ -826,7 +826,7 @@ def test_claude_chat_basic():
     """Verify claude_chat extracts response text correctly."""
     mock_resp = _mock_urlopen_response(_anthropic_chat_response("Hello from Claude"))
     with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp):
-        result = claude_chat("test prompt", model="claude-haiku-4-5-20251001", api_key="sk-test-key")
+        result = claude_chat("test prompt", model="claude-haiku-4-5", api_key="sk-test-key")
     assert result == "Hello from Claude"
 
 
@@ -834,14 +834,14 @@ def test_claude_chat_payload_format():
     """Verify the JSON payload and headers sent to the Anthropic API."""
     mock_resp = _mock_urlopen_response(_anthropic_chat_response("ok"))
     with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
-        claude_chat("test prompt", model="claude-haiku-4-5-20251001", api_key="sk-test-key")
+        claude_chat("test prompt", model="claude-haiku-4-5", api_key="sk-test-key")
 
     req = mock_urlopen.call_args[0][0]
     assert req.full_url == "https://api.anthropic.com/v1/messages"
     assert req.get_header("X-api-key") == "sk-test-key"
     assert req.get_header("Anthropic-version") == "2023-06-01"
     body = json.loads(req.data)
-    assert body["model"] == "claude-haiku-4-5-20251001"
+    assert body["model"] == "claude-haiku-4-5"
     assert body["messages"] == [{"role": "user", "content": "test prompt"}]
     assert body["max_tokens"] == 16384
 
@@ -887,7 +887,7 @@ def test_claude_extract_basic():
     triples = [{"source": "a", "target": "b", "relation": "uses"}]
     mock_resp = _mock_urlopen_response(_anthropic_chat_response(json.dumps(triples)))
     with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp):
-        result = claude_extract("extract from this text", model="claude-haiku-4-5-20251001", api_key="sk-test")
+        result = claude_extract("extract from this text", model="claude-haiku-4-5", api_key="sk-test")
     assert result == triples
 
 
@@ -895,7 +895,7 @@ def test_claude_extract_payload_format():
     """Verify extraction sends system prompt and correct parameters."""
     mock_resp = _mock_urlopen_response(_anthropic_chat_response("[]"))
     with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
-        claude_extract("some text", model="claude-haiku-4-5-20251001", api_key="sk-test")
+        claude_extract("some text", model="claude-haiku-4-5", api_key="sk-test")
 
     req = mock_urlopen.call_args[0][0]
     body = json.loads(req.data)
