@@ -192,6 +192,62 @@ def test_query_no_graph():
 
 
 # ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+
+def test_export_graph():
+    """Export a graph as a zip archive."""
+    import zipfile as zf
+    _create_graph("export-test")
+    resp = client.get("/graphs/export-test/export")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+    assert "export-test.zip" in resp.headers.get("content-disposition", "")
+
+    buf = __import__("io").BytesIO(resp.content)
+    with zf.ZipFile(buf) as z:
+        names = z.namelist()
+        assert any("export-test.json" in n for n in names)
+
+
+def test_export_nonexistent():
+    """Export of a nonexistent graph returns 404."""
+    resp = client.get("/graphs/nonexistent/export")
+    assert resp.status_code == 404
+
+
+def test_export_rewrites_absolute_paths():
+    """Absolute archived_to paths are made relative in the export."""
+    import zipfile as zf
+    _create_graph("path-test")
+    # Inject an absolute path into the graph's source metadata
+    graph_dir = GRAPHS_DIR / "path-test"
+    json_file = graph_dir / "path-test.json"
+    import json
+    data = json.loads(json_file.read_text())
+    data.setdefault("meta", {})["sources"] = {
+        "doc1": {
+            "stored_path": str(graph_dir / "path-test_sources" / "abc_doc1.md"),
+            "versions": [
+                {"archived_to": str(graph_dir / "path-test_sources" / "archive" / "v1_abc_doc1.md")}
+            ],
+        }
+    }
+    json_file.write_text(json.dumps(data))
+
+    resp = client.get("/graphs/path-test/export")
+    assert resp.status_code == 200
+    buf = __import__("io").BytesIO(resp.content)
+    with zf.ZipFile(buf) as z:
+        exported = json.loads(z.read("path-test/path-test.json"))
+    src = exported["meta"]["sources"]["doc1"]
+    # Paths should now be relative (no leading /)
+    assert not Path(src["stored_path"]).is_absolute()
+    assert not Path(src["versions"][0]["archived_to"]).is_absolute()
+
+
+# ---------------------------------------------------------------------------
 # Dashboard lists graphs
 # ---------------------------------------------------------------------------
 
