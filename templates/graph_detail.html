@@ -248,21 +248,6 @@ const typeColors = {{ type_colors_json|safe }};
 const relationColors = {{ relation_colors_json|safe }};
 const graphStats = {{ stats_json|safe }};
 
-// --- Build filter checkboxes ---
-const HIDDEN_TYPES_DEFAULT = new Set(['document', 'section']);
-(function() {
-  const tf = document.getElementById('type-filters');
-  Object.entries(typeColors).forEach(([t, c]) => {
-    const checked = HIDDEN_TYPES_DEFAULT.has(t) ? '' : 'checked';
-    tf.innerHTML += `<label class="filter-item"><input type="checkbox" ${checked} data-type="${t}" onchange="applyFilters()"><span class="color-dot" style="background:${c}"></span>${t}</label>`;
-  });
-  const rf = document.getElementById('relation-filters');
-  Object.entries(relationColors).forEach(([r, c]) => {
-    rf.innerHTML += `<label class="filter-item"><input type="checkbox" checked data-relation="${r}" onchange="applyFilters()"><span class="color-line" style="background:${c}"></span>${r}</label>`;
-  });
-  applyFilters();
-})();
-
 // --- Init Cytoscape ---
 const cy = cytoscape({
   container: document.getElementById('cy'),
@@ -337,6 +322,20 @@ const cy = cytoscape({
   maxZoom: 5,
   wheelSensitivity: 0.3,
 });
+
+// --- Build filter checkboxes (after cy is ready) ---
+const HIDDEN_TYPES_DEFAULT = new Set(['document', 'section']);
+(function() {
+  const tf = document.getElementById('type-filters');
+  Object.entries(typeColors).forEach(([t, c]) => {
+    const checked = HIDDEN_TYPES_DEFAULT.has(t) ? '' : 'checked';
+    tf.innerHTML += `<label class="filter-item"><input type="checkbox" ${checked} data-type="${t}" onchange="applyFilters()"><span class="color-dot" style="background:${c}"></span>${t}</label>`;
+  });
+  const rf = document.getElementById('relation-filters');
+  Object.entries(relationColors).forEach(([r, c]) => {
+    rf.innerHTML += `<label class="filter-item"><input type="checkbox" checked data-relation="${r}" onchange="applyFilters()"><span class="color-line" style="background:${c}"></span>${r}</label>`;
+  });
+})();
 
 // --- Layout ---
 let currentLayout = 'cose';
@@ -419,6 +418,7 @@ function applyFilters() {
     edge.toggleClass('hidden', !(srcVisible && tgtVisible && relVisible && confVisible));
   });
 }
+applyFilters();  // apply default hidden types on load
 
 function resetFilters() {
   document.querySelectorAll('#type-filters input, #relation-filters input').forEach(cb => cb.checked = true);
