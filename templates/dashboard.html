@@ -7,14 +7,10 @@
 <div class="space-y-8">
   <div class="flex items-center justify-between">
     <h1 class="text-2xl font-bold">Knowledge Graphs</h1>
-    <form hx-post="/graphs/create" hx-target="#graph-list" hx-swap="outerHTML" class="flex gap-2">
-      <input type="text" name="name" placeholder="New graph name…"
-             class="bg-black border border-gray-800 px-3 py-1.5 text-sm focus:outline-none focus:border-white" required>
-      <button type="submit"
-              class="border border-white px-4 py-1.5 text-sm hover:bg-white hover:text-black transition-colors">
-        Create
-      </button>
-    </form>
+    <a href="/upload"
+       class="border border-white px-4 py-1.5 text-sm hover:bg-white hover:text-black transition-colors">
+      Upload &amp; Create
+    </a>
   </div>
 
   <div id="graph-list">
@@ -50,7 +46,7 @@
     </table>
     {% else %}
     <div class="border border-gray-800 p-8 text-center text-gray-400">
-      No knowledge graphs found. Create one to get started.
+      No knowledge graphs found. <a href="/upload" class="underline hover:text-white">Upload documents</a> to create one.
     </div>
     {% endif %}
   </div>

@@ -184,19 +184,6 @@ async def dashboard(request: Request):
     })
 
 
-@app.post("/graphs/create", response_class=HTMLResponse)
-async def create_graph(request: Request, name: str = Form(...)):
-    """Create a new empty knowledge graph."""
-    logger.info("POST /graphs/create name=%r", name)
-    slug = _slugify(name)
-    graph_dir = GRAPHS_DIR / slug
-    graph_dir.mkdir(parents=True, exist_ok=True)
-    kg = KnowledgeGraph(graph_dir / f"{slug}.json")
-    kg.save()
-    response = HTMLResponse(content="")
-    response.headers["HX-Redirect"] = "/"
-    return response
-
 
 @app.get("/graphs/{name}", response_class=HTMLResponse)
 async def graph_detail(request: Request, name: str):
