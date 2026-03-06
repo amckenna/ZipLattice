@@ -194,7 +194,10 @@
     <div id="detail-panel">
       <div class="detail-header">
         <h3 id="detail-title">&mdash;</h3>
-        <button class="detail-close" onclick="closeDetail()">&times;</button>
+        <div style="display:flex;gap:4px;align-items:center">
+          <button class="ctrl-btn" id="copy-json-btn" onclick="copyNodeJSON()" title="Copy as JSON">Copy</button>
+          <button class="detail-close" onclick="closeDetail()">&times;</button>
+        </div>
       </div>
       <div class="detail-section" id="detail-content"></div>
       <div class="detail-section">
@@ -246,15 +249,18 @@ const relationColors = {{ relation_colors_json|safe }};
 const graphStats = {{ stats_json|safe }};
 
 // --- Build filter checkboxes ---
+const HIDDEN_TYPES_DEFAULT = new Set(['document', 'section']);
 (function() {
   const tf = document.getElementById('type-filters');
   Object.entries(typeColors).forEach(([t, c]) => {
-    tf.innerHTML += `<label class="filter-item"><input type="checkbox" checked data-type="${t}" onchange="applyFilters()"><span class="color-dot" style="background:${c}"></span>${t}</label>`;
+    const checked = HIDDEN_TYPES_DEFAULT.has(t) ? '' : 'checked';
+    tf.innerHTML += `<label class="filter-item"><input type="checkbox" ${checked} data-type="${t}" onchange="applyFilters()"><span class="color-dot" style="background:${c}"></span>${t}</label>`;
   });
   const rf = document.getElementById('relation-filters');
   Object.entries(relationColors).forEach(([r, c]) => {
     rf.innerHTML += `<label class="filter-item"><input type="checkbox" checked data-relation="${r}" onchange="applyFilters()"><span class="color-line" style="background:${c}"></span>${r}</label>`;
   });
+  applyFilters();
 })();
 
 // --- Init Cytoscape ---
@@ -457,9 +463,25 @@ cy.on('tap', function(evt) {
 });
 
 // --- Detail panel ---
+let _detailData = null;
+
+function copyNodeJSON() {
+  if (!_detailData) return;
+  const btn = document.getElementById('copy-json-btn');
+  navigator.clipboard.writeText(JSON.stringify(_detailData, null, 2)).then(() => {
+    btn.textContent = 'Copied';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+  });
+}
+
 function showDetail(node) {
   const panel = document.getElementById('detail-panel');
   const d = node.data();
+  _detailData = {
+    id: d.id, type: d.type, label: d.label,
+    confidence: d.confidence, source: d.source,
+    properties: d.properties || {},
+  };
   document.getElementById('detail-title').textContent = d.label;
   let html = '';
   html += detailRow('ID', d.id);
@@ -486,6 +508,11 @@ function showDetail(node) {
 function showEdgeDetail(edge) {
   const panel = document.getElementById('detail-panel');
   const d = edge.data();
+  _detailData = {
+    source: d.source, target: d.target, relation: d.relation,
+    confidence: d.confidence, source_meta: d.source_tag,
+    weight: d.weight, properties: d.properties || {},
+  };
   document.getElementById('detail-title').textContent = d.relation;
   let html = '';
   html += detailRow('Source', d.source);
