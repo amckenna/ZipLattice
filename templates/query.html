@@ -3,6 +3,28 @@
 {% block title %}Query — ZipLattice{% endblock %}
 {% block nav_query %}text-white border-b border-white{% endblock %}
 
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  .prose h1, .prose h2, .prose h3, .prose h4 { font-weight: 700; margin-top: 1em; margin-bottom: 0.5em; }
+  .prose h1 { font-size: 1.25rem; }
+  .prose h2 { font-size: 1.125rem; }
+  .prose h3 { font-size: 1rem; }
+  .prose p { margin-bottom: 0.75em; }
+  .prose ul, .prose ol { margin-left: 1.5em; margin-bottom: 0.75em; }
+  .prose ul { list-style-type: disc; }
+  .prose ol { list-style-type: decimal; }
+  .prose li { margin-bottom: 0.25em; }
+  .prose code { padding: 0.15em 0.3em; border-radius: 0.25rem; font-size: 0.85em; background-color: var(--bg-subtle); }
+  .prose pre { padding: 0.75em; border-radius: 0.375rem; overflow-x: auto; margin-bottom: 0.75em; background-color: var(--bg-subtle); border: 1px solid var(--border); }
+  .prose pre code { padding: 0; background: none; }
+  .prose blockquote { border-left: 3px solid var(--border); padding-left: 1em; color: var(--text-3); margin-bottom: 0.75em; }
+  .prose a { text-decoration: underline; }
+  .prose table { border-collapse: collapse; margin-bottom: 0.75em; }
+  .prose th, .prose td { border: 1px solid var(--border); padding: 0.35em 0.75em; }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="space-y-8 max-w-2xl">
   <h1 class="text-2xl font-bold">Query Knowledge Graph</h1>
@@ -32,19 +54,17 @@
     <div class="space-y-2">
       <label class="block text-sm text-gray-400">Mode</label>
       <div class="flex gap-4">
-        <label class="flex items-center gap-2 text-sm cursor-pointer"
-               title="Semantic similarity search — returns the most relevant nodes ranked by how closely they match your query.">
-          <input type="radio" name="mode" value="search" checked class="accent-white"> Search
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="mode" value="search" class="accent-white" onchange="updateModeHint(this.value)"> Search
         </label>
-        <label class="flex items-center gap-2 text-sm cursor-pointer"
-               title="Build a RAG context block — searches for relevant nodes, expands their neighborhoods, and formats everything as structured text you can paste into an LLM prompt.">
-          <input type="radio" name="mode" value="context" class="accent-white"> Context
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="mode" value="context" class="accent-white" onchange="updateModeHint(this.value)"> Context
         </label>
-        <label class="flex items-center gap-2 text-sm cursor-pointer"
-               title="Ask a question — builds context from the graph and sends it along with your question to an LLM for a full natural-language answer. Requires a running model.">
-          <input type="radio" name="mode" value="ask" class="accent-white"> Ask
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="mode" value="ask" checked class="accent-white" onchange="updateModeHint(this.value)"> Ask
         </label>
       </div>
+      <p id="mode-hint" class="text-xs text-gray-400"></p>
     </div>
 
     <!-- Model config (collapsible) -->
@@ -142,5 +162,15 @@ function togglePanel(showId, hideId) {
   show.querySelectorAll('input, select').forEach(function(el) { el.disabled = false; });
   hide.querySelectorAll('input, select').forEach(function(el) { el.disabled = true; });
 }
+
+var modeHints = {
+  search: "Semantic similarity search — returns the most relevant nodes ranked by how closely they match your query.",
+  context: "Builds a RAG context block — searches for relevant nodes, expands their neighborhoods, and formats everything as structured text you can paste into an LLM prompt.",
+  ask: "Asks a question — builds context from the graph and sends it along with your question to an LLM for a full natural-language answer. Requires a running model."
+};
+function updateModeHint(mode) {
+  document.getElementById('mode-hint').textContent = modeHints[mode] || '';
+}
+updateModeHint('ask');
 </script>
 {% endblock %}

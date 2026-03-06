@@ -293,7 +293,7 @@ def test_query_accepts_anthropic_provider():
             "query": "test",
             "mode": "search",
             "api_url": "http://localhost:11434",
-            "query_model": "claude-haiku-4-5-20251001",
+            "query_model": "claude-haiku-4-5",
             "embed_url": "",
             "embed_model": "",
             "provider": "anthropic",
@@ -322,7 +322,7 @@ def test_build_extract_fn_anthropic():
     from unittest.mock import patch
     from web_app import _build_extract_fn
     with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
-        fn = _build_extract_fn("anthropic", "claude-haiku-4-5-20251001", "http://localhost:11434")
+        fn = _build_extract_fn("anthropic", "claude-haiku-4-5", "http://localhost:11434")
     assert callable(fn)
 
 
@@ -339,5 +339,5 @@ def test_build_llm_fn_anthropic():
     from unittest.mock import patch
     from web_app import _build_llm_fn
     with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
-        fn = _build_llm_fn("anthropic", "claude-haiku-4-5-20251001", "http://localhost:11434")
+        fn = _build_llm_fn("anthropic", "claude-haiku-4-5", "http://localhost:11434")
     assert callable(fn)

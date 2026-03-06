@@ -82,7 +82,7 @@ python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-mod
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --api-url http://exo:11434
 
 # Ingest with Claude API (Haiku for fast extraction, local embeddings)
-python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-haiku-4-5-20251001 --embed-model qwen3-embedding
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-haiku-4-5 --embed-model qwen3-embedding
 
 # Query graph CLI
 python query_graph.py <path-to-graph.json> search "synthetic aperture radar"
@@ -91,7 +91,7 @@ python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-mode
 python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-model qwen3-coder:30b --api-url http://exo:11434
 
 # Query with Claude API (Opus for smartest answers)
-python query_graph.py <path-to-graph.json> ask "how does SAR work?" --provider anthropic --query-model claude-opus-4-0-20250115
+python query_graph.py <path-to-graph.json> ask "how does SAR work?" --provider anthropic --query-model claude-opus-4-6
 python query_graph.py <path-to-graph.json> node <node-id>
 python query_graph.py <path-to-graph.json> neighbors <node-id> --depth 2
 python query_graph.py <path-to-graph.json> path <source-id> <target-id>
@@ -102,7 +102,7 @@ python benchmark_models.py doc.md --models qwen3-coder:30b gemma3:27b llama3.1:7
 python benchmark_models.py docs/*.md --models modelA modelB --api-url http://exo:11434
 python benchmark_models.py doc.md --models modelA modelB --json
 python benchmark_models.py doc.md --models modelA modelB --max-sections 5  # quick test
-python benchmark_models.py doc.md --models claude-haiku-4-5-20251001 claude-sonnet-4-5-20250514 --provider anthropic
+python benchmark_models.py doc.md --models claude-haiku-4-5 claude-sonnet-4-6 --provider anthropic
 
 # Document converter CLI
 python convert_to_markdown.py document.pdf -o document.md

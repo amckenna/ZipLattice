@@ -282,7 +282,7 @@ def claude_chat(prompt: str, *, model: str, api_key: str | None = None) -> str:
 
     Args:
         prompt: The user message to send.
-        model: Anthropic model ID (e.g. ``claude-haiku-4-5-20251001``).
+        model: Anthropic model ID (e.g. ``claude-haiku-4-5``).
         api_key: API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
 
     Returns:
@@ -373,7 +373,7 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
 
     Args:
         prompt: The user-facing extraction prompt (section text).
-        model: Anthropic model ID (e.g. ``claude-haiku-4-5-20251001``).
+        model: Anthropic model ID (e.g. ``claude-haiku-4-5``).
         api_key: API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
 
     Returns:

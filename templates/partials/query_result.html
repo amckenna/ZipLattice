@@ -42,6 +42,17 @@
 {% elif mode == "ask" %}
 <div class="border border-gray-800 p-4 mt-4 space-y-2">
   <h3 class="text-sm font-bold">Answer</h3>
-  <div class="text-sm text-gray-300 whitespace-pre-wrap">{{ answer }}</div>
+  <div id="ask-answer" class="text-sm text-gray-300 prose"></div>
 </div>
+<script>
+(function() {
+  var raw = {{ answer|tojson }};
+  var el = document.getElementById('ask-answer');
+  if (typeof marked !== 'undefined') {
+    el.innerHTML = marked.parse(raw);
+  } else {
+    el.textContent = raw;
+  }
+})();
+</script>
 {% endif %}
