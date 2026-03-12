@@ -51,6 +51,7 @@ knowledge_graph/                  # dedicated graph directory
 - **Optional (for converter):** `pymupdf4llm`, `mammoth`, `markdownify`, `pymupdf_layout` (improves PDF layout analysis)
 - **Optional (for web frontend):** `fastapi`, `uvicorn`, `python-multipart`, `jinja2`
 - **Optional (for MCP server):** `fastmcp`
+- **Optional (for Bedrock provider):** `boto3`
 - Cytoscape.js is loaded from CDN in exported HTML files and does not need a local install
 
 ## Key classes
@@ -63,6 +64,9 @@ knowledge_graph/                  # dedicated graph directory
 - `ollama_embed()` (module-level) -- Calls OpenAI-compatible `/v1/embeddings` endpoint. Works with Ollama, llama.cpp, vLLM, LocalAI, etc. Used during ingestion and by `query_graph.py` at query time.
 - `claude_chat()` (module-level) -- Calls the Anthropic Messages API for chat/query. Used when `--provider anthropic` is set.
 - `claude_extract()` (module-level) -- Calls the Anthropic Messages API for JSON entity/relation extraction during ingestion. Same three-tier JSON recovery as the local path.
+- `bedrock_chat()` (module-level) -- Calls the AWS Bedrock Converse API for chat/query. Used when `--provider bedrock` is set.
+- `bedrock_extract()` (module-level) -- Calls the AWS Bedrock Converse API for JSON entity/relation extraction. Same three-tier JSON recovery as the local path.
+- `bedrock_embed()` (module-level) -- Calls AWS Bedrock for embeddings. Supports Titan (`invoke_model`) and Cohere (batched) embedding models.
 - `KnowledgeGraph.ingest_triples()` -- Public method that accepts pre-extracted triples directly (no LLM call). Enables the orchestrator-as-extractor pattern used by the MCP server.
 
 ## How to run
@@ -88,6 +92,13 @@ python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model 
 # Ingest with Claude API (Haiku for fast extraction, local embeddings)
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-haiku-4-5 --embed-model qwen3-embedding
 
+# Ingest with AWS Bedrock (Claude on Bedrock for extraction, local embeddings)
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider bedrock --extract-model us.anthropic.claude-sonnet-4-20250514-v1:0 --embed-model qwen3-embedding
+# Ingest with Bedrock for both extraction and embeddings (Titan embeddings)
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider bedrock --extract-model us.anthropic.claude-sonnet-4-20250514-v1:0 --embed-model amazon.titan-embed-text-v2:0
+# Ingest with Bedrock in a specific region
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider bedrock --extract-model us.anthropic.claude-sonnet-4-20250514-v1:0 --embed-model qwen3-embedding --bedrock-region us-west-2
+
 # Query graph CLI
 python query_graph.py <path-to-graph.json> search "synthetic aperture radar"
 python query_graph.py <path-to-graph.json> context "how does SAR work?"
@@ -96,6 +107,9 @@ python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-mode
 
 # Query with Claude API (Opus for smartest answers)
 python query_graph.py <path-to-graph.json> ask "how does SAR work?" --provider anthropic --query-model claude-opus-4-6
+# Query with AWS Bedrock
+python query_graph.py <path-to-graph.json> ask "how does SAR work?" --provider bedrock --query-model us.anthropic.claude-sonnet-4-20250514-v1:0
+python query_graph.py <path-to-graph.json> ask "how does SAR work?" --provider bedrock --query-model amazon.nova-pro-v1:0 --bedrock-region us-east-1
 python query_graph.py <path-to-graph.json> node <node-id>
 python query_graph.py <path-to-graph.json> neighbors <node-id> --depth 2
 python query_graph.py <path-to-graph.json> path <source-id> <target-id>
@@ -160,7 +174,7 @@ python -c "from query_graph import search_nodes, build_context, ask"
 - The library tracks a `_dirty` flag to avoid unnecessary writes on `save()`.
 - Relation proposals allow the schema to evolve: novel relations discovered during LLM extraction are proposed, accumulated across documents, and accepted or rejected.
 - Source documents are stored with SHA-256 content hashing for deduplication and version tracking.
-- **LLM provider abstraction:** Chat/extraction functions accept callables (`llm_fn`, `llm_extract_fn`), making the core logic provider-agnostic. The `--provider` flag selects between `local` (OpenAI-compatible servers) and `anthropic` (Claude API via `ANTHROPIC_API_KEY` env var). Embeddings always use a local server since Anthropic does not offer an embeddings API.
+- **LLM provider abstraction:** Chat/extraction functions accept callables (`llm_fn`, `llm_extract_fn`), making the core logic provider-agnostic. The `--provider` flag selects between `local` (OpenAI-compatible servers), `anthropic` (Claude API via `ANTHROPIC_API_KEY` env var), and `bedrock` (AWS Bedrock via `boto3` and standard AWS credentials). The Bedrock provider uses the Converse API for chat/extraction and `invoke_model` for embeddings (Titan and Cohere models). By default, embeddings use a local server unless `--embed-model` is explicitly set with the `bedrock` provider.
 - **MCP server / orchestrator-as-extractor:** `mcp_server.py` exposes graph operations as MCP tools via FastMCP. The key insight is that the calling orchestrator (e.g. Claude Code) *is* an LLM, so it can perform entity extraction itself using `build_extraction_prompt` and pass structured triples to `ingest_triples`, eliminating the need for a second LLM backend. The `ingest_triples()` method on `KnowledgeGraph` is the public API for this pattern — it accepts pre-extracted triples and handles all validation, node/edge creation, and proposal management.
 
 ## Common patterns when modifying this code

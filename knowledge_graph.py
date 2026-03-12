@@ -460,6 +460,258 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
 
 
 # ---------------------------------------------------------------------------
+# AWS Bedrock API helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_bedrock_client(region: str | None = None):
+    """Return a ``boto3`` Bedrock Runtime client.
+
+    Relies on standard AWS credential resolution (env vars, shared
+    credentials file, IAM role, etc.).  The *region* falls back to
+    ``AWS_DEFAULT_REGION`` / ``AWS_REGION`` env vars, then ``us-east-1``.
+
+    Raises ``RuntimeError`` with a clear message if ``boto3`` is not
+    installed or credentials cannot be resolved.
+    """
+    try:
+        import boto3  # type: ignore[import-untyped]
+    except ImportError:
+        raise RuntimeError(
+            "boto3 is required for the 'bedrock' provider.  "
+            "Install it with:  pip install boto3"
+        )
+    if region is None:
+        region = (
+            os.environ.get("AWS_DEFAULT_REGION")
+            or os.environ.get("AWS_REGION")
+            or "us-east-1"
+        )
+    try:
+        client = boto3.client("bedrock-runtime", region_name=region)
+        # Force credential resolution so we fail fast with a clear message.
+        client.meta.region_name  # noqa: B018 — triggers lazy init
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot create Bedrock client (region={region}): {exc}.  "
+            "Ensure AWS credentials are configured (AWS_ACCESS_KEY_ID / "
+            "AWS_SECRET_ACCESS_KEY, ~/.aws/credentials, or an IAM role)."
+        ) from exc
+    return client
+
+
+def bedrock_chat(
+    prompt: str,
+    *,
+    model: str,
+    region: str | None = None,
+) -> str:
+    """Call AWS Bedrock Converse API and return the assistant's text.
+
+    Args:
+        prompt: The user message to send.
+        model: Bedrock model ID (e.g.
+            ``us.anthropic.claude-sonnet-4-20250514``,
+            ``amazon.nova-pro-v1:0``).
+        region: AWS region.  Falls back to env / ``us-east-1``.
+
+    Returns:
+        The assistant's response text.
+    """
+    client = _get_bedrock_client(region)
+    logger.debug("bedrock_chat: model=%s  prompt=%d chars", model, len(prompt))
+    t0 = time.monotonic()
+
+    max_retries = 5
+    body = None
+    for attempt in range(max_retries):
+        try:
+            body = client.converse(
+                modelId=model,
+                messages=[{
+                    "role": "user",
+                    "content": [{"text": prompt}],
+                }],
+                inferenceConfig={"maxTokens": 16384},
+            )
+            break
+        except client.exceptions.ThrottlingException:
+            if attempt < max_retries - 1:
+                wait = min(30 * (2 ** attempt), 300)
+                logger.warning(
+                    "Bedrock chat throttled, retry %d/%d in %.0fs",
+                    attempt + 1, max_retries - 1, wait,
+                )
+                time.sleep(wait)
+                continue
+            raise RuntimeError(
+                f"Bedrock chat throttled after {max_retries} attempts "
+                f"(model={model})."
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Bedrock chat failed (model={model}): {exc}"
+            ) from exc
+
+    if body is None:
+        raise RuntimeError("Bedrock chat failed after retries.")
+
+    elapsed = time.monotonic() - t0
+    # Converse format: {"output": {"message": {"content": [{"text": "..."}]}}}
+    answer = body["output"]["message"]["content"][0]["text"].strip()
+    logger.debug("bedrock_chat: response=%d chars (%.1fs)", len(answer), elapsed)
+    return answer
+
+
+def bedrock_extract(
+    prompt: str,
+    *,
+    model: str,
+    region: str | None = None,
+) -> list[dict[str, Any]]:
+    """Call AWS Bedrock Converse API for JSON extraction.
+
+    Mirrors the extraction pattern of :func:`claude_extract` and
+    :func:`local_extract`:  sends a system prompt requesting pure JSON,
+    then parses the response with the three-tier recovery logic.
+
+    Args:
+        prompt: The user-facing extraction prompt.
+        model: Bedrock model ID.
+        region: AWS region.
+
+    Returns:
+        List of extracted triple dicts, or ``[]`` on failure.
+    """
+    client = _get_bedrock_client(region)
+    logger.debug("bedrock_extract: model=%s  prompt=%d chars", model, len(prompt))
+
+    max_retries = 5
+    body = None
+    for attempt in range(max_retries):
+        try:
+            body = client.converse(
+                modelId=model,
+                messages=[{
+                    "role": "user",
+                    "content": [{"text": prompt}],
+                }],
+                system=[{
+                    "text": (
+                        "You are a JSON extraction engine. "
+                        "Respond with ONLY a valid JSON array. "
+                        "No explanations, no markdown."
+                    ),
+                }],
+                inferenceConfig={
+                    "maxTokens": 32768,
+                    "temperature": 0.1,
+                },
+            )
+            break
+        except client.exceptions.ThrottlingException:
+            if attempt < max_retries - 1:
+                wait = min(30 * (2 ** attempt), 300)
+                logger.warning(
+                    "Bedrock extraction throttled, retry %d/%d in %.0fs",
+                    attempt + 1, max_retries - 1, wait,
+                )
+                time.sleep(wait)
+                continue
+            logger.error(
+                "Bedrock extraction throttled after %d attempts", max_retries,
+            )
+            return []
+        except Exception as exc:
+            logger.error("Bedrock extraction failed: %s", exc)
+            return []
+
+    if body is None:
+        return []
+
+    raw = body["output"]["message"]["content"][0]["text"].strip()
+    logger.debug("bedrock_extract: raw response=%d chars", len(raw))
+    raw = _strip_thinking(raw)
+
+    if not raw:
+        logger.warning("Bedrock returned empty response")
+        return []
+
+    return _parse_llm_json(raw)
+
+
+def bedrock_embed(
+    texts: list[str],
+    *,
+    model: str,
+    region: str | None = None,
+) -> list[list[float]]:
+    """Generate embeddings via AWS Bedrock.
+
+    Uses the Bedrock ``invoke_model`` API for embedding models such as
+    ``amazon.titan-embed-text-v2:0`` or ``cohere.embed-english-v3``.
+
+    For **Titan** models the request/response format is::
+
+        Request:  {"inputText": "...", "dimensions": 1024, "normalize": true}
+        Response: {"embedding": [...]}
+
+    For **Cohere** models the format is::
+
+        Request:  {"texts": [...], "input_type": "search_document"}
+        Response: {"embeddings": [[...], ...]}
+
+    Args:
+        texts: List of strings to embed.
+        model: Bedrock embedding model ID.
+        region: AWS region.
+
+    Returns:
+        List of embedding vectors (one per input text).
+    """
+    if not texts:
+        return []
+
+    client = _get_bedrock_client(region)
+    logger.debug("bedrock_embed: model=%s  texts=%d", model, len(texts))
+
+    is_cohere = "cohere" in model.lower()
+
+    if is_cohere:
+        # Cohere supports batched embedding
+        payload = json.dumps({
+            "texts": texts,
+            "input_type": "search_document",
+        }).encode()
+        try:
+            resp = client.invoke_model(modelId=model, body=payload)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Bedrock embedding failed (model={model}): {exc}"
+            ) from exc
+        result = json.loads(resp["body"].read())
+        return result["embeddings"]
+    else:
+        # Titan and other models — one text at a time
+        embeddings: list[list[float]] = []
+        for text in texts:
+            payload = json.dumps({
+                "inputText": text,
+                "dimensions": 1024,
+                "normalize": True,
+            }).encode()
+            try:
+                resp = client.invoke_model(modelId=model, body=payload)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Bedrock embedding failed (model={model}): {exc}"
+                ) from exc
+            result = json.loads(resp["body"].read())
+            embeddings.append(result["embedding"])
+        return embeddings
+
+
+# ---------------------------------------------------------------------------
 # Schema: Relation types
 # ---------------------------------------------------------------------------
 
@@ -5477,9 +5729,11 @@ def main():
     parser.add_argument("--embed-model", default=None, metavar="MODEL",
                         help="Embedding model for node embeddings during ingestion "
                              "(default: auto-detect from graph, or qwen3-embedding)")
-    parser.add_argument("--provider", choices=["local", "anthropic"], default="local",
+    parser.add_argument("--provider", choices=["local", "anthropic", "bedrock"], default="local",
                         help="LLM provider: 'local' for OpenAI-compatible servers (Ollama, llama.cpp, etc.), "
-                             "'anthropic' for the Claude API (default: local)")
+                             "'anthropic' for the Claude API, 'bedrock' for AWS Bedrock (default: local)")
+    parser.add_argument("--bedrock-region", default=None, metavar="REGION",
+                        help="AWS region for Bedrock (default: AWS_DEFAULT_REGION or us-east-1)")
     parser.add_argument("--extract-model", default=None, metavar="MODEL",
                         help="Dedicated model for entity/relation extraction during ingestion. "
                              "When set, --query-model is used only for querying. "
@@ -5659,6 +5913,12 @@ def main():
                     lambda prompt: claude_extract(prompt, model=_extract_model, api_key=_api_key)
                 )
                 print(f"  Using model: {_extract_model} (provider: anthropic)")
+            elif _provider == "bedrock":
+                _bedrock_region = args.bedrock_region
+                extract_fn = (
+                    lambda prompt: bedrock_extract(prompt, model=_extract_model, region=_bedrock_region)
+                )
+                print(f"  Using model: {_extract_model} (provider: bedrock, region: {_bedrock_region or 'default'})")
             else:
                 _extract_url = args.ollama_url.rstrip("/")
                 extract_fn = (
@@ -5753,11 +6013,16 @@ def main():
             )
             _total_elapsed = time.monotonic() - _ingest_t0
 
-            # Embed nodes using Ollama if available
+            # Embed nodes if an embedding model is configured
             _embed_stats = None
             if _embed_model:
-                def _embed_fn(batch: list[str]) -> list[list[float]]:
-                    return ollama_embed(batch, model=_embed_model, url=_embed_url)
+                if args.provider == "bedrock" and args.embed_model is not None:
+                    _br = args.bedrock_region
+                    def _embed_fn(batch: list[str]) -> list[list[float]]:
+                        return bedrock_embed(batch, model=_embed_model, region=_br)
+                else:
+                    def _embed_fn(batch: list[str]) -> list[list[float]]:
+                        return ollama_embed(batch, model=_embed_model, url=_embed_url)
 
                 if not _quiet:
                     print(f"  Embedding nodes with {_embed_model}...", end="", flush=True)
