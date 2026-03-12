@@ -162,6 +162,10 @@
       <h1 class="text-2xl font-bold mt-1">{{ graph_name }}</h1>
     </div>
     <div class="flex gap-2">
+      <a href="/upload?graph={{ graph_name }}"
+         class="border border-gray-800 px-4 py-1.5 text-sm text-gray-400 hover:border-white hover:text-white transition-colors">
+        Upload Documents
+      </a>
       <a href="/graphs/{{ graph_name }}/export"
          class="border border-gray-800 px-4 py-1.5 text-sm text-gray-400 hover:border-white hover:text-white transition-colors">
         Export

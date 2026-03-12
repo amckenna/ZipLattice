@@ -115,9 +115,12 @@
         <div id="ingest-bedrock-cfg" class="hidden grid grid-cols-2 gap-3">
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Extraction Model</label>
-            <input type="text" name="extract_model" value="us.anthropic.claude-sonnet-4-20250514-v1:0" disabled
-                   placeholder="Bedrock model ID"
-                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            <select name="extract_model" disabled
+                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+              <option value="us.anthropic.claude-haiku-4-5-v1:0">claude-haiku-4.5 (fastest)</option>
+              <option value="us.anthropic.claude-sonnet-4-6-v1:0">claude-sonnet-4.6</option>
+              <option value="us.anthropic.claude-opus-4-6-v1:0">claude-opus-4.6 (smartest)</option>
+            </select>
           </div>
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Bedrock Region</label>
