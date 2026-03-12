@@ -395,6 +395,8 @@ def main() -> None:
                              "'anthropic' for the Claude API, 'bedrock' for AWS Bedrock (default: local)")
     shared.add_argument("--bedrock-region", default=None, metavar="REGION",
                         help="AWS region for Bedrock (default: AWS_DEFAULT_REGION or us-east-1)")
+    shared.add_argument("--bedrock-profile", default=None, metavar="PROFILE",
+                        help="AWS profile name from ~/.aws/credentials for Bedrock")
     shared.add_argument("--top-k", type=int, default=10, help="Number of search results")
     shared.add_argument("--depth", type=int, default=1, help="Neighborhood expansion depth")
     shared.add_argument("--node-types", nargs="+", metavar="TYPE",
@@ -494,10 +496,11 @@ def main() -> None:
 
     if args.provider == "bedrock" and args.embed_model is not None:
         _br_region = args.bedrock_region
-        logger.info("Embed config: model='%s' (bedrock, region=%s)", embed_model, _br_region or "default")
+        _br_profile = args.bedrock_profile
+        logger.info("Embed config: model='%s' (bedrock, region=%s, profile=%s)", embed_model, _br_region or "default", _br_profile or "default")
 
         def embed_fn(texts: list[str]) -> list[list[float]]:
-            return bedrock_embed(texts, model=embed_model, region=_br_region)
+            return bedrock_embed(texts, model=embed_model, region=_br_region, profile=_br_profile)
     else:
         logger.info("Embed config: model='%s' url='%s'", embed_model, embed_url)
 
@@ -556,9 +559,10 @@ def main() -> None:
                 return claude_chat(prompt, model=chat_model, api_key=_api_key)
         elif args.provider == "bedrock":
             _br_region = args.bedrock_region
+            _br_profile = args.bedrock_profile
 
             def llm_fn(prompt: str) -> str:
-                return bedrock_chat(prompt, model=chat_model, region=_br_region)
+                return bedrock_chat(prompt, model=chat_model, region=_br_region, profile=_br_profile)
         else:
             chat_url = args.ollama_url.rstrip("/")
 
