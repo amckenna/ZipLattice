@@ -2840,6 +2840,81 @@ TEXT:
             )
             return stats
 
+        return self.ingest_triples(
+            triples,
+            text=text,
+            doc_id=doc_id,
+            low_confidence_threshold=low_confidence_threshold,
+            auto_add_doc_node=auto_add_doc_node,
+            ingestion_id=ingestion_id,
+            content_hash=content_hash,
+        )
+
+    def ingest_triples(
+        self,
+        triples: list[dict[str, Any]],
+        *,
+        text: str,
+        doc_id: str,
+        low_confidence_threshold: float = 0.3,
+        auto_add_doc_node: bool = True,
+        ingestion_id: str | None = None,
+        content_hash: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Process pre-extracted triples into the knowledge graph.
+
+        This is the second half of the ingestion pipeline — it takes a list
+        of triple dicts (as produced by an LLM or an MCP orchestrator) and
+        adds the corresponding nodes, edges, and relation proposals to the
+        graph.  Unlike ``ingest_document``, this method does **not** call an
+        LLM; the caller is responsible for producing the triples.
+
+        This enables an "orchestrator-as-extractor" pattern where the calling
+        LLM (e.g. Claude Code via MCP) performs entity extraction itself and
+        passes the structured triples directly, eliminating the need for a
+        second LLM backend.
+
+        Args:
+            triples: List of triple dicts matching the extraction schema::
+
+                    [{"source": "...", "source_type": "concept",
+                      "source_description": "...",
+                      "target": "...", "target_type": "concept",
+                      "target_description": "...",
+                      "relation": "depends_on",
+                      "is_new_relation": false,
+                      "suggested_relation": null,
+                      "justification": null,
+                      "confidence": 0.85,
+                      "context": "supporting quote"}, ...]
+
+                    List/tuple and string formats are also accepted and
+                    normalized automatically.
+            text: The original document text (used for validation and
+                  entity span tracking).
+            doc_id: Unique identifier for the source document.
+            low_confidence_threshold: Confidence assigned to edges with
+                novel (proposed) relations.
+            auto_add_doc_node: If True, create a 'document' node and link
+                extracted entities to it with 'documented_by' edges.
+            ingestion_id: Unique identifier for this ingestion run
+                (propagated to all created nodes and edges).
+            content_hash: Content hash of the source document.
+
+        Returns:
+            Stats dict: nodes_added, edges_added, proposals_created,
+            proposals_augmented, triples_processed, errors.
+        """
+        stats: dict[str, Any] = {
+            "triples_processed": 0,
+            "nodes_added": 0,
+            "edges_added": 0,
+            "proposals_created": 0,
+            "proposals_augmented": 0,
+            "errors": [],
+        }
+
         # Detect off-topic responses: if no triple has any recognized key,
         # the model returned garbage unrelated to the extraction prompt.
         if triples:

@@ -277,16 +277,54 @@ async def graph_detail(request: Request, name: str):
     cy = kg.cytoscape_elements()
     sources = kg._data.get("meta", {}).get("sources", {})
 
+    # Compute per-source node and edge counts
+    source_node_counts: dict[str, int] = {}
+    source_edge_counts: dict[str, int] = {}
+    for node in kg._data.get("nodes", {}).values():
+        src = node.get("source", "")
+        # source looks like "doc:<doc_id>" or "doc:<doc_id>::<section>"
+        if src.startswith("doc:"):
+            doc_key = src.split("::")[0].removeprefix("doc:")
+            source_node_counts[doc_key] = source_node_counts.get(doc_key, 0) + 1
+    for edge in kg._data.get("edges", []):
+        src_tag = edge.get("source_tag", "")
+        if src_tag.startswith("doc:"):
+            doc_key = src_tag.removeprefix("doc:")
+            source_edge_counts[doc_key] = source_edge_counts.get(doc_key, 0) + 1
+
+    # Enrich sources with counts and text availability
+    sources_enriched = {}
+    for doc_id, info in sources.items():
+        sources_enriched[doc_id] = {
+            **info,
+            "node_count": source_node_counts.get(doc_id, 0),
+            "edge_count": source_edge_counts.get(doc_id, 0),
+            "has_text": kg.has_source(doc_id),
+        }
+
     return templates.TemplateResponse("graph_detail.html", {
         "request": request,
         "graph_name": name,
         "stats": cy["stats"],
-        "sources": sources,
+        "sources": sources_enriched,
         "elements_json": json.dumps(cy["elements"], cls=GraphEncoder),
         "type_colors_json": json.dumps(cy["type_colors"]),
         "relation_colors_json": json.dumps(cy["relation_colors"]),
         "stats_json": json.dumps(cy["stats"]),
     })
+
+
+@app.get("/graphs/{name}/source/{doc_id}")
+async def get_source_text(name: str, doc_id: str):
+    """Return the stored source text for a document."""
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return {"error": "Graph not found"}, 404
+    kg = _load_graph(name)
+    text = kg.get_source_text(doc_id)
+    if text is None:
+        return {"error": "Source not found"}, 404
+    return {"doc_id": doc_id, "text": text}
 
 
 @app.get("/upload", response_class=HTMLResponse)
