@@ -37,6 +37,7 @@ from fastapi.templating import Jinja2Templates
 from knowledge_graph import (
     GraphEncoder, KnowledgeGraph, ollama_embed, local_extract,
     claude_chat, claude_extract, _get_anthropic_api_key,
+    bedrock_chat, bedrock_extract, bedrock_embed,
 )
 from query_graph import ask, build_context, ollama_chat, search_nodes
 
@@ -110,25 +111,37 @@ def _load_graph(name: str) -> KnowledgeGraph:
 
 
 def _build_embed_fn(
-    embed_model: str, embed_url: str
+    embed_model: str, embed_url: str, *, provider: str = "local",
+    bedrock_region: str = "",
 ) -> partial:
     """Build an embedding callable for search/query."""
+    if provider == "bedrock" and embed_model and not embed_model.startswith("qwen"):
+        region = bedrock_region.strip() or None
+        return partial(bedrock_embed, model=embed_model, region=region)
     return partial(ollama_embed, model=embed_model, url=embed_url)
 
 
-def _build_extract_fn(provider: str, model: str, api_url: str):
+def _build_extract_fn(provider: str, model: str, api_url: str, *,
+                      bedrock_region: str = ""):
     """Build an extraction callable for the given provider."""
     if provider == "anthropic":
         api_key = _get_anthropic_api_key()
         return partial(claude_extract, model=model, api_key=api_key)
+    if provider == "bedrock":
+        region = bedrock_region.strip() or None
+        return partial(bedrock_extract, model=model, region=region)
     return partial(local_extract, model=model, url=api_url)
 
 
-def _build_llm_fn(provider: str, model: str, api_url: str):
+def _build_llm_fn(provider: str, model: str, api_url: str, *,
+                  bedrock_region: str = ""):
     """Build a chat callable for the given provider (used by 'ask' mode)."""
     if provider == "anthropic":
         api_key = _get_anthropic_api_key()
         return partial(claude_chat, model=model, api_key=api_key)
+    if provider == "bedrock":
+        region = bedrock_region.strip() or None
+        return partial(bedrock_chat, model=model, region=region)
     return partial(ollama_chat, model=model, url=api_url)
 
 
@@ -192,6 +205,38 @@ def _chat_multi_turn_anthropic(
     with urllib.request.urlopen(req, timeout=1200) as resp:
         body = json.loads(resp.read())
     return body["content"][0]["text"]
+
+
+def _chat_multi_turn_bedrock(
+    messages: list[dict[str, str]], *, model: str, region: str | None = None
+) -> str:
+    """Call AWS Bedrock Converse API with full conversation history."""
+    from knowledge_graph import _get_bedrock_client
+
+    client = _get_bedrock_client(region)
+
+    system_parts: list[dict] = []
+    api_messages: list[dict] = []
+    for m in messages:
+        role = m["role"]
+        if role == "system":
+            system_parts.append({"text": m["content"]})
+        else:
+            api_messages.append({
+                "role": role,
+                "content": [{"text": m["content"]}],
+            })
+
+    kwargs: dict[str, Any] = {
+        "modelId": model,
+        "messages": api_messages,
+        "inferenceConfig": {"maxTokens": 16384},
+    }
+    if system_parts:
+        kwargs["system"] = system_parts
+
+    resp = client.converse(**kwargs)
+    return resp["output"]["message"]["content"][0]["text"].strip()
 
 
 def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
@@ -410,6 +455,7 @@ async def ingest_documents(
     embed_model: str = Form("qwen3-embedding"),
     provider: str = Form("local"),
     extract_model: str = Form(""),
+    bedrock_region: str = Form(""),
     verbose: str = Form(""),
 ):
     """Run LLM ingestion with streaming progress log."""
@@ -443,7 +489,8 @@ async def ingest_documents(
 
     def _stream():
         _model = extract_model.strip() or query_model
-        extract_fn = _build_extract_fn(provider, _model, api_url)
+        extract_fn = _build_extract_fn(provider, _model, api_url,
+                                       bedrock_region=bedrock_region)
         results = []
         total_docs = len(batch)
         graph_stats_before = kg.stats()
@@ -549,7 +596,8 @@ async def ingest_documents(
         if _verbose:
             yield _log(f"  embed config: model={embed_model} url={_embed_url}")
         try:
-            efn = _build_embed_fn(embed_model, _embed_url)
+            efn = _build_embed_fn(embed_model, _embed_url,
+                                 provider=provider, bedrock_region=bedrock_region)
             embed_stats = kg.embed_nodes(efn, skip_existing=True, model_name=embed_model)
             embed_count = embed_stats.get("nodes_embedded", 0)
             yield _log(f"  embedded {embed_count} nodes")
@@ -607,6 +655,7 @@ async def run_query(
     embed_url: str = Form(""),
     embed_model: str = Form(""),
     provider: str = Form("local"),
+    bedrock_region: str = Form(""),
 ):
     """Execute a query against a knowledge graph."""
     logger.info(
@@ -627,7 +676,8 @@ async def run_query(
         _embed_model = kg._embed_meta.get("model", "qwen3-embedding")
     _embed_url = embed_url.strip() or api_url
 
-    embed_fn = _build_embed_fn(_embed_model, _embed_url)
+    embed_fn = _build_embed_fn(_embed_model, _embed_url,
+                               provider=provider, bedrock_region=bedrock_region)
 
     try:
         if mode == "search":
@@ -646,7 +696,8 @@ async def run_query(
                 "context": ctx,
             })
         elif mode == "ask":
-            llm_fn = _build_llm_fn(provider, query_model, api_url)
+            llm_fn = _build_llm_fn(provider, query_model, api_url,
+                                   bedrock_region=bedrock_region)
             answer = ask(kg, query, embed_fn, llm_fn)
 
             # If chat mode, create a session so the user can follow up
@@ -670,6 +721,7 @@ async def run_query(
                         "provider": provider,
                         "query_model": query_model,
                         "api_url": api_url,
+                        "bedrock_region": bedrock_region,
                     },
                     "created_at": time.time(),
                 }
@@ -716,12 +768,18 @@ async def chat_follow_up(
     provider = cfg["provider"]
     model = cfg["query_model"]
     api_url = cfg["api_url"]
+    bedrock_region = cfg.get("bedrock_region", "")
 
     try:
         if provider == "anthropic":
             api_key = _get_anthropic_api_key()
             answer = _chat_multi_turn_anthropic(
                 session["messages"], model=model, api_key=api_key,
+            )
+        elif provider == "bedrock":
+            region = bedrock_region.strip() or None
+            answer = _chat_multi_turn_bedrock(
+                session["messages"], model=model, region=region,
             )
         else:
             answer = _chat_multi_turn_local(

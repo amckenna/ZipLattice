@@ -93,11 +93,15 @@
           <div class="flex gap-4">
             <label class="flex items-center gap-1 text-xs cursor-pointer">
               <input type="radio" name="provider" value="local" checked
-                     class="accent-white" onchange="togglePanel('query-local-cfg','query-anthropic-cfg')"> Local (Ollama / llama.cpp)
+                     class="accent-white" onchange="showProviderPanel('query','local')"> Local (Ollama / llama.cpp)
             </label>
             <label class="flex items-center gap-1 text-xs cursor-pointer">
               <input type="radio" name="provider" value="anthropic"
-                     class="accent-white" onchange="togglePanel('query-anthropic-cfg','query-local-cfg')"> Anthropic (Claude)
+                     class="accent-white" onchange="showProviderPanel('query','anthropic')"> Anthropic (Claude)
+            </label>
+            <label class="flex items-center gap-1 text-xs cursor-pointer">
+              <input type="radio" name="provider" value="bedrock"
+                     class="accent-white" onchange="showProviderPanel('query','bedrock')"> AWS Bedrock
             </label>
           </div>
         </div>
@@ -153,6 +157,35 @@
           </div>
           <p class="text-xs text-gray-600 col-span-2">API key is read from the ANTHROPIC_API_KEY environment variable. Embeddings always use a local server.</p>
         </div>
+
+        <!-- Bedrock provider config (disabled by default so fields don't submit) -->
+        <div id="query-bedrock-cfg" class="hidden grid grid-cols-2 gap-3">
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Query Model (for Ask)</label>
+            <input type="text" name="query_model" value="us.anthropic.claude-sonnet-4-20250514-v1:0" disabled
+                   placeholder="Bedrock model ID"
+                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          </div>
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Bedrock Region</label>
+            <input type="text" name="bedrock_region" value="" disabled
+                   placeholder="AWS_DEFAULT_REGION or us-east-1"
+                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          </div>
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Embed Model</label>
+            <input type="text" name="embed_model" value="" disabled
+                   placeholder="From graph or qwen3-embedding (local)"
+                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          </div>
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Embed URL (for local embeddings)</label>
+            <input type="text" name="embed_url" value="http://localhost:11434" disabled
+                   placeholder="Local embed server"
+                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          </div>
+          <p class="text-xs text-gray-600 col-span-2">Uses AWS credentials (env vars, ~/.aws/credentials, or IAM role). Set embed model to a Bedrock model ID (e.g. amazon.titan-embed-text-v2:0) for Bedrock embeddings, or leave blank for local.</p>
+        </div>
       </div>
     </details>
 
@@ -168,13 +201,19 @@
 </div>
 
 <script>
-function togglePanel(showId, hideId) {
-  var show = document.getElementById(showId);
-  var hide = document.getElementById(hideId);
-  show.classList.remove('hidden');
-  hide.classList.add('hidden');
-  show.querySelectorAll('input, select').forEach(function(el) { el.disabled = false; });
-  hide.querySelectorAll('input, select').forEach(function(el) { el.disabled = true; });
+function showProviderPanel(prefix, provider) {
+  var providers = ['local', 'anthropic', 'bedrock'];
+  providers.forEach(function(p) {
+    var panel = document.getElementById(prefix + '-' + p + '-cfg');
+    if (!panel) return;
+    if (p === provider) {
+      panel.classList.remove('hidden');
+      panel.querySelectorAll('input, select').forEach(function(el) { el.disabled = false; });
+    } else {
+      panel.classList.add('hidden');
+      panel.querySelectorAll('input, select').forEach(function(el) { el.disabled = true; });
+    }
+  });
 }
 
 var modeHints = {
