@@ -464,12 +464,16 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
 # ---------------------------------------------------------------------------
 
 
-def _get_bedrock_client(region: str | None = None):
+def _get_bedrock_client(region: str | None = None, profile: str | None = None):
     """Return a ``boto3`` Bedrock Runtime client.
 
     Relies on standard AWS credential resolution (env vars, shared
     credentials file, IAM role, etc.).  The *region* falls back to
     ``AWS_DEFAULT_REGION`` / ``AWS_REGION`` env vars, then ``us-east-1``.
+
+    When *profile* is given, a ``boto3.Session`` is created with that
+    profile name, allowing use of named profiles from
+    ``~/.aws/credentials`` and ``~/.aws/config``.
 
     Raises ``RuntimeError`` with a clear message if ``boto3`` is not
     installed or credentials cannot be resolved.
@@ -488,12 +492,16 @@ def _get_bedrock_client(region: str | None = None):
             or "us-east-1"
         )
     try:
-        client = boto3.client("bedrock-runtime", region_name=region)
+        if profile:
+            session = boto3.Session(profile_name=profile, region_name=region)
+            client = session.client("bedrock-runtime")
+        else:
+            client = boto3.client("bedrock-runtime", region_name=region)
         # Force credential resolution so we fail fast with a clear message.
         client.meta.region_name  # noqa: B018 — triggers lazy init
     except Exception as exc:
         raise RuntimeError(
-            f"Cannot create Bedrock client (region={region}): {exc}.  "
+            f"Cannot create Bedrock client (region={region}, profile={profile}): {exc}.  "
             "Ensure AWS credentials are configured (AWS_ACCESS_KEY_ID / "
             "AWS_SECRET_ACCESS_KEY, ~/.aws/credentials, or an IAM role)."
         ) from exc
@@ -505,6 +513,7 @@ def bedrock_chat(
     *,
     model: str,
     region: str | None = None,
+    profile: str | None = None,
 ) -> str:
     """Call AWS Bedrock Converse API and return the assistant's text.
 
@@ -514,11 +523,12 @@ def bedrock_chat(
             ``us.anthropic.claude-sonnet-4-20250514``,
             ``amazon.nova-pro-v1:0``).
         region: AWS region.  Falls back to env / ``us-east-1``.
+        profile: AWS profile name from ``~/.aws/credentials``.
 
     Returns:
         The assistant's response text.
     """
-    client = _get_bedrock_client(region)
+    client = _get_bedrock_client(region, profile=profile)
     logger.debug("bedrock_chat: model=%s  prompt=%d chars", model, len(prompt))
     t0 = time.monotonic()
 
@@ -568,6 +578,7 @@ def bedrock_extract(
     *,
     model: str,
     region: str | None = None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Call AWS Bedrock Converse API for JSON extraction.
 
@@ -579,11 +590,12 @@ def bedrock_extract(
         prompt: The user-facing extraction prompt.
         model: Bedrock model ID.
         region: AWS region.
+        profile: AWS profile name from ``~/.aws/credentials``.
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
     """
-    client = _get_bedrock_client(region)
+    client = _get_bedrock_client(region, profile=profile)
     logger.debug("bedrock_extract: model=%s  prompt=%d chars", model, len(prompt))
 
     max_retries = 5
@@ -645,6 +657,7 @@ def bedrock_embed(
     *,
     model: str,
     region: str | None = None,
+    profile: str | None = None,
 ) -> list[list[float]]:
     """Generate embeddings via AWS Bedrock.
 
@@ -665,6 +678,7 @@ def bedrock_embed(
         texts: List of strings to embed.
         model: Bedrock embedding model ID.
         region: AWS region.
+        profile: AWS profile name from ``~/.aws/credentials``.
 
     Returns:
         List of embedding vectors (one per input text).
@@ -672,7 +686,7 @@ def bedrock_embed(
     if not texts:
         return []
 
-    client = _get_bedrock_client(region)
+    client = _get_bedrock_client(region, profile=profile)
     logger.debug("bedrock_embed: model=%s  texts=%d", model, len(texts))
 
     is_cohere = "cohere" in model.lower()
@@ -5734,6 +5748,8 @@ def main():
                              "'anthropic' for the Claude API, 'bedrock' for AWS Bedrock (default: local)")
     parser.add_argument("--bedrock-region", default=None, metavar="REGION",
                         help="AWS region for Bedrock (default: AWS_DEFAULT_REGION or us-east-1)")
+    parser.add_argument("--bedrock-profile", default=None, metavar="PROFILE",
+                        help="AWS profile name from ~/.aws/credentials for Bedrock")
     parser.add_argument("--extract-model", default=None, metavar="MODEL",
                         help="Dedicated model for entity/relation extraction during ingestion. "
                              "When set, --query-model is used only for querying. "
@@ -5915,10 +5931,11 @@ def main():
                 print(f"  Using model: {_extract_model} (provider: anthropic)")
             elif _provider == "bedrock":
                 _bedrock_region = args.bedrock_region
+                _bedrock_profile = args.bedrock_profile
                 extract_fn = (
-                    lambda prompt: bedrock_extract(prompt, model=_extract_model, region=_bedrock_region)
+                    lambda prompt: bedrock_extract(prompt, model=_extract_model, region=_bedrock_region, profile=_bedrock_profile)
                 )
-                print(f"  Using model: {_extract_model} (provider: bedrock, region: {_bedrock_region or 'default'})")
+                print(f"  Using model: {_extract_model} (provider: bedrock, region: {_bedrock_region or 'default'}, profile: {_bedrock_profile or 'default'})")
             else:
                 _extract_url = args.ollama_url.rstrip("/")
                 extract_fn = (
@@ -6018,8 +6035,9 @@ def main():
             if _embed_model:
                 if args.provider == "bedrock" and args.embed_model is not None:
                     _br = args.bedrock_region
+                    _bp = args.bedrock_profile
                     def _embed_fn(batch: list[str]) -> list[list[float]]:
-                        return bedrock_embed(batch, model=_embed_model, region=_br)
+                        return bedrock_embed(batch, model=_embed_model, region=_br, profile=_bp)
                 else:
                     def _embed_fn(batch: list[str]) -> list[list[float]]:
                         return ollama_embed(batch, model=_embed_model, url=_embed_url)

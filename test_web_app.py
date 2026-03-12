@@ -377,6 +377,15 @@ def test_build_extract_fn_bedrock():
     assert callable(fn)
 
 
+def test_build_extract_fn_bedrock_with_profile():
+    """_build_extract_fn accepts bedrock_profile parameter."""
+    from web_app import _build_extract_fn
+    fn = _build_extract_fn("bedrock", "us.anthropic.claude-sonnet-4-20250514-v1:0",
+                           "http://localhost:11434", bedrock_region="us-west-2",
+                           bedrock_profile="my-profile")
+    assert callable(fn)
+
+
 def test_build_llm_fn_bedrock():
     """_build_llm_fn returns a callable for bedrock provider."""
     from web_app import _build_llm_fn
@@ -385,11 +394,29 @@ def test_build_llm_fn_bedrock():
     assert callable(fn)
 
 
+def test_build_llm_fn_bedrock_with_profile():
+    """_build_llm_fn accepts bedrock_profile parameter."""
+    from web_app import _build_llm_fn
+    fn = _build_llm_fn("bedrock", "us.anthropic.claude-sonnet-4-20250514-v1:0",
+                        "http://localhost:11434", bedrock_region="us-west-2",
+                        bedrock_profile="my-profile")
+    assert callable(fn)
+
+
 def test_build_embed_fn_bedrock():
     """_build_embed_fn returns a Bedrock embed callable for Bedrock model IDs."""
     from web_app import _build_embed_fn
     fn = _build_embed_fn("amazon.titan-embed-text-v2:0", "http://localhost:11434",
                          provider="bedrock", bedrock_region="us-east-1")
+    assert callable(fn)
+
+
+def test_build_embed_fn_bedrock_with_profile():
+    """_build_embed_fn accepts bedrock_profile parameter."""
+    from web_app import _build_embed_fn
+    fn = _build_embed_fn("amazon.titan-embed-text-v2:0", "http://localhost:11434",
+                         provider="bedrock", bedrock_region="us-east-1",
+                         bedrock_profile="my-profile")
     assert callable(fn)
 
 
@@ -432,8 +459,30 @@ def test_ingest_accepts_bedrock_region():
             "provider": "bedrock",
             "extract_model": "us.anthropic.claude-sonnet-4-20250514-v1:0",
             "bedrock_region": "us-west-2",
+            "bedrock_profile": "my-profile",
             "verbose": "",
         },
     )
     # Should return 200 (streaming response), the actual LLM error is in the stream
     assert resp.status_code == 200
+
+
+def test_query_bedrock_with_profile():
+    """Query endpoint accepts bedrock_profile parameter."""
+    resp = client.post(
+        "/query",
+        data={
+            "graph_name": "nonexistent",
+            "query": "test",
+            "mode": "search",
+            "api_url": "http://localhost:11434",
+            "query_model": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "embed_url": "",
+            "embed_model": "",
+            "provider": "bedrock",
+            "bedrock_region": "us-east-1",
+            "bedrock_profile": "my-profile",
+        },
+    )
+    assert resp.status_code == 200
+    assert "Error" in resp.text
