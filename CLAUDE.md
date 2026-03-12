@@ -12,6 +12,7 @@ ZipLattice is a portable, JSON-backed knowledge graph manager built on NetworkX.
 knowledge_graph.py       # Knowledge graph library and CLI (single-file)
 query_graph.py           # Knowledge graph query application (search, RAG, CLI)
 web_app.py               # FastAPI web frontend (HTMX + Tailwind CSS)
+mcp_server.py            # MCP server (FastMCP) — orchestrator-as-extractor pattern
 templates/               # Jinja2 HTML templates for the web frontend
   base.html              #   Layout shell (nav, Tailwind/HTMX CDN)
   dashboard.html         #   Dashboard — lists all knowledge graphs
@@ -22,6 +23,7 @@ templates/               # Jinja2 HTML templates for the web frontend
 test_knowledge_graph.py  # Tests for knowledge_graph.py
 test_query_graph.py      # Tests for query_graph.py
 test_web_app.py          # Tests for web_app.py
+test_mcp_server.py       # Tests for mcp_server.py and ingest_triples
 benchmark_models.py      # Model comparison tool for extraction quality
 convert_to_markdown.py   # Standalone document-to-Markdown converter (single-file)
 README.md                # Project documentation
@@ -48,6 +50,7 @@ knowledge_graph/                  # dedicated graph directory
 - **Optional:** `pyvis` (for Pyvis visualization export)
 - **Optional (for converter):** `pymupdf4llm`, `mammoth`, `markdownify`, `pymupdf_layout` (improves PDF layout analysis)
 - **Optional (for web frontend):** `fastapi`, `uvicorn`, `python-multipart`, `jinja2`
+- **Optional (for MCP server):** `fastmcp`
 - Cytoscape.js is loaded from CDN in exported HTML files and does not need a local install
 
 ## Key classes
@@ -60,6 +63,7 @@ knowledge_graph/                  # dedicated graph directory
 - `ollama_embed()` (module-level) -- Calls OpenAI-compatible `/v1/embeddings` endpoint. Works with Ollama, llama.cpp, vLLM, LocalAI, etc. Used during ingestion and by `query_graph.py` at query time.
 - `claude_chat()` (module-level) -- Calls the Anthropic Messages API for chat/query. Used when `--provider anthropic` is set.
 - `claude_extract()` (module-level) -- Calls the Anthropic Messages API for JSON entity/relation extraction during ingestion. Same three-tier JSON recovery as the local path.
+- `KnowledgeGraph.ingest_triples()` -- Public method that accepts pre-extracted triples directly (no LLM call). Enables the orchestrator-as-extractor pattern used by the MCP server.
 
 ## How to run
 
@@ -114,6 +118,10 @@ uvicorn web_app:app --reload                    # http://localhost:8000
 python web_app.py                               # same, starts on port 8000
 ZIPLATTICE_GRAPHS_DIR=./my_graphs uvicorn web_app:app  # custom graphs directory
 
+# MCP server (orchestrator-as-extractor pattern)
+pip install fastmcp
+python mcp_server.py                            # stdio transport (for Claude Code)
+
 # Library usage
 python -c "from knowledge_graph import KnowledgeGraph; print('OK')"
 python -c "from convert_to_markdown import convert; print('OK')"
@@ -123,7 +131,7 @@ python -c "from convert_to_markdown import convert; print('OK')"
 
 ```bash
 # Run all tests (no Ollama needed)
-python -m pytest test_knowledge_graph.py test_query_graph.py test_web_app.py -v
+python -m pytest test_knowledge_graph.py test_query_graph.py test_web_app.py test_mcp_server.py -v
 
 # Run knowledge_graph tests only
 python -m pytest test_knowledge_graph.py -v
@@ -133,6 +141,9 @@ python -m pytest test_query_graph.py -v
 
 # Run web app tests only
 python -m pytest test_web_app.py -v
+
+# Run MCP server tests only
+python -m pytest test_mcp_server.py -v
 
 # Verify modules load
 python -c "from knowledge_graph import KnowledgeGraph"
@@ -150,6 +161,7 @@ python -c "from query_graph import search_nodes, build_context, ask"
 - Relation proposals allow the schema to evolve: novel relations discovered during LLM extraction are proposed, accumulated across documents, and accepted or rejected.
 - Source documents are stored with SHA-256 content hashing for deduplication and version tracking.
 - **LLM provider abstraction:** Chat/extraction functions accept callables (`llm_fn`, `llm_extract_fn`), making the core logic provider-agnostic. The `--provider` flag selects between `local` (OpenAI-compatible servers) and `anthropic` (Claude API via `ANTHROPIC_API_KEY` env var). Embeddings always use a local server since Anthropic does not offer an embeddings API.
+- **MCP server / orchestrator-as-extractor:** `mcp_server.py` exposes graph operations as MCP tools via FastMCP. The key insight is that the calling orchestrator (e.g. Claude Code) *is* an LLM, so it can perform entity extraction itself using `build_extraction_prompt` and pass structured triples to `ingest_triples`, eliminating the need for a second LLM backend. The `ingest_triples()` method on `KnowledgeGraph` is the public API for this pattern — it accepts pre-extracted triples and handles all validation, node/edge creation, and proposal management.
 
 ## Common patterns when modifying this code
 
