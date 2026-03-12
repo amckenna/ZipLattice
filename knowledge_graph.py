@@ -5843,7 +5843,19 @@ def main():
     elif args.quiet:
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     else:
-        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        # Default: INFO messages print bare, WARNING+ get a level prefix
+        # so retry/error messages are clearly visible in console output.
+        class _DefaultFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                if record.levelno >= logging.WARNING:
+                    self._style._fmt = "%(levelname)s: %(message)s"
+                else:
+                    self._style._fmt = "%(message)s"
+                return super().format(record)
+
+        handler = logging.StreamHandler()
+        handler.setFormatter(_DefaultFormatter())
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
 
     # Commands that don't need the graph
     if args.list_models:
