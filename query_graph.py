@@ -26,6 +26,7 @@ from typing import Any, Callable
 from knowledge_graph import (
     KnowledgeGraph, GraphEncoder, ollama_embed, _strip_thinking,
     claude_chat, _get_anthropic_api_key,
+    bedrock_chat, bedrock_embed,
 )
 
 logger = logging.getLogger("query_graph")
@@ -389,9 +390,11 @@ def main() -> None:
     shared.add_argument("--embed-model", default=None, metavar="MODEL",
                         help="Embedding model for query embedding "
                              "(default: auto-detect from graph, or qwen3-embedding)")
-    shared.add_argument("--provider", choices=["local", "anthropic"], default="local",
+    shared.add_argument("--provider", choices=["local", "anthropic", "bedrock"], default="local",
                         help="LLM provider: 'local' for OpenAI-compatible servers, "
-                             "'anthropic' for the Claude API (default: local)")
+                             "'anthropic' for the Claude API, 'bedrock' for AWS Bedrock (default: local)")
+    shared.add_argument("--bedrock-region", default=None, metavar="REGION",
+                        help="AWS region for Bedrock (default: AWS_DEFAULT_REGION or us-east-1)")
     shared.add_argument("--top-k", type=int, default=10, help="Number of search results")
     shared.add_argument("--depth", type=int, default=1, help="Neighborhood expansion depth")
     shared.add_argument("--node-types", nargs="+", metavar="TYPE",
@@ -489,10 +492,17 @@ def main() -> None:
         embed_model = "qwen3-embedding"
         logger.info("No embed model in graph metadata, falling back to '%s'", embed_model)
 
-    logger.info("Embed config: model='%s' url='%s'", embed_model, embed_url)
+    if args.provider == "bedrock" and args.embed_model is not None:
+        _br_region = args.bedrock_region
+        logger.info("Embed config: model='%s' (bedrock, region=%s)", embed_model, _br_region or "default")
 
-    def embed_fn(texts: list[str]) -> list[list[float]]:
-        return ollama_embed(texts, model=embed_model, url=embed_url)
+        def embed_fn(texts: list[str]) -> list[list[float]]:
+            return bedrock_embed(texts, model=embed_model, region=_br_region)
+    else:
+        logger.info("Embed config: model='%s' url='%s'", embed_model, embed_url)
+
+        def embed_fn(texts: list[str]) -> list[list[float]]:
+            return ollama_embed(texts, model=embed_model, url=embed_url)
 
     # Dispatch
     if args.command == "search":
@@ -544,6 +554,11 @@ def main() -> None:
 
             def llm_fn(prompt: str) -> str:
                 return claude_chat(prompt, model=chat_model, api_key=_api_key)
+        elif args.provider == "bedrock":
+            _br_region = args.bedrock_region
+
+            def llm_fn(prompt: str) -> str:
+                return bedrock_chat(prompt, model=chat_model, region=_br_region)
         else:
             chat_url = args.ollama_url.rstrip("/")
 

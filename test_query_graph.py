@@ -16,6 +16,7 @@ import pytest
 from knowledge_graph import (
     KnowledgeGraph, ollama_embed, claude_chat, claude_extract,
     _get_anthropic_api_key, _parse_llm_json, local_extract,
+    bedrock_chat, bedrock_extract, bedrock_embed, _get_bedrock_client,
 )
 from query_graph import search_nodes, build_context, ask, ollama_chat
 
@@ -1105,3 +1106,251 @@ def test_local_extract_trailing_slash():
 
     req = mock_urlopen.call_args[0][0]
     assert req.full_url == "http://localhost:11434/v1/chat/completions"
+
+
+# ---------------------------------------------------------------------------
+# AWS Bedrock API tests (all mocked, no real AWS calls)
+# ---------------------------------------------------------------------------
+
+
+def _bedrock_converse_response(text):
+    """Build a Bedrock Converse API response dict."""
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{"text": text}],
+            }
+        },
+        "stopReason": "end_turn",
+    }
+
+
+def _mock_bedrock_client(converse_return=None, invoke_model_return=None, throttle_count=0):
+    """Create a mock boto3 bedrock-runtime client.
+
+    Args:
+        converse_return: Return value for converse() calls.
+        invoke_model_return: Return value for invoke_model() calls.
+        throttle_count: Number of ThrottlingException raises before success.
+    """
+    mock_client = MagicMock()
+
+    # Create a real exception class for ThrottlingException
+    class ThrottlingException(Exception):
+        pass
+
+    mock_client.exceptions.ThrottlingException = ThrottlingException
+
+    if throttle_count > 0 and converse_return is not None:
+        side_effects = [ThrottlingException("Rate exceeded")] * throttle_count + [converse_return]
+        mock_client.converse.side_effect = side_effects
+    elif converse_return is not None:
+        mock_client.converse.return_value = converse_return
+
+    if invoke_model_return is not None:
+        mock_client.invoke_model.return_value = invoke_model_return
+
+    return mock_client
+
+
+def test_bedrock_chat_basic():
+    """Verify bedrock_chat extracts response text correctly."""
+    mock_client = _mock_bedrock_client(
+        converse_return=_bedrock_converse_response("Hello from Bedrock")
+    )
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        result = bedrock_chat("test prompt", model="us.anthropic.claude-sonnet-4-20250514")
+    assert result == "Hello from Bedrock"
+
+
+def test_bedrock_chat_calls_converse():
+    """Verify bedrock_chat passes correct arguments to converse()."""
+    mock_client = _mock_bedrock_client(
+        converse_return=_bedrock_converse_response("ok")
+    )
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        bedrock_chat("test prompt", model="us.anthropic.claude-sonnet-4-20250514", region="us-west-2")
+
+    mock_client.converse.assert_called_once()
+    call_kwargs = mock_client.converse.call_args[1]
+    assert call_kwargs["modelId"] == "us.anthropic.claude-sonnet-4-20250514"
+    assert call_kwargs["messages"] == [{"role": "user", "content": [{"text": "test prompt"}]}]
+    assert call_kwargs["inferenceConfig"]["maxTokens"] == 16384
+
+
+def test_bedrock_chat_strips_whitespace():
+    """Verify leading/trailing whitespace is stripped."""
+    mock_client = _mock_bedrock_client(
+        converse_return=_bedrock_converse_response("  spaced  \n")
+    )
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        result = bedrock_chat("test", model="m")
+    assert result == "spaced"
+
+
+def test_bedrock_chat_throttle_retry():
+    """Verify ThrottlingException triggers retry."""
+    mock_client = _mock_bedrock_client(
+        converse_return=_bedrock_converse_response("ok"),
+        throttle_count=1,
+    )
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        with patch("knowledge_graph.time.sleep"):
+            result = bedrock_chat("test", model="m")
+    assert result == "ok"
+    assert mock_client.converse.call_count == 2
+
+
+def test_bedrock_chat_general_error():
+    """Verify non-throttle errors raise RuntimeError."""
+    mock_client = _mock_bedrock_client()
+    mock_client.converse.side_effect = Exception("Access denied")
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        with pytest.raises(RuntimeError, match="Bedrock chat failed"):
+            bedrock_chat("test", model="m")
+
+
+def test_bedrock_extract_basic():
+    """Verify bedrock_extract parses a JSON array from the response."""
+    triples = [{"source": "a", "target": "b", "relation": "uses"}]
+    mock_client = _mock_bedrock_client(
+        converse_return=_bedrock_converse_response(json.dumps(triples))
+    )
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        result = bedrock_extract("extract from this text", model="m")
+    assert result == triples
+
+
+def test_bedrock_extract_calls_converse_with_system():
+    """Verify extraction sends system prompt and correct parameters."""
+    mock_client = _mock_bedrock_client(
+        converse_return=_bedrock_converse_response("[]")
+    )
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        bedrock_extract("some text", model="m")
+
+    call_kwargs = mock_client.converse.call_args[1]
+    assert call_kwargs["system"][0]["text"].startswith("You are a JSON extraction engine")
+    assert call_kwargs["inferenceConfig"]["temperature"] == 0.1
+    assert call_kwargs["inferenceConfig"]["maxTokens"] == 32768
+
+
+def test_bedrock_extract_bracket_recovery():
+    """Verify bracket extraction works when the response has surrounding prose."""
+    triples = [{"source": "x", "target": "y", "relation": "part_of"}]
+    text_with_prose = f"Here is the result:\n{json.dumps(triples)}\nDone."
+    mock_client = _mock_bedrock_client(
+        converse_return=_bedrock_converse_response(text_with_prose)
+    )
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        result = bedrock_extract("text", model="m")
+    assert result == triples
+
+
+def test_bedrock_extract_empty_response():
+    """Verify empty response returns empty list."""
+    mock_client = _mock_bedrock_client(
+        converse_return=_bedrock_converse_response("")
+    )
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        result = bedrock_extract("text", model="m")
+    assert result == []
+
+
+def test_bedrock_extract_error_returns_empty():
+    """Verify errors return empty list (not exception)."""
+    mock_client = _mock_bedrock_client()
+    mock_client.converse.side_effect = Exception("Service error")
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        result = bedrock_extract("text", model="m")
+    assert result == []
+
+
+def test_bedrock_embed_titan():
+    """Verify bedrock_embed works with Titan-style model (one-at-a-time)."""
+    mock_client = _mock_bedrock_client()
+
+    # Mock invoke_model to return an embedding
+    embedding = [0.1, 0.2, 0.3]
+    mock_body = MagicMock()
+    mock_body.read.return_value = json.dumps({"embedding": embedding}).encode()
+    mock_client.invoke_model.return_value = {"body": mock_body}
+
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        result = bedrock_embed(["hello", "world"], model="amazon.titan-embed-text-v2:0")
+
+    assert len(result) == 2
+    assert result[0] == embedding
+    assert mock_client.invoke_model.call_count == 2
+
+
+def test_bedrock_embed_cohere():
+    """Verify bedrock_embed works with Cohere-style model (batched)."""
+    mock_client = _mock_bedrock_client()
+
+    embeddings = [[0.1, 0.2], [0.3, 0.4]]
+    mock_body = MagicMock()
+    mock_body.read.return_value = json.dumps({"embeddings": embeddings}).encode()
+    mock_client.invoke_model.return_value = {"body": mock_body}
+
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        result = bedrock_embed(["hello", "world"], model="cohere.embed-english-v3")
+
+    assert result == embeddings
+    # Cohere batches, so only one call
+    mock_client.invoke_model.assert_called_once()
+
+
+def test_bedrock_embed_empty_input():
+    """Verify empty input returns empty list without calling API."""
+    with patch("knowledge_graph._get_bedrock_client") as mock_get:
+        result = bedrock_embed([], model="amazon.titan-embed-text-v2:0")
+    assert result == []
+    mock_get.assert_not_called()
+
+
+def test_bedrock_embed_error():
+    """Verify invoke_model errors raise RuntimeError."""
+    mock_client = _mock_bedrock_client()
+    mock_client.invoke_model.side_effect = Exception("Model not found")
+
+    with patch("knowledge_graph._get_bedrock_client", return_value=mock_client):
+        with pytest.raises(RuntimeError, match="Bedrock embedding failed"):
+            bedrock_embed(["hello"], model="amazon.titan-embed-text-v2:0")
+
+
+def test_get_bedrock_client_missing_boto3():
+    """Verify missing boto3 raises RuntimeError with install hint."""
+    import builtins
+    real_import = builtins.__import__
+
+    def mock_import(name, *args, **kwargs):
+        if name == "boto3":
+            raise ImportError("No module named 'boto3'")
+        return real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=mock_import):
+        with pytest.raises(RuntimeError, match="boto3 is required"):
+            _get_bedrock_client()
+
+
+def test_bedrock_client_region_from_env():
+    """Verify region falls back to AWS_DEFAULT_REGION env var."""
+    mock_boto3_mod = MagicMock()
+    with patch.dict(os.environ, {"AWS_DEFAULT_REGION": "eu-west-1"}):
+        with patch.dict("sys.modules", {"boto3": mock_boto3_mod}):
+            _get_bedrock_client()
+            mock_boto3_mod.client.assert_called_once_with(
+                "bedrock-runtime", region_name="eu-west-1"
+            )
+
+
+def test_ask_with_bedrock_llm_fn(kg):
+    """Verify ask() works when given a Bedrock-based llm_fn."""
+    def mock_bedrock_llm(prompt: str) -> str:
+        assert "Radar" in prompt
+        return "Bedrock says: Radar uses radio waves."
+
+    answer = ask(kg, "What is radar?", fake_embed, mock_bedrock_llm, max_nodes=5)
+    assert answer == "Bedrock says: Radar uses radio waves."
