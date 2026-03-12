@@ -341,3 +341,99 @@ def test_build_llm_fn_anthropic():
     with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
         fn = _build_llm_fn("anthropic", "claude-haiku-4-5", "http://localhost:11434")
     assert callable(fn)
+
+
+# ---------------------------------------------------------------------------
+# Bedrock provider tests
+# ---------------------------------------------------------------------------
+
+
+def test_query_accepts_bedrock_provider():
+    """Query endpoint accepts provider=bedrock without a validation error."""
+    resp = client.post(
+        "/query",
+        data={
+            "graph_name": "nonexistent",
+            "query": "test",
+            "mode": "search",
+            "api_url": "http://localhost:11434",
+            "query_model": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "embed_url": "",
+            "embed_model": "",
+            "provider": "bedrock",
+            "bedrock_region": "us-east-1",
+        },
+    )
+    assert resp.status_code == 200
+    # Should show an error (graph not found or embed connection), not a provider validation error
+    assert "Error" in resp.text
+
+
+def test_build_extract_fn_bedrock():
+    """_build_extract_fn returns a callable for bedrock provider."""
+    from web_app import _build_extract_fn
+    fn = _build_extract_fn("bedrock", "us.anthropic.claude-sonnet-4-20250514-v1:0",
+                           "http://localhost:11434", bedrock_region="us-west-2")
+    assert callable(fn)
+
+
+def test_build_llm_fn_bedrock():
+    """_build_llm_fn returns a callable for bedrock provider."""
+    from web_app import _build_llm_fn
+    fn = _build_llm_fn("bedrock", "us.anthropic.claude-sonnet-4-20250514-v1:0",
+                        "http://localhost:11434", bedrock_region="us-west-2")
+    assert callable(fn)
+
+
+def test_build_embed_fn_bedrock():
+    """_build_embed_fn returns a Bedrock embed callable for Bedrock model IDs."""
+    from web_app import _build_embed_fn
+    fn = _build_embed_fn("amazon.titan-embed-text-v2:0", "http://localhost:11434",
+                         provider="bedrock", bedrock_region="us-east-1")
+    assert callable(fn)
+
+
+def test_build_embed_fn_bedrock_local_fallback():
+    """_build_embed_fn falls back to local embed for non-Bedrock model names."""
+    from web_app import _build_embed_fn
+    fn = _build_embed_fn("qwen3-embedding", "http://localhost:11434",
+                         provider="bedrock", bedrock_region="us-east-1")
+    assert callable(fn)
+
+
+def test_ingest_accepts_bedrock_region():
+    """Ingest endpoint accepts the bedrock_region parameter."""
+    _create_graph("bedrock-ingest-test")
+    # Upload a doc first to get a batch_id
+    md_content = b"# Test\n\nBedrock test.\n"
+    resp = client.post(
+        "/upload",
+        data={"graph_name": "bedrock-ingest-test", "new_graph_name": ""},
+        files=[("files", ("test.md", md_content, "text/markdown"))],
+    )
+    assert resp.status_code == 200
+    # Extract batch_id from response
+    import re
+    match = re.search(r'name="batch_id"\s+value="([^"]+)"', resp.text)
+    assert match, "batch_id not found in upload response"
+    batch_id = match.group(1)
+
+    # Try ingest with bedrock provider — it will fail at the LLM call (no AWS creds)
+    # but should NOT fail at parameter parsing
+    resp = client.post(
+        "/ingest",
+        data={
+            "graph_name": "bedrock-ingest-test",
+            "batch_id": batch_id,
+            "api_url": "http://localhost:11434",
+            "query_model": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "embed_url": "",
+            "embed_model": "qwen3-embedding",
+            "provider": "bedrock",
+            "extract_model": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "bedrock_region": "us-west-2",
+            "verbose": "",
+        },
+    )
+    # Should return 200 (streaming response), the actual LLM error is in the stream
+    assert resp.status_code == 200
