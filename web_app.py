@@ -496,6 +496,7 @@ async def ingest_documents(
         return json.dumps({"type": "log", "message": msg}) + "\n"
 
     def _stream():
+      try:
         _model = extract_model.strip() or query_model
         extract_fn = _build_extract_fn(provider, _model, api_url,
                                        bedrock_region=bedrock_region,
@@ -619,9 +620,13 @@ async def ingest_documents(
             logger.error("Embedding failed for graph '%s': %s", graph_name, exc)
             yield _log(f"  embedding failed: {exc}")
 
-        kg.save()
-        kg.save_embeddings()
-        yield _log("Graph saved.")
+        try:
+            kg.save()
+            kg.save_embeddings()
+            yield _log("Graph saved.")
+        except Exception as exc:
+            logger.error("Save failed for graph '%s': %s", graph_name, exc, exc_info=True)
+            yield _log(f"  save failed: {exc}")
 
         if _verbose:
             graph_stats_after = kg.stats()
@@ -634,6 +639,13 @@ async def ingest_documents(
         tpl = templates.env.get_template("partials/ingest_result.html")
         html = tpl.render(graph_name=graph_name, results=results, embed_count=embed_count)
         yield json.dumps({"type": "done", "html": html}) + "\n"
+      except Exception as exc:
+        logger.error(
+            "Unhandled error in ingest stream (graph=%s, provider=%s, model=%s): %s",
+            graph_name, provider, extract_model.strip() or query_model, exc,
+            exc_info=True,
+        )
+        yield json.dumps({"type": "error", "message": f"Internal error: {exc}"}) + "\n"
 
     return StreamingResponse(
         _stream(),
