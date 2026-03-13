@@ -278,7 +278,7 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
         try:
             detail = exc.read().decode(errors="replace").strip()
         except Exception:
-            pass
+            logger.debug("Could not read error detail from HTTP %d response", exc.code)
         msg = (
             f"Chat request failed (HTTP {exc.code}): "
             f"POST {endpoint} with model '{model}'."
@@ -328,7 +328,8 @@ def list_models(url: str) -> list[dict[str, Any]]:
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 body = json.loads(resp.read())
-        except (urllib.error.HTTPError, urllib.error.URLError):
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            logger.debug("list_models: %s failed: %s", endpoint, exc)
             continue
         logger.debug("list_models: GET %s returned: %s", endpoint, json.dumps(body, indent=2)[:2000])
         # OpenAI format: {"data": [{"id": ..., ...}, ...]}

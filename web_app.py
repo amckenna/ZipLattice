@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from knowledge_graph import (
@@ -94,7 +94,8 @@ def _list_graphs() -> list[dict[str, Any]]:
                 "edges": st.get("num_edges", 0),
                 "sources": len(sources),
             })
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to load graph '%s': %s", entry.name, exc)
             graphs.append({"name": entry.name, "nodes": "?", "edges": "?", "sources": "?"})
     return graphs
 
@@ -106,6 +107,7 @@ def _load_graph(name: str) -> KnowledgeGraph:
     try:
         json_file.resolve().relative_to(GRAPHS_DIR.resolve())
     except ValueError:
+        logger.warning("Path traversal attempt blocked: graph name=%r", name)
         raise ValueError(f"Invalid graph name: {name}")
     return KnowledgeGraph(json_file)
 
@@ -262,6 +264,7 @@ def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
         md = convert(tmp_path)
         return md, None
     except Exception as exc:
+        logger.error("File conversion failed for '%s': %s", filename, exc)
         return "", str(exc)
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -320,7 +323,8 @@ async def graph_detail(request: Request, name: str):
         return RedirectResponse(url="/", status_code=303)
     try:
         kg = _load_graph(name)
-    except Exception:
+    except Exception as exc:
+        logger.error("Failed to load graph '%s': %s", name, exc)
         return RedirectResponse(url="/", status_code=303)
 
     cy = kg.cytoscape_elements()
@@ -368,11 +372,15 @@ async def get_source_text(name: str, doc_id: str):
     """Return the stored source text for a document."""
     json_file = GRAPHS_DIR / name / f"{name}.json"
     if not json_file.exists():
-        return {"error": "Graph not found"}, 404
-    kg = _load_graph(name)
+        return JSONResponse({"error": "Graph not found"}, status_code=404)
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        logger.error("Failed to load graph '%s' for source text: %s", name, exc)
+        return JSONResponse({"error": f"Cannot load graph: {exc}"}, status_code=500)
     text = kg.get_source_text(doc_id)
     if text is None:
-        return {"error": "Source not found"}, 404
+        return JSONResponse({"error": "Source not found"}, status_code=404)
     return {"doc_id": doc_id, "text": text}
 
 
@@ -765,6 +773,10 @@ async def run_query(
                 "error": f"Unknown mode: {mode}",
             })
     except Exception as exc:
+        logger.error(
+            "Query failed (graph=%s, mode=%s, provider=%s, model=%s): %s",
+            graph_name, mode, provider, query_model, exc, exc_info=True,
+        )
         return templates.TemplateResponse("partials/query_result.html", {
             "request": request,
             "error": str(exc),
@@ -817,7 +829,7 @@ async def chat_follow_up(
     except Exception as exc:
         # Remove the failed user message so they can retry
         session["messages"].pop()
-        logger.error("Chat error session=%s: %s", session_id, exc)
+        logger.error("Chat error (session=%s, provider=%s, model=%s): %s", session_id, provider, model, exc, exc_info=True)
         return templates.TemplateResponse("partials/chat_message.html", {
             "request": request,
             "error": str(exc),
@@ -844,10 +856,15 @@ async def delete_graph(name: str):
     try:
         graph_dir.resolve().relative_to(GRAPHS_DIR.resolve())
     except ValueError:
+        logger.warning("Path traversal attempt blocked in delete: name=%r", name)
         return HTMLResponse(status_code=400, content="Invalid graph name")
     if not graph_dir.is_dir():
         return HTMLResponse(status_code=404, content="Graph not found")
-    shutil.rmtree(graph_dir)
+    try:
+        shutil.rmtree(graph_dir)
+    except Exception as exc:
+        logger.error("Failed to delete graph '%s': %s", name, exc)
+        return HTMLResponse(status_code=500, content=f"Delete failed: {exc}")
     response = HTMLResponse(content="")
     response.headers["HX-Redirect"] = "/"
     return response
@@ -861,33 +878,38 @@ async def export_graph(name: str):
     try:
         graph_dir.resolve().relative_to(GRAPHS_DIR.resolve())
     except ValueError:
+        logger.warning("Path traversal attempt blocked in export: name=%r", name)
         return HTMLResponse(status_code=400, content="Invalid graph name")
     json_file = graph_dir / f"{name}.json"
     if not json_file.exists():
         return HTMLResponse(status_code=404, content="Graph not found")
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file_path in sorted(graph_dir.rglob("*")):
-            if not file_path.is_file():
-                continue
-            arcname = str(Path(name) / file_path.relative_to(graph_dir))
-            if file_path == json_file:
-                # Rewrite absolute paths to relative for portability
-                data = json.loads(json_file.read_text(encoding="utf-8"))
-                sources = data.get("meta", {}).get("sources", {})
-                for entry in sources.values():
-                    entry["stored_path"] = _make_relative(
-                        entry.get("stored_path", ""), graph_dir
-                    )
-                    for ver in entry.get("versions", []):
-                        if "archived_to" in ver:
-                            ver["archived_to"] = _make_relative(
-                                ver["archived_to"], graph_dir
-                            )
-                zf.writestr(arcname, json.dumps(data, indent=2, cls=GraphEncoder))
-            else:
-                zf.write(file_path, arcname)
+    try:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in sorted(graph_dir.rglob("*")):
+                if not file_path.is_file():
+                    continue
+                arcname = str(Path(name) / file_path.relative_to(graph_dir))
+                if file_path == json_file:
+                    # Rewrite absolute paths to relative for portability
+                    data = json.loads(json_file.read_text(encoding="utf-8"))
+                    sources = data.get("meta", {}).get("sources", {})
+                    for entry in sources.values():
+                        entry["stored_path"] = _make_relative(
+                            entry.get("stored_path", ""), graph_dir
+                        )
+                        for ver in entry.get("versions", []):
+                            if "archived_to" in ver:
+                                ver["archived_to"] = _make_relative(
+                                    ver["archived_to"], graph_dir
+                                )
+                    zf.writestr(arcname, json.dumps(data, indent=2, cls=GraphEncoder))
+                else:
+                    zf.write(file_path, arcname)
+    except Exception as exc:
+        logger.error("Export failed for graph '%s': %s", name, exc, exc_info=True)
+        return HTMLResponse(status_code=500, content=f"Export failed: {exc}")
 
     buf.seek(0)
     return StreamingResponse(

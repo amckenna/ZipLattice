@@ -77,7 +77,7 @@ def ollama_embed(
         try:
             detail = exc.read().decode(errors="replace").strip()
         except Exception:
-            pass
+            logger.debug("Could not read error detail from HTTP %d response", exc.code)
         msg = (
             f"Embedding request failed (HTTP {exc.code}): "
             f"POST {endpoint} with model '{model}'."
@@ -206,6 +206,7 @@ def local_extract(
         headers={"Content-Type": "application/json"},
     )
     logger.debug("local_extract: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
+    t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=1200) as resp:
             body = json.loads(resp.read())
@@ -214,22 +215,24 @@ def local_extract(
         try:
             detail = exc.read().decode(errors="replace").strip()
         except Exception:
-            pass
+            logger.debug("Could not read error detail from HTTP %d response", exc.code)
         logger.error(
-            "Extraction request failed (HTTP %d): %s",
-            exc.code, detail or "(no detail)",
+            "Extraction request failed (HTTP %d, model=%s): %s",
+            exc.code, model, detail or "(no detail)",
         )
         return []
     except urllib.error.URLError as exc:
-        logger.error("Cannot connect to %s: %s", url, exc.reason)
+        logger.error("Cannot connect to %s (model=%s): %s", url, model, exc.reason)
         return []
 
+    elapsed = time.monotonic() - t0
     # OpenAI format: choices[0].message.content
     raw = body["choices"][0]["message"]["content"].strip()
+    logger.debug("local_extract: response=%d chars (%.1fs)", len(raw), elapsed)
     raw = _strip_thinking(raw)
 
     if not raw:
-        logger.warning("LLM returned empty response")
+        logger.warning("LLM returned empty response (model=%s)", model)
         return []
 
     return _parse_llm_json(raw)
@@ -320,12 +323,12 @@ def claude_chat(prompt: str, *, model: str, api_key: str | None = None) -> str:
             try:
                 detail = exc.read().decode(errors="replace").strip()
             except Exception:
-                pass
+                logger.debug("Could not read error detail from HTTP %d response", exc.code)
             if exc.code == 429 and attempt < max_retries - 1:
                 wait = _rate_limit_wait(detail, attempt)
                 logger.warning(
-                    "Claude chat rate-limited (429), retry %d/%d in %.0fs",
-                    attempt + 1, max_retries - 1, wait,
+                    "Claude chat rate-limited (429, model=%s), retry %d/%d in %.0fs",
+                    model, attempt + 1, max_retries - 1, wait,
                 )
                 time.sleep(wait)
                 req = urllib.request.Request(
@@ -404,6 +407,7 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
         },
     )
     logger.debug("claude_extract: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
+    t0 = time.monotonic()
     body = None
     max_retries = 5
     for attempt in range(max_retries):
@@ -416,12 +420,12 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
             try:
                 detail = exc.read().decode(errors="replace").strip()
             except Exception:
-                pass
+                logger.debug("Could not read error detail from HTTP %d response", exc.code)
             if exc.code == 429 and attempt < max_retries - 1:
                 wait = _rate_limit_wait(detail, attempt)
                 logger.warning(
-                    "Claude extraction rate-limited (429), retry %d/%d in %.0fs",
-                    attempt + 1, max_retries - 1, wait,
+                    "Claude extraction rate-limited (429, model=%s), retry %d/%d in %.0fs",
+                    model, attempt + 1, max_retries - 1, wait,
                 )
                 time.sleep(wait)
                 # Rebuild request (stream may be consumed)
@@ -445,15 +449,16 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
     if body is None:
         return []
 
+    elapsed = time.monotonic() - t0
     # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
     raw = body["content"][0]["text"].strip()
-    logger.debug("claude_extract: raw response=%d chars", len(raw))
+    logger.debug("claude_extract: raw response=%d chars (%.1fs)", len(raw), elapsed)
 
     # Safety-net strip of thinking tags (Claude doesn't emit them, but harmless)
     raw = _strip_thinking(raw)
 
     if not raw:
-        logger.warning("Claude returned empty response")
+        logger.warning("Claude returned empty response (model=%s)", model)
         return []
 
     return _parse_llm_json(raw)
@@ -686,7 +691,7 @@ def bedrock_extract(
     raw = _strip_thinking(raw)
 
     if not raw:
-        logger.warning("Bedrock returned empty response")
+        logger.warning("Bedrock returned empty response (model=%s)", model)
         return []
 
     return _parse_llm_json(raw)

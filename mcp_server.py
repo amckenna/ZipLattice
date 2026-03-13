@@ -67,7 +67,12 @@ def _get_graph(graph_path: str) -> KnowledgeGraph:
     """Load (or retrieve from cache) a KnowledgeGraph by path."""
     graph_path = str(Path(graph_path).resolve())
     if graph_path not in _graph_cache:
-        _graph_cache[graph_path] = KnowledgeGraph(graph_path)
+        logger.info("Loading graph: %s", graph_path)
+        try:
+            _graph_cache[graph_path] = KnowledgeGraph(graph_path)
+        except Exception as exc:
+            logger.error("Failed to load graph '%s': %s", graph_path, exc)
+            raise
     return _graph_cache[graph_path]
 
 
@@ -135,10 +140,15 @@ def ingest_triples(
         auto_save: Save the graph after ingestion (default True).
     """
     kg = _get_graph(graph_path)
+    logger.info("ingest_triples: doc_id=%s, triples=%d", doc_id, len(triples))
     stats = kg.ingest_triples(
         triples,
         text=text,
         doc_id=doc_id,
+    )
+    logger.info(
+        "ingest_triples: done — nodes_added=%d, edges_added=%d",
+        stats.get("total_nodes_added", 0), stats.get("total_edges_added", 0),
     )
     if auto_save:
         kg.save()
@@ -533,11 +543,13 @@ def embed_nodes(
         auto_save: Save embeddings after generation (default True).
     """
     kg = _get_graph(graph_path)
+    logger.info("embed_nodes: model=%s url=%s", embed_model, api_url)
 
     def embed_fn(texts: list[str]) -> list[list[float]]:
         return ollama_embed(texts, model=embed_model, url=api_url)
 
     stats = kg.embed_nodes(embed_fn, node_types=node_types)
+    logger.info("embed_nodes: done — %s", {k: v for k, v in stats.items() if isinstance(v, int)})
     if auto_save:
         kg.save_embeddings()
     return _json(stats)
@@ -568,6 +580,7 @@ def semantic_search(
         expand_depth: Neighborhood expansion depth.
     """
     kg = _get_graph(graph_path)
+    logger.info("semantic_search: query=%r model=%s top_k=%d", query[:80], embed_model, top_k)
 
     def embed_fn(texts: list[str]) -> list[list[float]]:
         return ollama_embed(texts, model=embed_model, url=api_url)
@@ -576,6 +589,7 @@ def semantic_search(
         query, embed_fn, top_k=top_k,
         node_types=node_types, expand_depth=expand_depth,
     )
+    logger.info("semantic_search: returned %d results", len(results))
     return _json(results)
 
 
