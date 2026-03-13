@@ -150,16 +150,89 @@ def _build_llm_fn(provider: str, model: str, api_url: str, *,
     return partial(ollama_chat, model=model, url=api_url)
 
 
-def _chat_multi_turn_local(
-    messages: list[dict[str, str]], *, model: str, url: str
+def _chat_multi_turn(
+    messages: list[dict[str, str]],
+    *,
+    provider: str,
+    model: str,
+    api_url: str = "",
+    bedrock_region: str = "",
+    bedrock_profile: str = "",
 ) -> str:
-    """Call an OpenAI-compatible chat completions endpoint with full history."""
+    """Call a chat completions endpoint with full conversation history.
+
+    Routes to the appropriate provider (local/anthropic/bedrock) and
+    handles provider-specific message formatting.
+    """
+    if provider == "anthropic":
+        import urllib.request
+        from knowledge_graph import _ANTHROPIC_API_URL, _ANTHROPIC_VERSION
+
+        api_key = _get_anthropic_api_key()
+        # Anthropic requires alternating user/assistant messages.
+        # System messages go via the ``system`` parameter.
+        system_text = ""
+        api_messages = []
+        for m in messages:
+            if m["role"] == "system":
+                system_text += m["content"] + "\n"
+            else:
+                api_messages.append({"role": m["role"], "content": m["content"]})
+
+        endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
+        body_dict: dict[str, Any] = {
+            "model": model, "max_tokens": 16384, "messages": api_messages,
+        }
+        if system_text.strip():
+            body_dict["system"] = system_text.strip()
+
+        payload = json.dumps(body_dict).encode()
+        req = urllib.request.Request(
+            endpoint, data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": _ANTHROPIC_VERSION,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=1200) as resp:
+            body = json.loads(resp.read())
+        return body["content"][0]["text"]
+
+    if provider == "bedrock":
+        from knowledge_graph import _get_bedrock_client
+
+        region = bedrock_region.strip() or None
+        profile = bedrock_profile.strip() or None
+        client = _get_bedrock_client(region, profile=profile)
+
+        system_parts: list[dict] = []
+        api_messages_br: list[dict] = []
+        for m in messages:
+            if m["role"] == "system":
+                system_parts.append({"text": m["content"]})
+            else:
+                api_messages_br.append({
+                    "role": m["role"],
+                    "content": [{"text": m["content"]}],
+                })
+
+        kwargs: dict[str, Any] = {
+            "modelId": model,
+            "messages": api_messages_br,
+            "inferenceConfig": {"maxTokens": 16384},
+        }
+        if system_parts:
+            kwargs["system"] = system_parts
+
+        resp = client.converse(**kwargs)
+        return resp["output"]["message"]["content"][0]["text"].strip()
+
+    # Default: local (OpenAI-compatible)
     import urllib.request
-    endpoint = f"{url.rstrip('/')}/v1/chat/completions"
+    endpoint = f"{api_url.rstrip('/')}/v1/chat/completions"
     payload = json.dumps({
-        "model": model,
-        "messages": messages,
-        "stream": False,
+        "model": model, "messages": messages, "stream": False,
     }).encode()
     req = urllib.request.Request(
         endpoint, data=payload,
@@ -168,81 +241,6 @@ def _chat_multi_turn_local(
     with urllib.request.urlopen(req, timeout=1200) as resp:
         body = json.loads(resp.read())
     return body["choices"][0]["message"]["content"]
-
-
-def _chat_multi_turn_anthropic(
-    messages: list[dict[str, str]], *, model: str, api_key: str
-) -> str:
-    """Call the Anthropic Messages API with full conversation history."""
-    import urllib.request
-    from knowledge_graph import _ANTHROPIC_API_URL, _ANTHROPIC_VERSION
-
-    # Anthropic requires alternating user/assistant messages.
-    # The first message must be a user message.  If we have a system-like
-    # preamble we pass it via the ``system`` parameter.
-    system_text = ""
-    api_messages = []
-    for m in messages:
-        role = m["role"]
-        if role == "system":
-            system_text += m["content"] + "\n"
-        else:
-            api_messages.append({"role": role, "content": m["content"]})
-
-    endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
-    body_dict: dict[str, Any] = {
-        "model": model,
-        "max_tokens": 16384,
-        "messages": api_messages,
-    }
-    if system_text.strip():
-        body_dict["system"] = system_text.strip()
-
-    payload = json.dumps(body_dict).encode()
-    req = urllib.request.Request(
-        endpoint, data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": _ANTHROPIC_VERSION,
-        },
-    )
-    with urllib.request.urlopen(req, timeout=1200) as resp:
-        body = json.loads(resp.read())
-    return body["content"][0]["text"]
-
-
-def _chat_multi_turn_bedrock(
-    messages: list[dict[str, str]], *, model: str, region: str | None = None,
-    profile: str | None = None,
-) -> str:
-    """Call AWS Bedrock Converse API with full conversation history."""
-    from knowledge_graph import _get_bedrock_client
-
-    client = _get_bedrock_client(region, profile=profile)
-
-    system_parts: list[dict] = []
-    api_messages: list[dict] = []
-    for m in messages:
-        role = m["role"]
-        if role == "system":
-            system_parts.append({"text": m["content"]})
-        else:
-            api_messages.append({
-                "role": role,
-                "content": [{"text": m["content"]}],
-            })
-
-    kwargs: dict[str, Any] = {
-        "modelId": model,
-        "messages": api_messages,
-        "inferenceConfig": {"maxTokens": 16384},
-    }
-    if system_parts:
-        kwargs["system"] = system_parts
-
-    resp = client.converse(**kwargs)
-    return resp["output"]["message"]["content"][0]["text"].strip()
 
 
 def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
@@ -810,22 +808,11 @@ async def chat_follow_up(
     bedrock_profile = cfg.get("bedrock_profile", "")
 
     try:
-        if provider == "anthropic":
-            api_key = _get_anthropic_api_key()
-            answer = _chat_multi_turn_anthropic(
-                session["messages"], model=model, api_key=api_key,
-            )
-        elif provider == "bedrock":
-            region = bedrock_region.strip() or None
-            profile = bedrock_profile.strip() or None
-            answer = _chat_multi_turn_bedrock(
-                session["messages"], model=model, region=region,
-                profile=profile,
-            )
-        else:
-            answer = _chat_multi_turn_local(
-                session["messages"], model=model, url=api_url,
-            )
+        answer = _chat_multi_turn(
+            session["messages"],
+            provider=provider, model=model, api_url=api_url,
+            bedrock_region=bedrock_region, bedrock_profile=bedrock_profile,
+        )
     except Exception as exc:
         # Remove the failed user message so they can retry
         session["messages"].pop()

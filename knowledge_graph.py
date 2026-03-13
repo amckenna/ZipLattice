@@ -166,6 +166,25 @@ def _parse_llm_json(raw: str) -> list[dict[str, Any]]:
     return []
 
 
+_EXTRACTION_SYSTEM_PROMPT = (
+    "You are a JSON extraction engine. "
+    "Respond with ONLY a valid JSON array. "
+    "No explanations, no markdown."
+)
+
+
+def _parse_extraction_response(raw: str, *, model: str, label: str) -> list[dict[str, Any]]:
+    """Shared post-processing for all extraction functions.
+
+    Strips thinking tags, checks for empty responses, and parses JSON.
+    """
+    raw = _strip_thinking(raw)
+    if not raw:
+        logger.warning("%s returned empty response (model=%s)", label, model)
+        return []
+    return _parse_llm_json(raw)
+
+
 def local_extract(
     prompt: str, *, model: str, url: str = "http://localhost:11434"
 ) -> list[dict[str, Any]]:
@@ -186,14 +205,7 @@ def local_extract(
     payload = json.dumps({
         "model": model,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a JSON extraction engine. "
-                    "Respond with ONLY a valid JSON array. "
-                    "No explanations, no markdown."
-                ),
-            },
+            {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
         "stream": False,
@@ -229,13 +241,7 @@ def local_extract(
     # OpenAI format: choices[0].message.content
     raw = body["choices"][0]["message"]["content"].strip()
     logger.debug("local_extract: response=%d chars (%.1fs)", len(raw), elapsed)
-    raw = _strip_thinking(raw)
-
-    if not raw:
-        logger.warning("LLM returned empty response (model=%s)", model)
-        return []
-
-    return _parse_llm_json(raw)
+    return _parse_extraction_response(raw, model=model, label="LLM")
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +286,91 @@ def _rate_limit_wait(detail: str, attempt: int) -> float:
     return min(30 * (2 ** attempt), 300)
 
 
+def _anthropic_request(
+    payload_dict: dict[str, Any],
+    *,
+    api_key: str,
+    model: str,
+    label: str,
+    on_error: str = "raise",
+) -> dict[str, Any] | None:
+    """Shared Anthropic HTTP request with 429 retry logic.
+
+    Args:
+        payload_dict: JSON-serializable request body.
+        api_key: Anthropic API key.
+        model: Model ID (for logging and error messages).
+        label: Human label for log messages (e.g. ``"chat"``, ``"extract"``).
+        on_error: ``"raise"`` to raise RuntimeError on non-retryable errors,
+            ``"return"`` to log and return None.
+
+    Returns:
+        Parsed response body dict, or None if *on_error* is ``"return"``
+        and the request failed.
+    """
+    endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
+    payload = json.dumps(payload_dict).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": _ANTHROPIC_VERSION,
+    }
+    req = urllib.request.Request(endpoint, data=payload, headers=headers)
+    logger.debug("claude_%s: POST %s  model=%s  prompt payload=%d bytes",
+                 label, endpoint, model, len(payload))
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=1200) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode(errors="replace").strip()
+            except Exception:
+                logger.debug("Could not read error detail from HTTP %d response", exc.code)
+            if exc.code == 429 and attempt < max_retries - 1:
+                wait = _rate_limit_wait(detail, attempt)
+                logger.warning(
+                    "Claude %s rate-limited (429, model=%s), retry %d/%d in %.0fs",
+                    label, model, attempt + 1, max_retries - 1, wait,
+                )
+                time.sleep(wait)
+                req = urllib.request.Request(endpoint, data=payload, headers=headers)
+                continue
+            if on_error == "return":
+                logger.error(
+                    "Claude %s request failed (HTTP %d, model=%s): %s",
+                    label, exc.code, model, detail or "(no detail)",
+                )
+                return None
+            msg = (
+                f"Claude {label} request failed (HTTP {exc.code}): "
+                f"POST {endpoint} with model '{model}'."
+            )
+            if detail:
+                msg += f"\nServer response: {detail}"
+            if exc.code == 401:
+                msg += "\nHint: check that ANTHROPIC_API_KEY is valid."
+            elif exc.code == 404:
+                msg += f"\nHint: model '{model}' may not exist. Check the model ID."
+            elif exc.code == 429:
+                msg += "\nHint: rate limited. Wait and retry."
+            raise RuntimeError(msg) from exc
+        except urllib.error.URLError as exc:
+            if on_error == "return":
+                logger.error("Cannot connect to %s: %s", endpoint, exc.reason)
+                return None
+            raise RuntimeError(
+                f"Cannot connect to {endpoint}: {exc.reason}."
+            ) from exc
+    # All retries exhausted (all were 429s)
+    if on_error == "return":
+        return None
+    raise RuntimeError(f"Claude {label} failed after {max_retries} retries.")
+
+
 def claude_chat(prompt: str, *, model: str, api_key: str | None = None) -> str:
     """Call the Anthropic Messages API and return the assistant's text.
 
@@ -294,74 +385,13 @@ def claude_chat(prompt: str, *, model: str, api_key: str | None = None) -> str:
     if not api_key:
         api_key = _get_anthropic_api_key()
 
-    endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
-    payload = json.dumps({
-        "model": model,
-        "max_tokens": 16384,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-    req = urllib.request.Request(
-        endpoint,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": _ANTHROPIC_VERSION,
-        },
-    )
-    logger.debug("claude_chat: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
     t0 = time.monotonic()
-    body = None
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            with urllib.request.urlopen(req, timeout=1200) as resp:
-                body = json.loads(resp.read())
-            break
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode(errors="replace").strip()
-            except Exception:
-                logger.debug("Could not read error detail from HTTP %d response", exc.code)
-            if exc.code == 429 and attempt < max_retries - 1:
-                wait = _rate_limit_wait(detail, attempt)
-                logger.warning(
-                    "Claude chat rate-limited (429, model=%s), retry %d/%d in %.0fs",
-                    model, attempt + 1, max_retries - 1, wait,
-                )
-                time.sleep(wait)
-                req = urllib.request.Request(
-                    endpoint, data=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "x-api-key": api_key,
-                        "anthropic-version": _ANTHROPIC_VERSION,
-                    },
-                )
-                continue
-            msg = (
-                f"Claude chat request failed (HTTP {exc.code}): "
-                f"POST {endpoint} with model '{model}'."
-            )
-            if detail:
-                msg += f"\nServer response: {detail}"
-            if exc.code == 401:
-                msg += "\nHint: check that ANTHROPIC_API_KEY is valid."
-            elif exc.code == 404:
-                msg += f"\nHint: model '{model}' may not exist. Check the model ID."
-            elif exc.code == 429:
-                msg += "\nHint: rate limited. Wait and retry."
-            raise RuntimeError(msg) from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
-                f"Cannot connect to {endpoint}: {exc.reason}."
-            ) from exc
-    if body is None:
-        raise RuntimeError("Claude chat failed after retries.")
-
+    body = _anthropic_request(
+        {"model": model, "max_tokens": 16384,
+         "messages": [{"role": "user", "content": prompt}]},
+        api_key=api_key, model=model, label="chat",
+    )
     elapsed = time.monotonic() - t0
-    # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
     answer = body["content"][0]["text"].strip()
     logger.debug("claude_chat: response=%d chars (%.1fs)", len(answer), elapsed)
     return answer
@@ -385,83 +415,20 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
     if not api_key:
         api_key = _get_anthropic_api_key()
 
-    endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
-    payload = json.dumps({
-        "model": model,
-        "max_tokens": 32768,
-        "temperature": 0.1,
-        "system": (
-            "You are a JSON extraction engine. "
-            "Respond with ONLY a valid JSON array. "
-            "No explanations, no markdown."
-        ),
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-    req = urllib.request.Request(
-        endpoint,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": _ANTHROPIC_VERSION,
-        },
-    )
-    logger.debug("claude_extract: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
     t0 = time.monotonic()
-    body = None
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            with urllib.request.urlopen(req, timeout=1200) as resp:
-                body = json.loads(resp.read())
-            break
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode(errors="replace").strip()
-            except Exception:
-                logger.debug("Could not read error detail from HTTP %d response", exc.code)
-            if exc.code == 429 and attempt < max_retries - 1:
-                wait = _rate_limit_wait(detail, attempt)
-                logger.warning(
-                    "Claude extraction rate-limited (429, model=%s), retry %d/%d in %.0fs",
-                    model, attempt + 1, max_retries - 1, wait,
-                )
-                time.sleep(wait)
-                # Rebuild request (stream may be consumed)
-                req = urllib.request.Request(
-                    endpoint, data=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "x-api-key": api_key,
-                        "anthropic-version": _ANTHROPIC_VERSION,
-                    },
-                )
-                continue
-            logger.error(
-                "Claude extraction request failed (HTTP %d): %s",
-                exc.code, detail or "(no detail)",
-            )
-            return []
-        except urllib.error.URLError as exc:
-            logger.error("Cannot connect to %s: %s", endpoint, exc.reason)
-            return []
+    body = _anthropic_request(
+        {"model": model, "max_tokens": 32768, "temperature": 0.1,
+         "system": _EXTRACTION_SYSTEM_PROMPT,
+         "messages": [{"role": "user", "content": prompt}]},
+        api_key=api_key, model=model, label="extract", on_error="return",
+    )
     if body is None:
         return []
 
     elapsed = time.monotonic() - t0
-    # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
     raw = body["content"][0]["text"].strip()
     logger.debug("claude_extract: raw response=%d chars (%.1fs)", len(raw), elapsed)
-
-    # Safety-net strip of thinking tags (Claude doesn't emit them, but harmless)
-    raw = _strip_thinking(raw)
-
-    if not raw:
-        logger.warning("Claude returned empty response (model=%s)", model)
-        return []
-
-    return _parse_llm_json(raw)
+    return _parse_extraction_response(raw, model=model, label="Claude")
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +521,67 @@ def _is_bedrock_retryable(exc: Exception) -> bool:
     return False
 
 
+def _bedrock_converse_with_retries(
+    converse_kwargs: dict[str, Any],
+    *,
+    model: str,
+    region: str | None = None,
+    profile: str | None = None,
+    label: str,
+    on_error: str = "raise",
+) -> dict[str, Any] | None:
+    """Shared Bedrock Converse call with transient-error retry logic.
+
+    Args:
+        converse_kwargs: Keyword arguments for ``client.converse()``.
+        model: Model ID (for logging).
+        region: AWS region.
+        profile: AWS profile name.
+        label: Human label for log messages (e.g. ``"chat"``, ``"extract"``).
+        on_error: ``"raise"`` to raise RuntimeError on non-retryable errors,
+            ``"return"`` to log and return None.
+
+    Returns:
+        Converse response dict, or None if *on_error* is ``"return"``
+        and the request failed.
+    """
+    client = _get_bedrock_client(region, profile=profile)
+    logger.debug("bedrock_%s: model=%s", label, model)
+
+    max_retries = 5
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            return client.converse(**converse_kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if _is_bedrock_retryable(exc) and attempt < max_retries - 1:
+                wait = min(30 * (2 ** attempt), 300)
+                logger.warning(
+                    "Bedrock %s error (model=%s, %s), retry %d/%d in %.0fs",
+                    label, model, exc, attempt + 1, max_retries - 1, wait,
+                )
+                time.sleep(wait)
+                client = _get_bedrock_client(region, profile=profile)
+                continue
+            if on_error == "return":
+                logger.error(
+                    "Bedrock %s failed after %d attempt(s) (model=%s): %s",
+                    label, attempt + 1, model, exc,
+                )
+                return None
+            raise RuntimeError(
+                f"Bedrock {label} failed (model={model}): {exc}"
+            ) from exc
+
+    # All retries exhausted
+    if on_error == "return":
+        return None
+    raise RuntimeError(
+        f"Bedrock {label} failed after {max_retries} retries: {last_exc}"
+    )
+
+
 def bedrock_chat(
     prompt: str,
     *,
@@ -574,46 +602,14 @@ def bedrock_chat(
     Returns:
         The assistant's response text.
     """
-    client = _get_bedrock_client(region, profile=profile)
-    logger.debug("bedrock_chat: model=%s  prompt=%d chars", model, len(prompt))
     t0 = time.monotonic()
-
-    max_retries = 5
-    body = None
-    last_exc: Exception | None = None
-    for attempt in range(max_retries):
-        try:
-            body = client.converse(
-                modelId=model,
-                messages=[{
-                    "role": "user",
-                    "content": [{"text": prompt}],
-                }],
-                inferenceConfig={"maxTokens": 16384},
-            )
-            break
-        except Exception as exc:
-            last_exc = exc
-            if _is_bedrock_retryable(exc) and attempt < max_retries - 1:
-                wait = min(30 * (2 ** attempt), 300)
-                logger.warning(
-                    "Bedrock chat error (model=%s, %s), retry %d/%d in %.0fs",
-                    model, exc, attempt + 1, max_retries - 1, wait,
-                )
-                time.sleep(wait)
-                client = _get_bedrock_client(region, profile=profile)
-                continue
-            raise RuntimeError(
-                f"Bedrock chat failed (model={model}): {exc}"
-            ) from exc
-
-    if body is None:
-        raise RuntimeError(
-            f"Bedrock chat failed after {max_retries} retries: {last_exc}"
-        )
-
+    body = _bedrock_converse_with_retries(
+        {"modelId": model,
+         "messages": [{"role": "user", "content": [{"text": prompt}]}],
+         "inferenceConfig": {"maxTokens": 16384}},
+        model=model, region=region, profile=profile, label="chat",
+    )
     elapsed = time.monotonic() - t0
-    # Converse format: {"output": {"message": {"content": [{"text": "..."}]}}}
     answer = body["output"]["message"]["content"][0]["text"].strip()
     logger.debug("bedrock_chat: response=%d chars (%.1fs)", len(answer), elapsed)
     return answer
@@ -641,60 +637,22 @@ def bedrock_extract(
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
     """
-    client = _get_bedrock_client(region, profile=profile)
-    logger.debug("bedrock_extract: model=%s  prompt=%d chars", model, len(prompt))
-
-    max_retries = 5
-    body = None
-    for attempt in range(max_retries):
-        try:
-            body = client.converse(
-                modelId=model,
-                messages=[{
-                    "role": "user",
-                    "content": [{"text": prompt}],
-                }],
-                system=[{
-                    "text": (
-                        "You are a JSON extraction engine. "
-                        "Respond with ONLY a valid JSON array. "
-                        "No explanations, no markdown."
-                    ),
-                }],
-                inferenceConfig={
-                    "maxTokens": 32768,
-                    "temperature": 0.1,
-                },
-            )
-            break
-        except Exception as exc:
-            if _is_bedrock_retryable(exc) and attempt < max_retries - 1:
-                wait = min(30 * (2 ** attempt), 300)
-                logger.warning(
-                    "Bedrock extraction error (model=%s, %s), retry %d/%d in %.0fs",
-                    model, exc, attempt + 1, max_retries - 1, wait,
-                )
-                time.sleep(wait)
-                client = _get_bedrock_client(region, profile=profile)
-                continue
-            logger.error(
-                "Bedrock extraction failed after %d attempt(s) (model=%s): %s",
-                attempt + 1, model, exc,
-            )
-            return []
-
+    t0 = time.monotonic()
+    body = _bedrock_converse_with_retries(
+        {"modelId": model,
+         "messages": [{"role": "user", "content": [{"text": prompt}]}],
+         "system": [{"text": _EXTRACTION_SYSTEM_PROMPT}],
+         "inferenceConfig": {"maxTokens": 32768, "temperature": 0.1}},
+        model=model, region=region, profile=profile,
+        label="extract", on_error="return",
+    )
     if body is None:
         return []
 
+    elapsed = time.monotonic() - t0
     raw = body["output"]["message"]["content"][0]["text"].strip()
-    logger.debug("bedrock_extract: raw response=%d chars", len(raw))
-    raw = _strip_thinking(raw)
-
-    if not raw:
-        logger.warning("Bedrock returned empty response (model=%s)", model)
-        return []
-
-    return _parse_llm_json(raw)
+    logger.debug("bedrock_extract: raw response=%d chars (%.1fs)", len(raw), elapsed)
+    return _parse_extraction_response(raw, model=model, label="Bedrock")
 
 
 def bedrock_embed(
