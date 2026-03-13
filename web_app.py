@@ -587,8 +587,8 @@ async def ingest_documents(
                     if accepted:
                         yield _log(f"  auto-accepted {accepted} relation proposal(s)")
             except Exception as exc:
-                logger.error("Ingestion error for doc '%s': %s", doc["doc_id"], exc, exc_info=_verbose)
-                yield _log(f"  error: {exc}")
+                logger.error("Ingestion error for doc '%s' (provider=%s, model=%s): %s", doc["doc_id"], provider, _model, exc, exc_info=_verbose)
+                yield _log(f"  error (model={_model}): {exc}")
                 results.append({
                     "doc_id": doc["doc_id"],
                     "total_sections": 0,
