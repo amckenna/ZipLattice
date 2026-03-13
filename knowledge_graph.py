@@ -592,8 +592,8 @@ def bedrock_chat(
             if _is_bedrock_retryable(exc) and attempt < max_retries - 1:
                 wait = min(30 * (2 ** attempt), 300)
                 logger.warning(
-                    "Bedrock chat error (%s), retry %d/%d in %.0fs",
-                    exc, attempt + 1, max_retries - 1, wait,
+                    "Bedrock chat error (model=%s, %s), retry %d/%d in %.0fs",
+                    model, exc, attempt + 1, max_retries - 1, wait,
                 )
                 time.sleep(wait)
                 client = _get_bedrock_client(region, profile=profile)
@@ -666,15 +666,15 @@ def bedrock_extract(
             if _is_bedrock_retryable(exc) and attempt < max_retries - 1:
                 wait = min(30 * (2 ** attempt), 300)
                 logger.warning(
-                    "Bedrock extraction error (%s), retry %d/%d in %.0fs",
-                    exc, attempt + 1, max_retries - 1, wait,
+                    "Bedrock extraction error (model=%s, %s), retry %d/%d in %.0fs",
+                    model, exc, attempt + 1, max_retries - 1, wait,
                 )
                 time.sleep(wait)
                 client = _get_bedrock_client(region, profile=profile)
                 continue
             logger.error(
-                "Bedrock extraction failed after %d attempt(s): %s",
-                attempt + 1, exc,
+                "Bedrock extraction failed after %d attempt(s) (model=%s): %s",
+                attempt + 1, model, exc,
             )
             return []
 
