@@ -508,6 +508,47 @@ def _get_bedrock_client(region: str | None = None, profile: str | None = None):
     return client
 
 
+def _is_bedrock_retryable(exc: Exception) -> bool:
+    """Return True if *exc* is a transient Bedrock error worth retrying.
+
+    Covers throttling, network stream errors ("Error in input stream"),
+    connection resets, read timeouts, and generic ``botocore`` transport
+    failures.
+    """
+    msg = str(exc).lower()
+    retryable_phrases = [
+        "error in input stream",
+        "throttl",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+        "network",
+        "endpoint url",
+        "read timeout",
+        "connect timeout",
+        "service unavailable",
+        "internal server error",
+        "bad gateway",
+        "too many requests",
+    ]
+    if any(phrase in msg for phrase in retryable_phrases):
+        return True
+    # botocore-specific exceptions
+    exc_type = type(exc).__name__
+    if exc_type in (
+        "ThrottlingException",
+        "ReadTimeoutError",
+        "ConnectTimeoutError",
+        "EndpointConnectionError",
+        "ConnectionClosedError",
+        "EventStreamError",
+    ):
+        return True
+    return False
+
+
 def bedrock_chat(
     prompt: str,
     *,
@@ -534,6 +575,7 @@ def bedrock_chat(
 
     max_retries = 5
     body = None
+    last_exc: Exception | None = None
     for attempt in range(max_retries):
         try:
             body = client.converse(
@@ -545,26 +587,25 @@ def bedrock_chat(
                 inferenceConfig={"maxTokens": 16384},
             )
             break
-        except client.exceptions.ThrottlingException:
-            if attempt < max_retries - 1:
+        except Exception as exc:
+            last_exc = exc
+            if _is_bedrock_retryable(exc) and attempt < max_retries - 1:
                 wait = min(30 * (2 ** attempt), 300)
                 logger.warning(
-                    "Bedrock chat throttled, retry %d/%d in %.0fs",
-                    attempt + 1, max_retries - 1, wait,
+                    "Bedrock chat error (%s), retry %d/%d in %.0fs",
+                    exc, attempt + 1, max_retries - 1, wait,
                 )
                 time.sleep(wait)
+                client = _get_bedrock_client(region, profile=profile)
                 continue
-            raise RuntimeError(
-                f"Bedrock chat throttled after {max_retries} attempts "
-                f"(model={model})."
-            )
-        except Exception as exc:
             raise RuntimeError(
                 f"Bedrock chat failed (model={model}): {exc}"
             ) from exc
 
     if body is None:
-        raise RuntimeError("Bedrock chat failed after retries.")
+        raise RuntimeError(
+            f"Bedrock chat failed after {max_retries} retries: {last_exc}"
+        )
 
     elapsed = time.monotonic() - t0
     # Converse format: {"output": {"message": {"content": [{"text": "..."}]}}}
@@ -621,21 +662,20 @@ def bedrock_extract(
                 },
             )
             break
-        except client.exceptions.ThrottlingException:
-            if attempt < max_retries - 1:
+        except Exception as exc:
+            if _is_bedrock_retryable(exc) and attempt < max_retries - 1:
                 wait = min(30 * (2 ** attempt), 300)
                 logger.warning(
-                    "Bedrock extraction throttled, retry %d/%d in %.0fs",
-                    attempt + 1, max_retries - 1, wait,
+                    "Bedrock extraction error (%s), retry %d/%d in %.0fs",
+                    exc, attempt + 1, max_retries - 1, wait,
                 )
                 time.sleep(wait)
+                client = _get_bedrock_client(region, profile=profile)
                 continue
             logger.error(
-                "Bedrock extraction throttled after %d attempts", max_retries,
+                "Bedrock extraction failed after %d attempt(s): %s",
+                attempt + 1, exc,
             )
-            return []
-        except Exception as exc:
-            logger.error("Bedrock extraction failed: %s", exc)
             return []
 
     if body is None:
@@ -691,20 +731,32 @@ def bedrock_embed(
 
     is_cohere = "cohere" in model.lower()
 
+    max_retries = 5
+
     if is_cohere:
         # Cohere supports batched embedding
         payload = json.dumps({
             "texts": texts,
             "input_type": "search_document",
         }).encode()
-        try:
-            resp = client.invoke_model(modelId=model, body=payload)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Bedrock embedding failed (model={model}): {exc}"
-            ) from exc
-        result = json.loads(resp["body"].read())
-        return result["embeddings"]
+        for attempt in range(max_retries):
+            try:
+                resp = client.invoke_model(modelId=model, body=payload)
+                result = json.loads(resp["body"].read())
+                return result["embeddings"]
+            except Exception as exc:
+                if _is_bedrock_retryable(exc) and attempt < max_retries - 1:
+                    wait = min(30 * (2 ** attempt), 300)
+                    logger.warning(
+                        "Bedrock embed error (%s), retry %d/%d in %.0fs",
+                        exc, attempt + 1, max_retries - 1, wait,
+                    )
+                    time.sleep(wait)
+                    client = _get_bedrock_client(region, profile=profile)
+                    continue
+                raise RuntimeError(
+                    f"Bedrock embedding failed (model={model}): {exc}"
+                ) from exc
     else:
         # Titan and other models — one text at a time
         embeddings: list[list[float]] = []
@@ -714,14 +766,25 @@ def bedrock_embed(
                 "dimensions": 1024,
                 "normalize": True,
             }).encode()
-            try:
-                resp = client.invoke_model(modelId=model, body=payload)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Bedrock embedding failed (model={model}): {exc}"
-                ) from exc
-            result = json.loads(resp["body"].read())
-            embeddings.append(result["embedding"])
+            for attempt in range(max_retries):
+                try:
+                    resp = client.invoke_model(modelId=model, body=payload)
+                    result = json.loads(resp["body"].read())
+                    embeddings.append(result["embedding"])
+                    break
+                except Exception as exc:
+                    if _is_bedrock_retryable(exc) and attempt < max_retries - 1:
+                        wait = min(30 * (2 ** attempt), 300)
+                        logger.warning(
+                            "Bedrock embed error (%s), retry %d/%d in %.0fs",
+                            exc, attempt + 1, max_retries - 1, wait,
+                        )
+                        time.sleep(wait)
+                        client = _get_bedrock_client(region, profile=profile)
+                        continue
+                    raise RuntimeError(
+                        f"Bedrock embedding failed (model={model}): {exc}"
+                    ) from exc
         return embeddings
 
 
@@ -5780,7 +5843,19 @@ def main():
     elif args.quiet:
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     else:
-        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        # Default: INFO messages print bare, WARNING+ get a level prefix
+        # so retry/error messages are clearly visible in console output.
+        class _DefaultFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                if record.levelno >= logging.WARNING:
+                    self._style._fmt = "%(levelname)s: %(message)s"
+                else:
+                    self._style._fmt = "%(message)s"
+                return super().format(record)
+
+        handler = logging.StreamHandler()
+        handler.setFormatter(_DefaultFormatter())
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
 
     # Commands that don't need the graph
     if args.list_models:

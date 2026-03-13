@@ -377,13 +377,14 @@ async def get_source_text(name: str, doc_id: str):
 
 
 @app.get("/upload", response_class=HTMLResponse)
-async def upload_page(request: Request):
+async def upload_page(request: Request, graph: str = ""):
     """Upload form page."""
-    logger.info("GET /upload — upload page")
+    logger.info("GET /upload — upload page (graph=%r)", graph)
     graphs = _list_graphs()
     return templates.TemplateResponse("upload.html", {
         "request": request,
         "graphs": graphs,
+        "selected_graph": graph.strip(),
     })
 
 
@@ -400,8 +401,10 @@ async def upload_files(
         "POST /upload graph=%r new_graph=%r files=%s",
         graph_name, new_graph_name, filenames,
     )
-    # Determine target graph
+    # Determine target graph ("__new__" is the sentinel from the dropdown)
     target = graph_name.strip()
+    if target == "__new__":
+        target = ""
     if new_graph_name.strip():
         target = _slugify(new_graph_name.strip())
         # Create the graph if it doesn't exist
