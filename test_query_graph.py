@@ -870,7 +870,8 @@ def test_claude_chat_http_429():
     exc = urllib.error.HTTPError(
         "https://api.anthropic.com/v1/messages", 429, "Too Many Requests", {}, None
     )
-    with patch("knowledge_graph.urllib.request.urlopen", side_effect=exc):
+    with patch("knowledge_graph.urllib.request.urlopen", side_effect=exc), \
+         patch("knowledge_graph.time.sleep"):
         with pytest.raises(RuntimeError, match="rate limited"):
             claude_chat("test", model="m", api_key="sk-test")
 

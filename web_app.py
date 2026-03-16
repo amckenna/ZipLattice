@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from knowledge_graph import (
@@ -94,7 +94,8 @@ def _list_graphs() -> list[dict[str, Any]]:
                 "edges": st.get("num_edges", 0),
                 "sources": len(sources),
             })
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to load graph '%s': %s", entry.name, exc)
             graphs.append({"name": entry.name, "nodes": "?", "edges": "?", "sources": "?"})
     return graphs
 
@@ -106,6 +107,7 @@ def _load_graph(name: str) -> KnowledgeGraph:
     try:
         json_file.resolve().relative_to(GRAPHS_DIR.resolve())
     except ValueError:
+        logger.warning("Path traversal attempt blocked: graph name=%r", name)
         raise ValueError(f"Invalid graph name: {name}")
     return KnowledgeGraph(json_file)
 
@@ -148,16 +150,89 @@ def _build_llm_fn(provider: str, model: str, api_url: str, *,
     return partial(ollama_chat, model=model, url=api_url)
 
 
-def _chat_multi_turn_local(
-    messages: list[dict[str, str]], *, model: str, url: str
+def _chat_multi_turn(
+    messages: list[dict[str, str]],
+    *,
+    provider: str,
+    model: str,
+    api_url: str = "",
+    bedrock_region: str = "",
+    bedrock_profile: str = "",
 ) -> str:
-    """Call an OpenAI-compatible chat completions endpoint with full history."""
+    """Call a chat completions endpoint with full conversation history.
+
+    Routes to the appropriate provider (local/anthropic/bedrock) and
+    handles provider-specific message formatting.
+    """
+    if provider == "anthropic":
+        import urllib.request
+        from knowledge_graph import _ANTHROPIC_API_URL, _ANTHROPIC_VERSION
+
+        api_key = _get_anthropic_api_key()
+        # Anthropic requires alternating user/assistant messages.
+        # System messages go via the ``system`` parameter.
+        system_text = ""
+        api_messages = []
+        for m in messages:
+            if m["role"] == "system":
+                system_text += m["content"] + "\n"
+            else:
+                api_messages.append({"role": m["role"], "content": m["content"]})
+
+        endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
+        body_dict: dict[str, Any] = {
+            "model": model, "max_tokens": 16384, "messages": api_messages,
+        }
+        if system_text.strip():
+            body_dict["system"] = system_text.strip()
+
+        payload = json.dumps(body_dict).encode()
+        req = urllib.request.Request(
+            endpoint, data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": _ANTHROPIC_VERSION,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=1200) as resp:
+            body = json.loads(resp.read())
+        return body["content"][0]["text"]
+
+    if provider == "bedrock":
+        from knowledge_graph import _get_bedrock_client
+
+        region = bedrock_region.strip() or None
+        profile = bedrock_profile.strip() or None
+        client = _get_bedrock_client(region, profile=profile)
+
+        system_parts: list[dict] = []
+        api_messages_br: list[dict] = []
+        for m in messages:
+            if m["role"] == "system":
+                system_parts.append({"text": m["content"]})
+            else:
+                api_messages_br.append({
+                    "role": m["role"],
+                    "content": [{"text": m["content"]}],
+                })
+
+        kwargs: dict[str, Any] = {
+            "modelId": model,
+            "messages": api_messages_br,
+            "inferenceConfig": {"maxTokens": 16384},
+        }
+        if system_parts:
+            kwargs["system"] = system_parts
+
+        resp = client.converse(**kwargs)
+        return resp["output"]["message"]["content"][0]["text"].strip()
+
+    # Default: local (OpenAI-compatible)
     import urllib.request
-    endpoint = f"{url.rstrip('/')}/v1/chat/completions"
+    endpoint = f"{api_url.rstrip('/')}/v1/chat/completions"
     payload = json.dumps({
-        "model": model,
-        "messages": messages,
-        "stream": False,
+        "model": model, "messages": messages, "stream": False,
     }).encode()
     req = urllib.request.Request(
         endpoint, data=payload,
@@ -166,81 +241,6 @@ def _chat_multi_turn_local(
     with urllib.request.urlopen(req, timeout=1200) as resp:
         body = json.loads(resp.read())
     return body["choices"][0]["message"]["content"]
-
-
-def _chat_multi_turn_anthropic(
-    messages: list[dict[str, str]], *, model: str, api_key: str
-) -> str:
-    """Call the Anthropic Messages API with full conversation history."""
-    import urllib.request
-    from knowledge_graph import _ANTHROPIC_API_URL, _ANTHROPIC_VERSION
-
-    # Anthropic requires alternating user/assistant messages.
-    # The first message must be a user message.  If we have a system-like
-    # preamble we pass it via the ``system`` parameter.
-    system_text = ""
-    api_messages = []
-    for m in messages:
-        role = m["role"]
-        if role == "system":
-            system_text += m["content"] + "\n"
-        else:
-            api_messages.append({"role": role, "content": m["content"]})
-
-    endpoint = f"{_ANTHROPIC_API_URL}/v1/messages"
-    body_dict: dict[str, Any] = {
-        "model": model,
-        "max_tokens": 16384,
-        "messages": api_messages,
-    }
-    if system_text.strip():
-        body_dict["system"] = system_text.strip()
-
-    payload = json.dumps(body_dict).encode()
-    req = urllib.request.Request(
-        endpoint, data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": _ANTHROPIC_VERSION,
-        },
-    )
-    with urllib.request.urlopen(req, timeout=1200) as resp:
-        body = json.loads(resp.read())
-    return body["content"][0]["text"]
-
-
-def _chat_multi_turn_bedrock(
-    messages: list[dict[str, str]], *, model: str, region: str | None = None,
-    profile: str | None = None,
-) -> str:
-    """Call AWS Bedrock Converse API with full conversation history."""
-    from knowledge_graph import _get_bedrock_client
-
-    client = _get_bedrock_client(region, profile=profile)
-
-    system_parts: list[dict] = []
-    api_messages: list[dict] = []
-    for m in messages:
-        role = m["role"]
-        if role == "system":
-            system_parts.append({"text": m["content"]})
-        else:
-            api_messages.append({
-                "role": role,
-                "content": [{"text": m["content"]}],
-            })
-
-    kwargs: dict[str, Any] = {
-        "modelId": model,
-        "messages": api_messages,
-        "inferenceConfig": {"maxTokens": 16384},
-    }
-    if system_parts:
-        kwargs["system"] = system_parts
-
-    resp = client.converse(**kwargs)
-    return resp["output"]["message"]["content"][0]["text"].strip()
 
 
 def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
@@ -262,6 +262,7 @@ def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
         md = convert(tmp_path)
         return md, None
     except Exception as exc:
+        logger.error("File conversion failed for '%s': %s", filename, exc)
         return "", str(exc)
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -320,7 +321,8 @@ async def graph_detail(request: Request, name: str):
         return RedirectResponse(url="/", status_code=303)
     try:
         kg = _load_graph(name)
-    except Exception:
+    except Exception as exc:
+        logger.error("Failed to load graph '%s': %s", name, exc)
         return RedirectResponse(url="/", status_code=303)
 
     cy = kg.cytoscape_elements()
@@ -368,11 +370,15 @@ async def get_source_text(name: str, doc_id: str):
     """Return the stored source text for a document."""
     json_file = GRAPHS_DIR / name / f"{name}.json"
     if not json_file.exists():
-        return {"error": "Graph not found"}, 404
-    kg = _load_graph(name)
+        return JSONResponse({"error": "Graph not found"}, status_code=404)
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        logger.error("Failed to load graph '%s' for source text: %s", name, exc)
+        return JSONResponse({"error": f"Cannot load graph: {exc}"}, status_code=500)
     text = kg.get_source_text(doc_id)
     if text is None:
-        return {"error": "Source not found"}, 404
+        return JSONResponse({"error": "Source not found"}, status_code=404)
     return {"doc_id": doc_id, "text": text}
 
 
@@ -496,6 +502,7 @@ async def ingest_documents(
         return json.dumps({"type": "log", "message": msg}) + "\n"
 
     def _stream():
+      try:
         _model = extract_model.strip() or query_model
         extract_fn = _build_extract_fn(provider, _model, api_url,
                                        bedrock_region=bedrock_region,
@@ -619,9 +626,13 @@ async def ingest_documents(
             logger.error("Embedding failed for graph '%s': %s", graph_name, exc)
             yield _log(f"  embedding failed: {exc}")
 
-        kg.save()
-        kg.save_embeddings()
-        yield _log("Graph saved.")
+        try:
+            kg.save()
+            kg.save_embeddings()
+            yield _log("Graph saved.")
+        except Exception as exc:
+            logger.error("Save failed for graph '%s': %s", graph_name, exc, exc_info=True)
+            yield _log(f"  save failed: {exc}")
 
         if _verbose:
             graph_stats_after = kg.stats()
@@ -634,6 +645,13 @@ async def ingest_documents(
         tpl = templates.env.get_template("partials/ingest_result.html")
         html = tpl.render(graph_name=graph_name, results=results, embed_count=embed_count)
         yield json.dumps({"type": "done", "html": html}) + "\n"
+      except Exception as exc:
+        logger.error(
+            "Unhandled error in ingest stream (graph=%s, provider=%s, model=%s): %s",
+            graph_name, provider, extract_model.strip() or query_model, exc,
+            exc_info=True,
+        )
+        yield json.dumps({"type": "error", "message": f"Internal error: {exc}"}) + "\n"
 
     return StreamingResponse(
         _stream(),
@@ -753,6 +771,10 @@ async def run_query(
                 "error": f"Unknown mode: {mode}",
             })
     except Exception as exc:
+        logger.error(
+            "Query failed (graph=%s, mode=%s, provider=%s, model=%s): %s",
+            graph_name, mode, provider, query_model, exc, exc_info=True,
+        )
         return templates.TemplateResponse("partials/query_result.html", {
             "request": request,
             "error": str(exc),
@@ -786,26 +808,15 @@ async def chat_follow_up(
     bedrock_profile = cfg.get("bedrock_profile", "")
 
     try:
-        if provider == "anthropic":
-            api_key = _get_anthropic_api_key()
-            answer = _chat_multi_turn_anthropic(
-                session["messages"], model=model, api_key=api_key,
-            )
-        elif provider == "bedrock":
-            region = bedrock_region.strip() or None
-            profile = bedrock_profile.strip() or None
-            answer = _chat_multi_turn_bedrock(
-                session["messages"], model=model, region=region,
-                profile=profile,
-            )
-        else:
-            answer = _chat_multi_turn_local(
-                session["messages"], model=model, url=api_url,
-            )
+        answer = _chat_multi_turn(
+            session["messages"],
+            provider=provider, model=model, api_url=api_url,
+            bedrock_region=bedrock_region, bedrock_profile=bedrock_profile,
+        )
     except Exception as exc:
         # Remove the failed user message so they can retry
         session["messages"].pop()
-        logger.error("Chat error session=%s: %s", session_id, exc)
+        logger.error("Chat error (session=%s, provider=%s, model=%s): %s", session_id, provider, model, exc, exc_info=True)
         return templates.TemplateResponse("partials/chat_message.html", {
             "request": request,
             "error": str(exc),
@@ -832,10 +843,15 @@ async def delete_graph(name: str):
     try:
         graph_dir.resolve().relative_to(GRAPHS_DIR.resolve())
     except ValueError:
+        logger.warning("Path traversal attempt blocked in delete: name=%r", name)
         return HTMLResponse(status_code=400, content="Invalid graph name")
     if not graph_dir.is_dir():
         return HTMLResponse(status_code=404, content="Graph not found")
-    shutil.rmtree(graph_dir)
+    try:
+        shutil.rmtree(graph_dir)
+    except Exception as exc:
+        logger.error("Failed to delete graph '%s': %s", name, exc)
+        return HTMLResponse(status_code=500, content=f"Delete failed: {exc}")
     response = HTMLResponse(content="")
     response.headers["HX-Redirect"] = "/"
     return response
@@ -849,33 +865,38 @@ async def export_graph(name: str):
     try:
         graph_dir.resolve().relative_to(GRAPHS_DIR.resolve())
     except ValueError:
+        logger.warning("Path traversal attempt blocked in export: name=%r", name)
         return HTMLResponse(status_code=400, content="Invalid graph name")
     json_file = graph_dir / f"{name}.json"
     if not json_file.exists():
         return HTMLResponse(status_code=404, content="Graph not found")
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file_path in sorted(graph_dir.rglob("*")):
-            if not file_path.is_file():
-                continue
-            arcname = str(Path(name) / file_path.relative_to(graph_dir))
-            if file_path == json_file:
-                # Rewrite absolute paths to relative for portability
-                data = json.loads(json_file.read_text(encoding="utf-8"))
-                sources = data.get("meta", {}).get("sources", {})
-                for entry in sources.values():
-                    entry["stored_path"] = _make_relative(
-                        entry.get("stored_path", ""), graph_dir
-                    )
-                    for ver in entry.get("versions", []):
-                        if "archived_to" in ver:
-                            ver["archived_to"] = _make_relative(
-                                ver["archived_to"], graph_dir
-                            )
-                zf.writestr(arcname, json.dumps(data, indent=2, cls=GraphEncoder))
-            else:
-                zf.write(file_path, arcname)
+    try:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in sorted(graph_dir.rglob("*")):
+                if not file_path.is_file():
+                    continue
+                arcname = str(Path(name) / file_path.relative_to(graph_dir))
+                if file_path == json_file:
+                    # Rewrite absolute paths to relative for portability
+                    data = json.loads(json_file.read_text(encoding="utf-8"))
+                    sources = data.get("meta", {}).get("sources", {})
+                    for entry in sources.values():
+                        entry["stored_path"] = _make_relative(
+                            entry.get("stored_path", ""), graph_dir
+                        )
+                        for ver in entry.get("versions", []):
+                            if "archived_to" in ver:
+                                ver["archived_to"] = _make_relative(
+                                    ver["archived_to"], graph_dir
+                                )
+                    zf.writestr(arcname, json.dumps(data, indent=2, cls=GraphEncoder))
+                else:
+                    zf.write(file_path, arcname)
+    except Exception as exc:
+        logger.error("Export failed for graph '%s': %s", name, exc, exc_info=True)
+        return HTMLResponse(status_code=500, content=f"Export failed: {exc}")
 
     buf.seek(0)
     return StreamingResponse(
