@@ -112,12 +112,22 @@ def _load_graph(name: str) -> KnowledgeGraph:
     return KnowledgeGraph(json_file)
 
 
+def _is_bedrock_embed_model(model: str) -> bool:
+    """Check if the model name looks like a Bedrock model ID.
+
+    Bedrock model IDs always contain a dot (e.g. ``amazon.titan-embed-text-v2:0``,
+    ``cohere.embed-english-v3``), while local model names typically don't
+    (e.g. ``qwen3-embedding``).
+    """
+    return "." in model
+
+
 def _build_embed_fn(
     embed_model: str, embed_url: str, *, provider: str = "local",
     bedrock_region: str = "", bedrock_profile: str = "",
 ) -> partial:
     """Build an embedding callable for search/query."""
-    if provider == "bedrock" and embed_model and not embed_model.startswith("qwen"):
+    if provider == "bedrock" and embed_model and _is_bedrock_embed_model(embed_model):
         region = bedrock_region.strip() or None
         profile = bedrock_profile.strip() or None
         return partial(bedrock_embed, model=embed_model, region=region, profile=profile)
@@ -555,32 +565,57 @@ async def ingest_documents(
                     elif evt == "section_done":
                         elapsed = ev.get("elapsed_seconds", 0)
                         triples = ev.get("triples_processed", 0)
-                        nodes = ev.get("nodes_added", 0)
-                        edges = ev.get("edges_added", 0)
-                        yield _log(f"    +{triples} triples, +{nodes} nodes, +{edges} edges ({elapsed}s)")
+                        nodes_added = ev.get("nodes_added", 0)
+                        nodes_updated = ev.get("nodes_updated", 0)
+                        edges_added = ev.get("edges_added", 0)
+                        edges_updated = ev.get("edges_updated", 0)
+                        # Build concise summary
+                        n_parts = []
+                        if nodes_added:
+                            n_parts.append(f"+{nodes_added} new")
+                        if nodes_updated:
+                            n_parts.append(f"{nodes_updated} updated")
+                        node_str = ", ".join(n_parts) if n_parts else "0"
+                        e_parts = []
+                        if edges_added:
+                            e_parts.append(f"+{edges_added} new")
+                        if edges_updated:
+                            e_parts.append(f"{edges_updated} updated")
+                        edge_str = ", ".join(e_parts) if e_parts else "0"
+                        yield _log(f"    {triples} triples → {node_str} nodes, {edge_str} edges ({elapsed}s)")
                         if _verbose:
-                            nodes_skipped = ev.get("nodes_skipped", 0)
-                            edges_skipped = ev.get("edges_skipped", 0)
                             proposals = ev.get("proposals_created", 0)
-                            extra_parts = []
-                            if nodes_skipped:
-                                extra_parts.append(f"{nodes_skipped} duplicate nodes skipped")
-                            if edges_skipped:
-                                extra_parts.append(f"{edges_skipped} duplicate edges skipped")
                             if proposals:
-                                extra_parts.append(f"{proposals} new relation proposal(s)")
-                            if extra_parts:
-                                yield _log(f"    ({', '.join(extra_parts)})")
+                                yield _log(f"    ({proposals} new relation proposal(s))")
                     elif evt == "section_skip":
                         yield _log(f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})")
 
-                yield _log(f"  done: {stats['total_triples']} triples, {stats['total_nodes_added']} nodes, {stats['total_edges_added']} edges")
+                _na = stats['total_nodes_added']
+                _nu = stats.get('total_nodes_updated', 0)
+                _ea = stats['total_edges_added']
+                _eu = stats.get('total_edges_updated', 0)
+                _n_str = f"{_na} added"
+                if _nu:
+                    _n_str += f", {_nu} updated"
+                _e_str = f"{_ea} added"
+                if _eu:
+                    _e_str += f", {_eu} updated"
+                yield _log(f"  done: {stats['total_triples']} triples → nodes: {_n_str} | edges: {_e_str}")
+
+                # Source version info
+                src = stats.get("source")
+                if src:
+                    ver = src.get("version", 1)
+                    if src.get("is_update"):
+                        yield _log(f"  source updated to v{ver}")
+                    elif src.get("is_duplicate"):
+                        yield _log(f"  warning: duplicate content (matches '{src['existing_doc_id']}')")
+                    elif ver > 1:
+                        yield _log(f"  source unchanged (v{ver})")
 
                 if _verbose:
                     yield _log(
-                        f"  detail: {stats.get('total_sections', 0)} sections processed, "
-                        f"{stats.get('total_nodes_skipped', 0)} nodes skipped (dup), "
-                        f"{stats.get('total_edges_skipped', 0)} edges skipped (dup), "
+                        f"  detail: {stats.get('total_sections', 0)} sections, "
                         f"{stats.get('total_proposals_created', 0)} proposals"
                     )
 
@@ -601,7 +636,9 @@ async def ingest_documents(
                     "total_sections": 0,
                     "total_triples": 0,
                     "total_nodes_added": 0,
+                    "total_nodes_updated": 0,
                     "total_edges_added": 0,
+                    "total_edges_updated": 0,
                     "error": str(exc),
                 })
 
@@ -609,7 +646,9 @@ async def ingest_documents(
         _embed_url = embed_url.strip() or api_url
         embed_count = 0
         yield _log("Embedding new nodes...")
-        if _verbose:
+        if provider == "bedrock" and embed_model and _is_bedrock_embed_model(embed_model):
+            yield _log(f"  embed config: model={embed_model} (bedrock, region={bedrock_region or 'default'}, profile={bedrock_profile or 'default'})")
+        else:
             yield _log(f"  embed config: model={embed_model} url={_embed_url}")
         try:
             efn = _build_embed_fn(embed_model, _embed_url,

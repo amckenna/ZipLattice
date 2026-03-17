@@ -11,8 +11,10 @@
         <th class="pb-1 font-normal">Document</th>
         <th class="pb-1 font-normal text-right">Sections</th>
         <th class="pb-1 font-normal text-right">Triples</th>
-        <th class="pb-1 font-normal text-right">Nodes</th>
-        <th class="pb-1 font-normal text-right">Edges</th>
+        <th class="pb-1 font-normal text-right">Nodes +new</th>
+        <th class="pb-1 font-normal text-right">~updated</th>
+        <th class="pb-1 font-normal text-right">Edges +new</th>
+        <th class="pb-1 font-normal text-right">~updated</th>
       </tr>
     </thead>
     <tbody>
@@ -22,7 +24,9 @@
         <td class="py-1 text-right text-gray-400">{{ r.total_sections }}</td>
         <td class="py-1 text-right text-gray-400">{{ r.total_triples }}</td>
         <td class="py-1 text-right text-gray-400">{{ r.total_nodes_added }}</td>
+        <td class="py-1 text-right text-gray-400">{{ r.total_nodes_updated|default(0) }}</td>
         <td class="py-1 text-right text-gray-400">{{ r.total_edges_added }}</td>
+        <td class="py-1 text-right text-gray-400">{{ r.total_edges_updated|default(0) }}</td>
       </tr>
       {% endfor %}
     </tbody>
