@@ -4129,6 +4129,8 @@ TEXT:
                     "nodes_updated": section_stats["nodes_updated"],
                     "edges_added": section_stats["edges_added"],
                     "edges_updated": section_stats["edges_updated"],
+                    "proposals_created": section_stats["proposals_created"],
+                    "proposals_augmented": section_stats["proposals_augmented"],
                     "errors": section_stats["errors"],
                 })
 

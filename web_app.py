@@ -25,6 +25,7 @@ import shutil
 import tempfile
 import time
 import uuid
+import threading
 import zipfile
 from functools import partial
 from pathlib import Path
@@ -47,6 +48,34 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("web_app")
+
+# ---------------------------------------------------------------------------
+# Log-capture handler: captures knowledge_graph log records so they can be
+# streamed to the web UI in verbose mode.
+# ---------------------------------------------------------------------------
+
+class _LogCaptureHandler(logging.Handler):
+    """Accumulates formatted log records into a thread-safe list."""
+
+    def __init__(self, level: int = logging.DEBUG):
+        super().__init__(level)
+        self._records: list[str] = []
+        self._lock = threading.Lock()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with self._lock:
+                self._records.append(msg)
+        except Exception:
+            self.handleError(record)
+
+    def drain(self) -> list[str]:
+        """Return and clear all captured messages."""
+        with self._lock:
+            msgs = self._records[:]
+            self._records.clear()
+        return msgs
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -512,6 +541,24 @@ async def ingest_documents(
         return json.dumps({"type": "log", "message": msg}) + "\n"
 
     def _stream():
+      # Attach a log-capture handler to surface knowledge_graph logs in verbose mode
+      kg_logger = logging.getLogger("knowledge_graph")
+      capture_handler: _LogCaptureHandler | None = None
+      _prev_kg_level = kg_logger.level
+      if _verbose:
+          capture_handler = _LogCaptureHandler(level=logging.DEBUG)
+          capture_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+          # Ensure the knowledge_graph logger emits DEBUG+ so the handler sees them
+          kg_logger.setLevel(logging.DEBUG)
+          kg_logger.addHandler(capture_handler)
+
+      def _drain_captured():
+          """Yield any captured knowledge_graph log messages."""
+          if capture_handler is None:
+              return
+          for msg in capture_handler.drain():
+              yield _log(f"  [kg] {msg}")
+
       try:
         _model = extract_model.strip() or query_model
         extract_fn = _build_extract_fn(provider, _model, api_url,
@@ -554,6 +601,9 @@ async def ingest_documents(
                 )
                 results.append(stats)
 
+                # Drain any captured knowledge_graph logs (verbose mode)
+                yield from _drain_captured()
+
                 # Replay captured progress events as log lines
                 for ev in section_events:
                     evt = ev.get("event", "")
@@ -564,7 +614,7 @@ async def ingest_documents(
                         yield _log(f"  section {idx}/{total}: {heading} ({ev.get('char_count', 0)} chars)...")
                     elif evt == "section_done":
                         elapsed = ev.get("elapsed_seconds", 0)
-                        triples = ev.get("triples_processed", 0)
+                        triples = ev.get("triples", 0)
                         nodes_added = ev.get("nodes_added", 0)
                         nodes_updated = ev.get("nodes_updated", 0)
                         edges_added = ev.get("edges_added", 0)
@@ -585,8 +635,14 @@ async def ingest_documents(
                         yield _log(f"    {triples} triples → {node_str} nodes, {edge_str} edges ({elapsed}s)")
                         if _verbose:
                             proposals = ev.get("proposals_created", 0)
+                            augmented = ev.get("proposals_augmented", 0)
                             if proposals:
                                 yield _log(f"    ({proposals} new relation proposal(s))")
+                            if augmented:
+                                yield _log(f"    ({augmented} existing proposal(s) augmented)")
+                            errors = ev.get("errors", [])
+                            for err in errors:
+                                yield _log(f"    warning: {err}")
                     elif evt == "section_skip":
                         yield _log(f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})")
 
@@ -664,6 +720,7 @@ async def ingest_documents(
         except Exception as exc:
             logger.error("Embedding failed for graph '%s': %s", graph_name, exc)
             yield _log(f"  embedding failed: {exc}")
+        yield from _drain_captured()
 
         try:
             kg.save()
@@ -691,6 +748,10 @@ async def ingest_documents(
             exc_info=True,
         )
         yield json.dumps({"type": "error", "message": f"Internal error: {exc}"}) + "\n"
+      finally:
+        if capture_handler is not None:
+            kg_logger.removeHandler(capture_handler)
+            kg_logger.setLevel(_prev_kg_level)
 
     return StreamingResponse(
         _stream(),
