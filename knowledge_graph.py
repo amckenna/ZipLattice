@@ -2612,6 +2612,9 @@ class KnowledgeGraph:
             logger.info("No nodes to embed (all skipped or no matches).")
             return stats
 
+        total_to_embed = len(candidates)
+        logger.info("Preparing to embed %d nodes...", total_to_embed)
+
         # Build embedding texts
         texts: list[tuple[str, str]] = []  # (node_id, text)
         for nid in candidates:
@@ -2629,10 +2632,18 @@ class KnowledgeGraph:
                 logger.warning("Failed to build embedding text for '%s': %s", nid, e)
 
         # Process in batches
-        for batch_start in range(0, len(texts), batch_size):
+        total_texts = len(texts)
+        total_batches = (total_texts + batch_size - 1) // batch_size
+        for batch_start in range(0, total_texts, batch_size):
             batch = texts[batch_start:batch_start + batch_size]
             batch_texts = [t for _, t in batch]
             batch_ids = [nid for nid, _ in batch]
+            batch_num = stats["batches"] + 1
+
+            logger.info(
+                "Embedding batch %d/%d (%d nodes)...",
+                batch_num, total_batches, len(batch_ids),
+            )
 
             try:
                 embeddings = embed_fn(batch_texts)
@@ -2649,6 +2660,10 @@ class KnowledgeGraph:
                 for nid, emb in zip(batch_ids, embeddings):
                     self._embeddings[nid] = emb
                     stats["nodes_embedded"] += 1
+                    logger.info(
+                        "  Embedded node %d/%d: '%s' (dim=%d)",
+                        stats["nodes_embedded"], total_texts, nid, len(emb),
+                    )
 
                 self._dirty_embeddings = True
                 stats["batches"] += 1
