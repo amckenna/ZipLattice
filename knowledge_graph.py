@@ -4424,6 +4424,8 @@ TEXT:
             "num_nodes": self.num_nodes,
             "num_edges": self.num_edges,
             "num_embeddings": len(self._embeddings),
+            "embed_model": self.embed_model,
+            "embed_dim": self.embed_dim,
             "nodes_without_embeddings": len(self.nodes_without_embeddings()),
             "node_type_distribution": dict(type_counts),
             "relation_distribution": dict(relation_counts),
@@ -5788,6 +5790,8 @@ def main():
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
                         help="Verify integrity of stored source files")
+    parser.add_argument("--verify-embeddings", action="store_true",
+                        help="Check embedding integrity: dimensions, zero vectors, coverage")
     parser.add_argument("--list-models", action="store_true",
                         help="List models available on the API server and exit")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -6076,9 +6080,13 @@ def main():
                     _bp = args.bedrock_profile
                     def _embed_fn(batch: list[str]) -> list[list[float]]:
                         return bedrock_embed(batch, model=_embed_model, region=_br, profile=_bp)
+                    if not _quiet:
+                        print(f"  Embed config: model='{_embed_model}' (bedrock, region={_br or 'default'}, profile={_bp or 'default'})")
                 else:
                     def _embed_fn(batch: list[str]) -> list[list[float]]:
                         return ollama_embed(batch, model=_embed_model, url=_embed_url)
+                    if not _quiet:
+                        print(f"  Embed config: model='{_embed_model}' url='{_embed_url}'")
 
                 if not _quiet:
                     print(f"  Embedding nodes with {_embed_model}...", end="", flush=True)
@@ -6224,15 +6232,68 @@ def main():
                     if k not in ('doc_id', 'issue'):
                         print(f"    {k}: {v}")
 
+    if args.verify_embeddings:
+        emb_count = len(kg._embeddings)
+        if emb_count == 0:
+            print("No embeddings found.")
+        else:
+            model = kg.embed_model or "(unknown)"
+            dim = kg.embed_dim
+            missing = kg.nodes_without_embeddings()
+            # Check for issues
+            zero_vectors = []
+            dim_mismatches = []
+            first_dim = None
+            for nid, vec in kg._embeddings.items():
+                if first_dim is None:
+                    first_dim = len(vec)
+                if all(v == 0.0 for v in vec):
+                    zero_vectors.append(nid)
+                if len(vec) != first_dim:
+                    dim_mismatches.append((nid, len(vec)))
+
+            print(f"  Embeddings: {emb_count}")
+            print(f"  Model: {model}")
+            print(f"  Dimension: {dim or first_dim}")
+            print(f"  Nodes without embeddings: {len(missing)}")
+            if missing and len(missing) <= 10:
+                for nid in missing:
+                    print(f"    - {nid}")
+            elif missing:
+                for nid in missing[:5]:
+                    print(f"    - {nid}")
+                print(f"    ... and {len(missing) - 5} more")
+
+            if zero_vectors:
+                print(f"  WARNING: {len(zero_vectors)} zero vector(s) detected (embedding may have failed):")
+                for nid in zero_vectors[:5]:
+                    print(f"    - {nid}")
+                if len(zero_vectors) > 5:
+                    print(f"    ... and {len(zero_vectors) - 5} more")
+
+            if dim_mismatches:
+                print(f"  WARNING: {len(dim_mismatches)} dimension mismatch(es):")
+                for nid, d in dim_mismatches[:5]:
+                    print(f"    - {nid}: {d} (expected {first_dim})")
+
+            if not zero_vectors and not dim_mismatches:
+                # Show a sample embedding to confirm non-trivial values
+                sample_nid = next(iter(kg._embeddings))
+                sample_vec = kg._embeddings[sample_nid]
+                preview = ", ".join(f"{v:.4f}" for v in sample_vec[:5])
+                print(f"  Sample ({sample_nid}): [{preview}, ...] (len={len(sample_vec)})")
+                print("  OK — all embeddings look valid.")
+
     if not any([args.stats, args.node, args.neighbors, args.split,
                 args.proposals, args.accept, args.accept_all, args.reject,
                 args.patterns, args.pyvis, args.cytoscape,
                 args.preview_md, args.ingest_md,
-                args.sources, args.check_sources]):
+                args.sources, args.check_sources, args.verify_embeddings]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
               f"--accept, --accept-all, --reject, --patterns, --pyvis, --cytoscape, "
-              f"--preview-md, --ingest-md, --sources, --check-sources for details.")
+              f"--preview-md, --ingest-md, --sources, --check-sources, "
+              f"--verify-embeddings for details.")
 
 
 if __name__ == "__main__":
