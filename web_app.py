@@ -684,6 +684,14 @@ async def ingest_documents(
                         accepted += 1
                     if accepted:
                         yield _log(f"  auto-accepted {accepted} relation proposal(s)")
+
+                # Incremental save after each document so progress survives
+                # client disconnects (e.g. network timeout during embedding)
+                try:
+                    kg.save()
+                except Exception as save_exc:
+                    logger.error("Incremental save failed for graph '%s': %s", graph_name, save_exc)
+                    yield _log(f"  warning: incremental save failed: {save_exc}")
             except Exception as exc:
                 logger.error("Ingestion error for doc '%s' (provider=%s, model=%s): %s", doc["doc_id"], provider, _model, exc, exc_info=_verbose)
                 yield _log(f"  error (model={_model}): {exc}")
@@ -712,6 +720,8 @@ async def ingest_documents(
                                  bedrock_profile=bedrock_profile)
             embed_stats = kg.embed_nodes(efn, skip_existing=True, model_name=embed_model)
             embed_count = embed_stats.get("nodes_embedded", 0)
+            # Save embeddings immediately so they survive client disconnects
+            kg.save_embeddings()
             yield _log(f"  embedded {embed_count} nodes")
             if _verbose:
                 skipped = embed_stats.get("nodes_skipped", 0)
