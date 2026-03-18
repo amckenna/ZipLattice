@@ -402,6 +402,7 @@ async def graph_detail(request: Request, name: str):
         "type_colors_json": json.dumps(cy["type_colors"]),
         "relation_colors_json": json.dumps(cy["relation_colors"]),
         "stats_json": json.dumps(cy["stats"]),
+        "has_positions": cy.get("has_positions", False),
     })
 
 
