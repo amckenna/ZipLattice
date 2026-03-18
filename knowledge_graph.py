@@ -2612,6 +2612,9 @@ class KnowledgeGraph:
             logger.info("No nodes to embed (all skipped or no matches).")
             return stats
 
+        total_to_embed = len(candidates)
+        logger.info("Preparing to embed %d nodes...", total_to_embed)
+
         # Build embedding texts
         texts: list[tuple[str, str]] = []  # (node_id, text)
         for nid in candidates:
@@ -2629,10 +2632,18 @@ class KnowledgeGraph:
                 logger.warning("Failed to build embedding text for '%s': %s", nid, e)
 
         # Process in batches
-        for batch_start in range(0, len(texts), batch_size):
+        total_texts = len(texts)
+        total_batches = (total_texts + batch_size - 1) // batch_size
+        for batch_start in range(0, total_texts, batch_size):
             batch = texts[batch_start:batch_start + batch_size]
             batch_texts = [t for _, t in batch]
             batch_ids = [nid for nid, _ in batch]
+            batch_num = stats["batches"] + 1
+
+            logger.info(
+                "Embedding batch %d/%d (%d nodes)...",
+                batch_num, total_batches, len(batch_ids),
+            )
 
             try:
                 embeddings = embed_fn(batch_texts)
@@ -2649,6 +2660,10 @@ class KnowledgeGraph:
                 for nid, emb in zip(batch_ids, embeddings):
                     self._embeddings[nid] = emb
                     stats["nodes_embedded"] += 1
+                    logger.info(
+                        "  Embedded node %d/%d: '%s' (dim=%d)",
+                        stats["nodes_embedded"], total_texts, nid, len(emb),
+                    )
 
                 self._dirty_embeddings = True
                 stats["batches"] += 1
@@ -3107,7 +3122,9 @@ TEXT:
         stats = {
             "triples_processed": 0,
             "nodes_added": 0,
+            "nodes_updated": 0,
             "edges_added": 0,
+            "edges_updated": 0,
             "proposals_created": 0,
             "proposals_augmented": 0,
             "errors": [],
@@ -3195,13 +3212,16 @@ TEXT:
             content_hash: Content hash of the source document.
 
         Returns:
-            Stats dict: nodes_added, edges_added, proposals_created,
-            proposals_augmented, triples_processed, errors.
+            Stats dict: nodes_added, nodes_updated, edges_added,
+            edges_updated, proposals_created, proposals_augmented,
+            triples_processed, errors.
         """
         stats: dict[str, Any] = {
             "triples_processed": 0,
             "nodes_added": 0,
+            "nodes_updated": 0,
             "edges_added": 0,
+            "edges_updated": 0,
             "proposals_created": 0,
             "proposals_augmented": 0,
             "errors": [],
@@ -3440,16 +3460,18 @@ TEXT:
                             confidence=conf,
                         )
                         stats["nodes_added"] += 1
-                    elif desc:
-                        # Node already exists — merge description
-                        existing = self._data["nodes"].get(nid, {})
-                        existing.setdefault("properties", {})
-                        _merge_description(
-                            existing["properties"], desc, doc_id, conf,
-                        )
-                        # Sync networkx
-                        self._G.nodes[nid].update(existing)
-                        self._dirty = True
+                    else:
+                        # Node already exists — merge description if available
+                        if desc:
+                            existing = self._data["nodes"].get(nid, {})
+                            existing.setdefault("properties", {})
+                            _merge_description(
+                                existing["properties"], desc, doc_id, conf,
+                            )
+                            # Sync networkx
+                            self._G.nodes[nid].update(existing)
+                            self._dirty = True
+                        stats["nodes_updated"] += 1
 
                     # --- Entity span tracking ---
                     spans = find_entity_spans(text, label)
@@ -3521,6 +3543,7 @@ TEXT:
                 if content_hash:
                     edge_props["content_hash"] = content_hash
 
+                _edge_existed = (source_id, target_id, effective_relation) in self._edge_index
                 self.add_edge(
                     source_id,
                     target_id,
@@ -3530,7 +3553,10 @@ TEXT:
                     confidence=edge_conf,
                     _skip_auto_register=skip_register,
                 )
-                stats["edges_added"] += 1
+                if _edge_existed:
+                    stats["edges_updated"] += 1
+                else:
+                    stats["edges_added"] += 1
 
             except Exception as e:
                 stats["errors"].append(f"Triple processing error: {e} — {triple}")
@@ -3867,7 +3893,9 @@ TEXT:
             "total_sections": 0,
             "total_triples": 0,
             "total_nodes_added": 0,
+            "total_nodes_updated": 0,
             "total_edges_added": 0,
+            "total_edges_updated": 0,
             "total_proposals_created": 0,
             "total_proposals_augmented": 0,
             "source": None,
@@ -4087,7 +4115,9 @@ TEXT:
             # Accumulate stats
             aggregate_stats["total_triples"] += section_stats["triples_processed"]
             aggregate_stats["total_nodes_added"] += section_stats["nodes_added"]
+            aggregate_stats["total_nodes_updated"] += section_stats["nodes_updated"]
             aggregate_stats["total_edges_added"] += section_stats["edges_added"]
+            aggregate_stats["total_edges_updated"] += section_stats["edges_updated"]
             aggregate_stats["total_proposals_created"] += section_stats["proposals_created"]
             aggregate_stats["total_proposals_augmented"] += section_stats["proposals_augmented"]
             section_record = {
@@ -4111,6 +4141,11 @@ TEXT:
                     "elapsed_seconds": round(elapsed, 1),
                     "triples": section_stats["triples_processed"],
                     "nodes_added": section_stats["nodes_added"],
+                    "nodes_updated": section_stats["nodes_updated"],
+                    "edges_added": section_stats["edges_added"],
+                    "edges_updated": section_stats["edges_updated"],
+                    "proposals_created": section_stats["proposals_created"],
+                    "proposals_augmented": section_stats["proposals_augmented"],
                     "errors": section_stats["errors"],
                 })
 
@@ -4132,11 +4167,14 @@ TEXT:
                 ]
 
         logger.info(
-            "Markdown ingest '%s': %d sections, %d triples → %d nodes, %d edges",
+            "Markdown ingest '%s': %d sections, %d triples → "
+            "%d nodes added (%d updated), %d edges added (%d updated)",
             doc_id, aggregate_stats["total_sections"],
             aggregate_stats["total_triples"],
             aggregate_stats["total_nodes_added"],
+            aggregate_stats["total_nodes_updated"],
             aggregate_stats["total_edges_added"],
+            aggregate_stats["total_edges_updated"],
         )
         return aggregate_stats
 
@@ -4424,6 +4462,8 @@ TEXT:
             "num_nodes": self.num_nodes,
             "num_edges": self.num_edges,
             "num_embeddings": len(self._embeddings),
+            "embed_model": self.embed_model,
+            "embed_dim": self.embed_dim,
             "nodes_without_embeddings": len(self.nodes_without_embeddings()),
             "node_type_distribution": dict(type_counts),
             "relation_distribution": dict(relation_counts),
@@ -5788,6 +5828,8 @@ def main():
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
                         help="Verify integrity of stored source files")
+    parser.add_argument("--verify-embeddings", action="store_true",
+                        help="Check embedding integrity: dimensions, zero vectors, coverage")
     parser.add_argument("--list-models", action="store_true",
                         help="List models available on the API server and exit")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -6003,23 +6045,37 @@ def main():
                 elapsed = event.get("elapsed_seconds", 0)
                 triples = event.get("triples", 0)
                 nodes_added = event.get("nodes_added", 0)
+                nodes_updated = event.get("nodes_updated", 0)
+                edges_added = event.get("edges_added", 0)
+                edges_updated = event.get("edges_updated", 0)
                 errors = event.get("errors", [])
-                if errors and nodes_added == 0 and triples > 0:
-                    print(f" {triples} triples → 0 nodes ({len(errors)} errors, {elapsed}s)")
-                    if _verbose:
-                        for err in errors[:5]:
-                            print(f"         {err}")
-                        if len(errors) > 5:
-                            print(f"         ... and {len(errors) - 5} more")
-                elif errors:
-                    print(f" {triples} triples → {nodes_added} nodes ({len(errors)} errors, {elapsed}s)")
+                # Build concise node/edge summary
+                parts = []
+                if nodes_added:
+                    parts.append(f"{nodes_added} new")
+                if nodes_updated:
+                    parts.append(f"{nodes_updated} updated")
+                node_summary = "+".join(parts) + " nodes" if parts else "0 nodes"
+                edge_parts = []
+                if edges_added:
+                    edge_parts.append(f"{edges_added} new")
+                if edges_updated:
+                    edge_parts.append(f"{edges_updated} updated")
+                edge_summary = ("+".join(edge_parts) + " edges") if edge_parts else ""
+
+                result_str = node_summary
+                if edge_summary:
+                    result_str += f", {edge_summary}"
+
+                if errors:
+                    print(f" {triples} triples → {result_str} ({len(errors)} errors, {elapsed}s)")
                     if _verbose:
                         for err in errors[:5]:
                             print(f"         {err}")
                         if len(errors) > 5:
                             print(f"         ... and {len(errors) - 5} more")
                 else:
-                    print(f" {triples} triples → {nodes_added} nodes ({elapsed}s)")
+                    print(f" {triples} triples → {result_str} ({elapsed}s)")
 
         # Resolve embed model once (shared across all files)
         _embed_model = None
@@ -6076,9 +6132,13 @@ def main():
                     _bp = args.bedrock_profile
                     def _embed_fn(batch: list[str]) -> list[list[float]]:
                         return bedrock_embed(batch, model=_embed_model, region=_br, profile=_bp)
+                    if not _quiet:
+                        print(f"  Embed config: model='{_embed_model}' (bedrock, region={_br or 'default'}, profile={_bp or 'default'})")
                 else:
                     def _embed_fn(batch: list[str]) -> list[list[float]]:
                         return ollama_embed(batch, model=_embed_model, url=_embed_url)
+                    if not _quiet:
+                        print(f"  Embed config: model='{_embed_model}' url='{_embed_url}'")
 
                 if not _quiet:
                     print(f"  Embedding nodes with {_embed_model}...", end="", flush=True)
@@ -6111,7 +6171,18 @@ def main():
             print(f"  Document ID: {stats['doc_id']}")
             print(f"  Sections: {stats['total_sections']}")
             print(f"  Triples extracted: {stats['total_triples']}")
-            print(f"  Nodes added: {stats['total_nodes_added']}, Edges added: {stats['total_edges_added']}")
+            _n_added = stats['total_nodes_added']
+            _n_updated = stats['total_nodes_updated']
+            _e_added = stats['total_edges_added']
+            _e_updated = stats['total_edges_updated']
+            node_str = f"{_n_added} added"
+            if _n_updated:
+                node_str += f", {_n_updated} updated"
+            edge_str = f"{_e_added} added"
+            if _e_updated:
+                edge_str += f", {_e_updated} updated"
+            print(f"  Nodes: {node_str}")
+            print(f"  Edges: {edge_str}")
             print(f"  Total time: {_total_elapsed:.1f}s")
             print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
             if _embed_stats and _embed_stats["nodes_embedded"]:
@@ -6125,8 +6196,14 @@ def main():
                 src = stats["source"]
                 if src.get("is_duplicate"):
                     print(f"  Warning: duplicate content (matches '{src['existing_doc_id']}')")
+                elif src.get("is_update"):
+                    print(f"  Source updated: v{src['version']} ({src['stored_path']})")
                 else:
-                    print(f"  Source stored: {src['stored_path']}")
+                    ver = src.get("version", 1)
+                    if ver > 1:
+                        print(f"  Source unchanged: v{ver} ({src['stored_path']})")
+                    else:
+                        print(f"  Source stored: v{ver} ({src['stored_path']})")
 
             # Show section breakdown (verbose only)
             if _verbose:
@@ -6141,12 +6218,23 @@ def main():
                         triples_info = ""
                         n_triples = sec_stat.get("triples_processed", 0)
                         n_nodes = sec_stat.get("nodes_added", 0)
+                        n_nodes_upd = sec_stat.get("nodes_updated", 0)
+                        n_edges = sec_stat.get("edges_added", 0)
+                        n_edges_upd = sec_stat.get("edges_updated", 0)
                         n_errors = len(sec_stat.get("errors", []))
                         if n_triples:
                             triples_info = f", {n_triples} triples"
-                        if n_triples and n_nodes == 0 and n_errors:
+                        if n_nodes:
+                            triples_info += f", {n_nodes} new nodes"
+                        if n_nodes_upd:
+                            triples_info += f", {n_nodes_upd} updated nodes"
+                        if n_edges:
+                            triples_info += f", {n_edges} new edges"
+                        if n_edges_upd:
+                            triples_info += f", {n_edges_upd} updated edges"
+                        if n_triples and n_nodes == 0 and n_nodes_upd == 0 and n_errors:
                             tag = "WARN"
-                            triples_info += f", 0 nodes, {n_errors} errors"
+                            triples_info += f", {n_errors} errors"
                         else:
                             tag = "ok"
                         print(f"    [{tag}]   {heading} ({sec_stat.get('char_count', 0):,} chars{triples_info}{elapsed_str})")
@@ -6160,13 +6248,22 @@ def main():
         if len(_all_stats) > 1:
             _batch_elapsed = time.monotonic() - _batch_t0
             total_triples = sum(s["stats"]["total_triples"] for s in _all_stats)
-            total_nodes = sum(s["stats"]["total_nodes_added"] for s in _all_stats)
-            total_edges = sum(s["stats"]["total_edges_added"] for s in _all_stats)
+            total_nodes_added = sum(s["stats"]["total_nodes_added"] for s in _all_stats)
+            total_nodes_updated = sum(s["stats"]["total_nodes_updated"] for s in _all_stats)
+            total_edges_added = sum(s["stats"]["total_edges_added"] for s in _all_stats)
+            total_edges_updated = sum(s["stats"]["total_edges_updated"] for s in _all_stats)
             graph_stats = kg.stats()
             print(f"\n{'='*60}")
             print(f"  Batch complete: {len(_all_stats)} files ingested")
             print(f"  Total triples: {total_triples}")
-            print(f"  Total nodes added: {total_nodes}, edges added: {total_edges}")
+            _bn = f"{total_nodes_added} added"
+            if total_nodes_updated:
+                _bn += f", {total_nodes_updated} updated"
+            _be = f"{total_edges_added} added"
+            if total_edges_updated:
+                _be += f", {total_edges_updated} updated"
+            print(f"  Total nodes: {_bn}"  )
+            print(f"  Total edges: {_be}")
             print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
             print(f"  Total time: {_batch_elapsed:.1f}s")
             print(f"{'='*60}")
@@ -6224,15 +6321,68 @@ def main():
                     if k not in ('doc_id', 'issue'):
                         print(f"    {k}: {v}")
 
+    if args.verify_embeddings:
+        emb_count = len(kg._embeddings)
+        if emb_count == 0:
+            print("No embeddings found.")
+        else:
+            model = kg.embed_model or "(unknown)"
+            dim = kg.embed_dim
+            missing = kg.nodes_without_embeddings()
+            # Check for issues
+            zero_vectors = []
+            dim_mismatches = []
+            first_dim = None
+            for nid, vec in kg._embeddings.items():
+                if first_dim is None:
+                    first_dim = len(vec)
+                if all(v == 0.0 for v in vec):
+                    zero_vectors.append(nid)
+                if len(vec) != first_dim:
+                    dim_mismatches.append((nid, len(vec)))
+
+            print(f"  Embeddings: {emb_count}")
+            print(f"  Model: {model}")
+            print(f"  Dimension: {dim or first_dim}")
+            print(f"  Nodes without embeddings: {len(missing)}")
+            if missing and len(missing) <= 10:
+                for nid in missing:
+                    print(f"    - {nid}")
+            elif missing:
+                for nid in missing[:5]:
+                    print(f"    - {nid}")
+                print(f"    ... and {len(missing) - 5} more")
+
+            if zero_vectors:
+                print(f"  WARNING: {len(zero_vectors)} zero vector(s) detected (embedding may have failed):")
+                for nid in zero_vectors[:5]:
+                    print(f"    - {nid}")
+                if len(zero_vectors) > 5:
+                    print(f"    ... and {len(zero_vectors) - 5} more")
+
+            if dim_mismatches:
+                print(f"  WARNING: {len(dim_mismatches)} dimension mismatch(es):")
+                for nid, d in dim_mismatches[:5]:
+                    print(f"    - {nid}: {d} (expected {first_dim})")
+
+            if not zero_vectors and not dim_mismatches:
+                # Show a sample embedding to confirm non-trivial values
+                sample_nid = next(iter(kg._embeddings))
+                sample_vec = kg._embeddings[sample_nid]
+                preview = ", ".join(f"{v:.4f}" for v in sample_vec[:5])
+                print(f"  Sample ({sample_nid}): [{preview}, ...] (len={len(sample_vec)})")
+                print("  OK — all embeddings look valid.")
+
     if not any([args.stats, args.node, args.neighbors, args.split,
                 args.proposals, args.accept, args.accept_all, args.reject,
                 args.patterns, args.pyvis, args.cytoscape,
                 args.preview_md, args.ingest_md,
-                args.sources, args.check_sources]):
+                args.sources, args.check_sources, args.verify_embeddings]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
               f"--accept, --accept-all, --reject, --patterns, --pyvis, --cytoscape, "
-              f"--preview-md, --ingest-md, --sources, --check-sources for details.")
+              f"--preview-md, --ingest-md, --sources, --check-sources, "
+              f"--verify-embeddings for details.")
 
 
 if __name__ == "__main__":

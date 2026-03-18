@@ -147,8 +147,10 @@ def ingest_triples(
         doc_id=doc_id,
     )
     logger.info(
-        "ingest_triples: done — nodes_added=%d, edges_added=%d",
-        stats.get("total_nodes_added", 0), stats.get("total_edges_added", 0),
+        "ingest_triples: done — nodes_added=%d, nodes_updated=%d, "
+        "edges_added=%d, edges_updated=%d",
+        stats.get("nodes_added", 0), stats.get("nodes_updated", 0),
+        stats.get("edges_added", 0), stats.get("edges_updated", 0),
     )
     if auto_save:
         kg.save()

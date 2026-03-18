@@ -25,6 +25,7 @@ import shutil
 import tempfile
 import time
 import uuid
+import threading
 import zipfile
 from functools import partial
 from pathlib import Path
@@ -47,6 +48,34 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("web_app")
+
+# ---------------------------------------------------------------------------
+# Log-capture handler: captures knowledge_graph log records so they can be
+# streamed to the web UI in verbose mode.
+# ---------------------------------------------------------------------------
+
+class _LogCaptureHandler(logging.Handler):
+    """Accumulates formatted log records into a thread-safe list."""
+
+    def __init__(self, level: int = logging.DEBUG):
+        super().__init__(level)
+        self._records: list[str] = []
+        self._lock = threading.Lock()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with self._lock:
+                self._records.append(msg)
+        except Exception:
+            self.handleError(record)
+
+    def drain(self) -> list[str]:
+        """Return and clear all captured messages."""
+        with self._lock:
+            msgs = self._records[:]
+            self._records.clear()
+        return msgs
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -112,12 +141,22 @@ def _load_graph(name: str) -> KnowledgeGraph:
     return KnowledgeGraph(json_file)
 
 
+def _is_bedrock_embed_model(model: str) -> bool:
+    """Check if the model name looks like a Bedrock model ID.
+
+    Bedrock model IDs always contain a dot (e.g. ``amazon.titan-embed-text-v2:0``,
+    ``cohere.embed-english-v3``), while local model names typically don't
+    (e.g. ``qwen3-embedding``).
+    """
+    return "." in model
+
+
 def _build_embed_fn(
     embed_model: str, embed_url: str, *, provider: str = "local",
     bedrock_region: str = "", bedrock_profile: str = "",
 ) -> partial:
     """Build an embedding callable for search/query."""
-    if provider == "bedrock" and embed_model and not embed_model.startswith("qwen"):
+    if provider == "bedrock" and embed_model and _is_bedrock_embed_model(embed_model):
         region = bedrock_region.strip() or None
         profile = bedrock_profile.strip() or None
         return partial(bedrock_embed, model=embed_model, region=region, profile=profile)
@@ -502,6 +541,24 @@ async def ingest_documents(
         return json.dumps({"type": "log", "message": msg}) + "\n"
 
     def _stream():
+      # Attach a log-capture handler to surface knowledge_graph logs in verbose mode
+      kg_logger = logging.getLogger("knowledge_graph")
+      capture_handler: _LogCaptureHandler | None = None
+      _prev_kg_level = kg_logger.level
+      if _verbose:
+          capture_handler = _LogCaptureHandler(level=logging.DEBUG)
+          capture_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+          # Ensure the knowledge_graph logger emits DEBUG+ so the handler sees them
+          kg_logger.setLevel(logging.DEBUG)
+          kg_logger.addHandler(capture_handler)
+
+      def _drain_captured():
+          """Yield any captured knowledge_graph log messages."""
+          if capture_handler is None:
+              return
+          for msg in capture_handler.drain():
+              yield _log(f"  [kg] {msg}")
+
       try:
         _model = extract_model.strip() or query_model
         extract_fn = _build_extract_fn(provider, _model, api_url,
@@ -544,6 +601,9 @@ async def ingest_documents(
                 )
                 results.append(stats)
 
+                # Drain any captured knowledge_graph logs (verbose mode)
+                yield from _drain_captured()
+
                 # Replay captured progress events as log lines
                 for ev in section_events:
                     evt = ev.get("event", "")
@@ -554,33 +614,64 @@ async def ingest_documents(
                         yield _log(f"  section {idx}/{total}: {heading} ({ev.get('char_count', 0)} chars)...")
                     elif evt == "section_done":
                         elapsed = ev.get("elapsed_seconds", 0)
-                        triples = ev.get("triples_processed", 0)
-                        nodes = ev.get("nodes_added", 0)
-                        edges = ev.get("edges_added", 0)
-                        yield _log(f"    +{triples} triples, +{nodes} nodes, +{edges} edges ({elapsed}s)")
+                        triples = ev.get("triples", 0)
+                        nodes_added = ev.get("nodes_added", 0)
+                        nodes_updated = ev.get("nodes_updated", 0)
+                        edges_added = ev.get("edges_added", 0)
+                        edges_updated = ev.get("edges_updated", 0)
+                        # Build concise summary
+                        n_parts = []
+                        if nodes_added:
+                            n_parts.append(f"+{nodes_added} new")
+                        if nodes_updated:
+                            n_parts.append(f"{nodes_updated} updated")
+                        node_str = ", ".join(n_parts) if n_parts else "0"
+                        e_parts = []
+                        if edges_added:
+                            e_parts.append(f"+{edges_added} new")
+                        if edges_updated:
+                            e_parts.append(f"{edges_updated} updated")
+                        edge_str = ", ".join(e_parts) if e_parts else "0"
+                        yield _log(f"    {triples} triples → {node_str} nodes, {edge_str} edges ({elapsed}s)")
                         if _verbose:
-                            nodes_skipped = ev.get("nodes_skipped", 0)
-                            edges_skipped = ev.get("edges_skipped", 0)
                             proposals = ev.get("proposals_created", 0)
-                            extra_parts = []
-                            if nodes_skipped:
-                                extra_parts.append(f"{nodes_skipped} duplicate nodes skipped")
-                            if edges_skipped:
-                                extra_parts.append(f"{edges_skipped} duplicate edges skipped")
+                            augmented = ev.get("proposals_augmented", 0)
                             if proposals:
-                                extra_parts.append(f"{proposals} new relation proposal(s)")
-                            if extra_parts:
-                                yield _log(f"    ({', '.join(extra_parts)})")
+                                yield _log(f"    ({proposals} new relation proposal(s))")
+                            if augmented:
+                                yield _log(f"    ({augmented} existing proposal(s) augmented)")
+                            errors = ev.get("errors", [])
+                            for err in errors:
+                                yield _log(f"    warning: {err}")
                     elif evt == "section_skip":
                         yield _log(f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})")
 
-                yield _log(f"  done: {stats['total_triples']} triples, {stats['total_nodes_added']} nodes, {stats['total_edges_added']} edges")
+                _na = stats['total_nodes_added']
+                _nu = stats.get('total_nodes_updated', 0)
+                _ea = stats['total_edges_added']
+                _eu = stats.get('total_edges_updated', 0)
+                _n_str = f"{_na} added"
+                if _nu:
+                    _n_str += f", {_nu} updated"
+                _e_str = f"{_ea} added"
+                if _eu:
+                    _e_str += f", {_eu} updated"
+                yield _log(f"  done: {stats['total_triples']} triples → nodes: {_n_str} | edges: {_e_str}")
+
+                # Source version info
+                src = stats.get("source")
+                if src:
+                    ver = src.get("version", 1)
+                    if src.get("is_update"):
+                        yield _log(f"  source updated to v{ver}")
+                    elif src.get("is_duplicate"):
+                        yield _log(f"  warning: duplicate content (matches '{src['existing_doc_id']}')")
+                    elif ver > 1:
+                        yield _log(f"  source unchanged (v{ver})")
 
                 if _verbose:
                     yield _log(
-                        f"  detail: {stats.get('total_sections', 0)} sections processed, "
-                        f"{stats.get('total_nodes_skipped', 0)} nodes skipped (dup), "
-                        f"{stats.get('total_edges_skipped', 0)} edges skipped (dup), "
+                        f"  detail: {stats.get('total_sections', 0)} sections, "
                         f"{stats.get('total_proposals_created', 0)} proposals"
                     )
 
@@ -593,6 +684,14 @@ async def ingest_documents(
                         accepted += 1
                     if accepted:
                         yield _log(f"  auto-accepted {accepted} relation proposal(s)")
+
+                # Incremental save after each document so progress survives
+                # client disconnects (e.g. network timeout during embedding)
+                try:
+                    kg.save()
+                except Exception as save_exc:
+                    logger.error("Incremental save failed for graph '%s': %s", graph_name, save_exc)
+                    yield _log(f"  warning: incremental save failed: {save_exc}")
             except Exception as exc:
                 logger.error("Ingestion error for doc '%s' (provider=%s, model=%s): %s", doc["doc_id"], provider, _model, exc, exc_info=_verbose)
                 yield _log(f"  error (model={_model}): {exc}")
@@ -601,7 +700,9 @@ async def ingest_documents(
                     "total_sections": 0,
                     "total_triples": 0,
                     "total_nodes_added": 0,
+                    "total_nodes_updated": 0,
                     "total_edges_added": 0,
+                    "total_edges_updated": 0,
                     "error": str(exc),
                 })
 
@@ -609,7 +710,9 @@ async def ingest_documents(
         _embed_url = embed_url.strip() or api_url
         embed_count = 0
         yield _log("Embedding new nodes...")
-        if _verbose:
+        if provider == "bedrock" and embed_model and _is_bedrock_embed_model(embed_model):
+            yield _log(f"  embed config: model={embed_model} (bedrock, region={bedrock_region or 'default'}, profile={bedrock_profile or 'default'})")
+        else:
             yield _log(f"  embed config: model={embed_model} url={_embed_url}")
         try:
             efn = _build_embed_fn(embed_model, _embed_url,
@@ -617,6 +720,8 @@ async def ingest_documents(
                                  bedrock_profile=bedrock_profile)
             embed_stats = kg.embed_nodes(efn, skip_existing=True, model_name=embed_model)
             embed_count = embed_stats.get("nodes_embedded", 0)
+            # Save embeddings immediately so they survive client disconnects
+            kg.save_embeddings()
             yield _log(f"  embedded {embed_count} nodes")
             if _verbose:
                 skipped = embed_stats.get("nodes_skipped", 0)
@@ -625,6 +730,7 @@ async def ingest_documents(
         except Exception as exc:
             logger.error("Embedding failed for graph '%s': %s", graph_name, exc)
             yield _log(f"  embedding failed: {exc}")
+        yield from _drain_captured()
 
         try:
             kg.save()
@@ -652,6 +758,10 @@ async def ingest_documents(
             exc_info=True,
         )
         yield json.dumps({"type": "error", "message": f"Internal error: {exc}"}) + "\n"
+      finally:
+        if capture_handler is not None:
+            kg_logger.removeHandler(capture_handler)
+            kg_logger.setLevel(_prev_kg_level)
 
     return StreamingResponse(
         _stream(),

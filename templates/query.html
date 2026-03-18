@@ -181,16 +181,16 @@
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Embed Model</label>
             <input type="text" name="embed_model" value="" disabled
-                   placeholder="From graph or qwen3-embedding (local)"
+                   placeholder="From graph, or e.g. amazon.titan-embed-text-v2:0"
                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
           </div>
           <div class="space-y-1">
-            <label class="block text-xs text-gray-400">Embed URL (for local embeddings)</label>
-            <input type="text" name="embed_url" value="http://localhost:11434" disabled
-                   placeholder="Local embed server"
+            <label class="block text-xs text-gray-400">Embed URL (only for local embeddings)</label>
+            <input type="text" name="embed_url" value="" disabled
+                   placeholder="Leave blank for Bedrock embeddings"
                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
           </div>
-          <p class="text-xs text-gray-600 col-span-2">Uses named profiles from ~/.aws/credentials. Leave AWS Profile blank for the default credential chain (env vars, default profile, IAM role).</p>
+          <p class="text-xs text-gray-600 col-span-2">Uses named profiles from ~/.aws/credentials. Leave AWS Profile blank for the default credential chain (env vars, default profile, IAM role). Bedrock model IDs (e.g. amazon.titan-*) are sent to Bedrock; local model names use the Embed URL.</p>
         </div>
       </div>
     </details>
