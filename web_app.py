@@ -39,6 +39,7 @@ from knowledge_graph import (
     GraphEncoder, KnowledgeGraph, ollama_embed, local_extract,
     claude_chat, claude_extract, _get_anthropic_api_key,
     bedrock_chat, bedrock_extract, bedrock_embed,
+    slugify,
 )
 from query_graph import ask, build_context, ollama_chat, search_nodes
 
@@ -374,12 +375,12 @@ async def graph_detail(request: Request, name: str):
         src = node.get("source", "")
         # source looks like "doc:<doc_id>" or "doc:<doc_id>::<section>"
         if src.startswith("doc:"):
-            doc_key = src.split("::")[0].removeprefix("doc:")
+            doc_key = slugify(src.split("::")[0].removeprefix("doc:"))
             source_node_counts[doc_key] = source_node_counts.get(doc_key, 0) + 1
     for edge in kg._data.get("edges", []):
         src_tag = edge.get("source_tag", "")
         if src_tag.startswith("doc:"):
-            doc_key = src_tag.removeprefix("doc:")
+            doc_key = slugify(src_tag.split("::")[0].removeprefix("doc:"))
             source_edge_counts[doc_key] = source_edge_counts.get(doc_key, 0) + 1
 
     # Enrich sources with counts and text availability
@@ -401,6 +402,7 @@ async def graph_detail(request: Request, name: str):
         "type_colors_json": json.dumps(cy["type_colors"]),
         "relation_colors_json": json.dumps(cy["relation_colors"]),
         "stats_json": json.dumps(cy["stats"]),
+        "has_positions": cy.get("has_positions", False),
     })
 
 

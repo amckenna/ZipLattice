@@ -4759,12 +4759,49 @@ TEXT:
     # Visualization — Cytoscape.js (detailed interactive view)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _compute_layout_positions(
+        render_nodes: dict,
+        render_edges: list[dict],
+        *,
+        scale: float = 1000.0,
+    ) -> dict[str, dict[str, float]]:
+        """Pre-compute force-directed node positions using NetworkX.
+
+        Uses Fruchterman-Reingold (``nx.spring_layout``) to compute stable
+        positions server-side.  The resulting coordinates are scaled to
+        *scale* × *scale* pixels so they map directly to Cytoscape.js
+        ``preset`` layout positions, which renders instantly with no
+        client-side simulation.
+
+        Returns a mapping of ``{node_id: {"x": float, "y": float}}``.
+        """
+        G = nx.Graph()
+        G.add_nodes_from(render_nodes.keys())
+        for e in render_edges:
+            src, tgt = e["source"], e["target"]
+            if src in render_nodes and tgt in render_nodes:
+                G.add_edge(src, tgt)
+
+        if len(G) == 0:
+            return {}
+
+        pos = nx.spring_layout(
+            G,
+            k=None,            # optimal node distance (auto)
+            iterations=100,    # more iterations → stabler layout
+            seed=42,           # deterministic output
+            scale=scale / 2,   # half-scale so coords range ±scale/2
+        )
+        return {nid: {"x": float(xy[0]), "y": float(xy[1])} for nid, xy in pos.items()}
+
     def cytoscape_elements(
         self,
         *,
         center_node: str | None = None,
         depth: int | None = None,
         min_confidence: float = 0.0,
+        precompute_layout: bool = True,
     ) -> dict:
         """Return Cytoscape.js data needed to render an interactive graph.
 
@@ -4776,6 +4813,8 @@ TEXT:
           - ``relations``: sorted list of relation types present
           - ``proposals``: list of pending relation proposals
           - ``stats``: dict with node/edge/component/proposal counts
+          - ``has_positions``: bool indicating whether elements contain
+            pre-computed layout positions (``preset`` layout ready)
         """
         if center_node and depth:
             subgraph = self.get_subgraph(center_node, depth=depth)
@@ -4791,6 +4830,11 @@ TEXT:
                 if e.get("confidence", 1.0) >= min_confidence
             ]
 
+        # Pre-compute positions with NetworkX spring_layout
+        positions: dict[str, dict[str, float]] = {}
+        if precompute_layout and render_nodes:
+            positions = self._compute_layout_positions(render_nodes, render_edges)
+
         elements: list[dict] = []
         degree: dict[str, int] = defaultdict(int)
         for e in render_edges:
@@ -4799,7 +4843,7 @@ TEXT:
 
         for nid, node in render_nodes.items():
             ntype = node.get("type", "custom")
-            elements.append({
+            elem: dict = {
                 "group": "nodes",
                 "data": {
                     "id": nid,
@@ -4811,7 +4855,10 @@ TEXT:
                     "degree": degree.get(nid, 0),
                     "properties": node.get("properties", {}),
                 },
-            })
+            }
+            if nid in positions:
+                elem["position"] = positions[nid]
+            elements.append(elem)
 
         for i, edge in enumerate(render_edges):
             src, tgt = edge["source"], edge["target"]
@@ -4849,6 +4896,7 @@ TEXT:
             "types": types_present,
             "relations": relations_present,
             "proposals": pending_proposals,
+            "has_positions": bool(positions),
             "stats": {
                 "nodes": len(render_nodes),
                 "edges": len(render_edges),
@@ -4877,6 +4925,11 @@ TEXT:
             node/edge detail panel, confidence slider, type toggles
           - Color coding by node type and relation type
           - Click-to-focus neighborhood exploration
+
+        When *layout* is ``"cose"`` (the default), node positions are
+        pre-computed server-side with ``nx.spring_layout()`` and the
+        Cytoscape ``preset`` layout is used for instant rendering.
+        Other layout algorithms are still executed client-side.
 
         Args:
             output_path: Where to write the HTML file.
@@ -4908,6 +4961,12 @@ TEXT:
                 if e.get("confidence", 1.0) >= min_confidence
             ]
 
+        # Pre-compute positions for instant preset layout
+        positions: dict[str, dict[str, float]] = {}
+        if render_nodes:
+            positions = self._compute_layout_positions(render_nodes, render_edges)
+        has_positions = bool(positions)
+
         # Build Cytoscape elements
         elements = []
 
@@ -4919,7 +4978,7 @@ TEXT:
 
         for nid, node in render_nodes.items():
             ntype = node.get("type", "custom")
-            elements.append({
+            elem: dict = {
                 "group": "nodes",
                 "data": {
                     "id": nid,
@@ -4931,7 +4990,10 @@ TEXT:
                     "degree": degree.get(nid, 0),
                     "properties": node.get("properties", {}),
                 },
-            })
+            }
+            if nid in positions:
+                elem["position"] = positions[nid]
+            elements.append(elem)
 
         for i, edge in enumerate(render_edges):
             src = edge["source"]
@@ -4978,6 +5040,9 @@ TEXT:
         }
         stats_json = json.dumps(stats)
 
+        # Use preset layout for instant render when positions are pre-computed
+        effective_layout = "preset" if has_positions else layout
+
         html = self._cytoscape_html_template(
             title=title,
             elements_json=elements_json,
@@ -4985,7 +5050,7 @@ TEXT:
             relation_colors_json=relation_colors_json,
             proposals_json=proposals_json,
             stats_json=stats_json,
-            initial_layout=layout,
+            initial_layout=effective_layout,
             types_present=types_present,
             relations_present=relations_present,
         )

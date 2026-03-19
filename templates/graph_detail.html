@@ -315,6 +315,14 @@ const elements = {{ elements_json|safe }};
 const typeColors = {{ type_colors_json|safe }};
 const relationColors = {{ relation_colors_json|safe }};
 const graphStats = {{ stats_json|safe }};
+const hasPositions = {{ has_positions|tojson }};
+
+// Use preset layout for instant rendering when positions are pre-computed
+const initialLayout = hasPositions
+  ? { name: 'preset', padding: 60 }
+  : { name: 'cose', animate: true, animationDuration: 600,
+      nodeRepulsion: function() { return 8000; }, idealEdgeLength: function() { return 100; },
+      padding: 60 };
 
 // --- Init Cytoscape ---
 const cy = cytoscape({
@@ -383,9 +391,7 @@ const cy = cytoscape({
     { selector: 'edge.highlighted', style: { 'opacity': 1, 'width': 3, 'z-index': 999 } },
     { selector: 'node.hidden, edge.hidden', style: { 'display': 'none' } },
   ],
-  layout: { name: 'cose', animate: true, animationDuration: 600,
-            nodeRepulsion: function() { return 8000; }, idealEdgeLength: function() { return 100; },
-            padding: 60 },
+  layout: initialLayout,
   minZoom: 0.1,
   maxZoom: 5,
   wheelSensitivity: 0.3,
@@ -406,7 +412,8 @@ const HIDDEN_TYPES_DEFAULT = new Set(['document', 'section']);
 })();
 
 // --- Layout ---
-let currentLayout = 'cose';
+// When positions are pre-computed, we used 'preset' but the user sees 'cose' as active
+let currentLayout = hasPositions ? 'preset' : 'cose';
 document.querySelector('[data-layout="cose"]')?.classList.add('active');
 
 function changeLayout(name) {
