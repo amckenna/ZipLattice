@@ -1031,6 +1031,138 @@ def _make_relative(path_str: str, base: Path) -> str:
     return path_str
 
 
+@app.post("/import", response_class=HTMLResponse)
+async def import_graph(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    """Import a knowledge graph from a previously exported .zip archive."""
+    filename = file.filename or "upload.zip"
+    logger.info("POST /import file=%s", filename)
+
+    if not filename.lower().endswith(".zip"):
+        return templates.TemplateResponse("partials/import_result.html", {
+            "request": request,
+            "error": "Please upload a .zip file (exported from ZipLattice).",
+        })
+
+    content = await file.read()
+    if not content:
+        return templates.TemplateResponse("partials/import_result.html", {
+            "request": request,
+            "error": "Uploaded file is empty.",
+        })
+
+    try:
+        buf = io.BytesIO(content)
+        with zipfile.ZipFile(buf, "r") as zf:
+            names = zf.namelist()
+            if not names:
+                return templates.TemplateResponse("partials/import_result.html", {
+                    "request": request,
+                    "error": "The zip archive is empty.",
+                })
+
+            # Determine the graph name from the top-level directory.
+            # Export format: <name>/<name>.json plus other files under <name>/
+            top_dirs = {n.split("/")[0] for n in names if "/" in n}
+            if len(top_dirs) != 1:
+                return templates.TemplateResponse("partials/import_result.html", {
+                    "request": request,
+                    "error": "Expected a single graph directory in the archive.",
+                })
+
+            graph_name = top_dirs.pop()
+            # Validate the graph name is safe
+            safe_name = _slugify(graph_name)
+            if not safe_name:
+                return templates.TemplateResponse("partials/import_result.html", {
+                    "request": request,
+                    "error": "Could not determine a valid graph name from the archive.",
+                })
+
+            # Check that the archive contains the expected JSON file
+            json_arcname = f"{graph_name}/{graph_name}.json"
+            if json_arcname not in names:
+                return templates.TemplateResponse("partials/import_result.html", {
+                    "request": request,
+                    "error": f"Archive missing expected graph file: {json_arcname}",
+                })
+
+            # Guard against overwriting an existing graph
+            target_dir = GRAPHS_DIR / safe_name
+            if target_dir.exists():
+                return templates.TemplateResponse("partials/import_result.html", {
+                    "request": request,
+                    "error": f"A graph named '{safe_name}' already exists. Delete it first or rename.",
+                })
+
+            # Validate all paths are safe (no path traversal)
+            GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
+            for member in names:
+                dest = (GRAPHS_DIR / member).resolve()
+                if not str(dest).startswith(str(GRAPHS_DIR.resolve())):
+                    return templates.TemplateResponse("partials/import_result.html", {
+                        "request": request,
+                        "error": "Archive contains unsafe file paths.",
+                    })
+
+            # Extract — remap from archive name to safe_name if they differ
+            for member in names:
+                # Skip directory entries
+                if member.endswith("/"):
+                    continue
+                parts = member.split("/", 1)
+                if len(parts) < 2:
+                    continue
+                relative = parts[1]
+                # Remap filenames that embed the graph name
+                if graph_name != safe_name:
+                    relative = relative.replace(graph_name, safe_name)
+                dest = GRAPHS_DIR / safe_name / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(zf.read(member))
+
+            # If the archive graph name differs from the slugified name,
+            # rename the main JSON file
+            expected_json = GRAPHS_DIR / safe_name / f"{safe_name}.json"
+            if not expected_json.exists():
+                # Try the original name
+                original_json = GRAPHS_DIR / safe_name / f"{graph_name}.json"
+                if original_json.exists():
+                    original_json.rename(expected_json)
+
+            # Verify the graph loads
+            kg = KnowledgeGraph(expected_json)
+            st = kg.stats()
+
+    except zipfile.BadZipFile:
+        return templates.TemplateResponse("partials/import_result.html", {
+            "request": request,
+            "error": "The uploaded file is not a valid zip archive.",
+        })
+    except Exception as exc:
+        logger.error("Import failed: %s", exc, exc_info=True)
+        # Clean up partial extraction
+        target_dir = GRAPHS_DIR / safe_name
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        return templates.TemplateResponse("partials/import_result.html", {
+            "request": request,
+            "error": f"Import failed: {exc}",
+        })
+
+    logger.info(
+        "Imported graph '%s': %d nodes, %d edges",
+        safe_name, st.get("num_nodes", 0), st.get("num_edges", 0),
+    )
+    return templates.TemplateResponse("partials/import_result.html", {
+        "request": request,
+        "graph_name": safe_name,
+        "stats": st,
+    })
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""

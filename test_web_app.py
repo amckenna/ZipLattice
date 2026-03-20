@@ -467,6 +467,105 @@ def test_ingest_accepts_bedrock_region():
     assert resp.status_code == 200
 
 
+# ---------------------------------------------------------------------------
+# Import
+# ---------------------------------------------------------------------------
+
+
+def test_import_graph():
+    """Import a previously exported graph from a zip archive."""
+    import io
+    import zipfile as zf
+
+    _create_graph("to-export")
+    # Add a node so we can verify round-trip
+    kg = KnowledgeGraph(GRAPHS_DIR / "to-export" / "to-export.json")
+    kg.add_node("test-node", type="concept", label="Test Node")
+    kg.save()
+
+    # Export it
+    resp = client.get("/graphs/to-export/export")
+    assert resp.status_code == 200
+    export_data = resp.content
+
+    # Delete the original so we can re-import
+    import shutil
+    shutil.rmtree(GRAPHS_DIR / "to-export")
+
+    # Import
+    resp = client.post(
+        "/import",
+        files=[("file", ("to-export.zip", export_data, "application/zip"))],
+    )
+    assert resp.status_code == 200
+    assert "to-export" in resp.text
+    assert "successfully" in resp.text.lower() or "Imported" in resp.text
+
+    # Verify the graph exists and has the node
+    assert (GRAPHS_DIR / "to-export" / "to-export.json").exists()
+    kg2 = KnowledgeGraph(GRAPHS_DIR / "to-export" / "to-export.json")
+    assert kg2.get_node("test-node") is not None
+
+
+def test_import_rejects_non_zip():
+    """Import rejects non-zip files."""
+    resp = client.post(
+        "/import",
+        files=[("file", ("graph.txt", b"not a zip", "text/plain"))],
+    )
+    assert resp.status_code == 200
+    assert "Error" in resp.text or ".zip" in resp.text
+
+
+def test_import_rejects_invalid_zip():
+    """Import rejects corrupt zip data."""
+    resp = client.post(
+        "/import",
+        files=[("file", ("graph.zip", b"not a zip", "application/zip"))],
+    )
+    assert resp.status_code == 200
+    assert "Error" in resp.text
+
+
+def test_import_rejects_duplicate():
+    """Import rejects if a graph with the same name already exists."""
+    import io
+    import zipfile as zf
+
+    _create_graph("dup-test")
+
+    # Build a minimal zip
+    buf = io.BytesIO()
+    with zf.ZipFile(buf, "w") as z:
+        z.writestr("dup-test/dup-test.json", '{"nodes": {}, "edges": [], "meta": {}}')
+    zip_data = buf.getvalue()
+
+    resp = client.post(
+        "/import",
+        files=[("file", ("dup-test.zip", zip_data, "application/zip"))],
+    )
+    assert resp.status_code == 200
+    assert "already exists" in resp.text
+
+
+def test_import_rejects_missing_json():
+    """Import rejects archives without the expected graph JSON."""
+    import io
+    import zipfile as zf
+
+    buf = io.BytesIO()
+    with zf.ZipFile(buf, "w") as z:
+        z.writestr("my-graph/random.txt", "hello")
+    zip_data = buf.getvalue()
+
+    resp = client.post(
+        "/import",
+        files=[("file", ("my-graph.zip", zip_data, "application/zip"))],
+    )
+    assert resp.status_code == 200
+    assert "Error" in resp.text or "missing" in resp.text.lower()
+
+
 def test_query_bedrock_with_profile():
     """Query endpoint accepts bedrock_profile parameter."""
     resp = client.post(
