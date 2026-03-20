@@ -1,0 +1,14 @@
+{% if error %}
+<div class="border border-red-900 bg-red-950 p-4 text-sm">
+  <span class="text-red-400 font-bold">Error:</span> {{ error }}
+</div>
+{% else %}
+<div class="border border-gray-800 p-4 text-sm space-y-2">
+  <p class="text-green-400 font-bold">Imported "{{ graph_name }}" successfully.</p>
+  <p class="text-gray-400">{{ stats.get("num_nodes", 0) }} nodes, {{ stats.get("num_edges", 0) }} edges</p>
+  <a href="/graphs/{{ graph_name }}"
+     class="inline-block mt-2 border border-white px-4 py-1.5 text-xs hover:bg-white hover:text-black transition-colors">
+    View Graph
+  </a>
+</div>
+{% endif %}

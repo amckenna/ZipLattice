@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import math
 import os
 import re
 import time
@@ -4774,6 +4775,10 @@ TEXT:
         ``preset`` layout positions, which renders instantly with no
         client-side simulation.
 
+        Disconnected components are laid out independently and then tiled
+        left-to-right so that outlier components cannot compress the main
+        cluster via ``rescale_layout``.
+
         Returns a mapping of ``{node_id: {"x": float, "y": float}}``.
         """
         G = nx.Graph()
@@ -4786,14 +4791,79 @@ TEXT:
         if len(G) == 0:
             return {}
 
-        pos = nx.spring_layout(
-            G,
-            k=None,            # optimal node distance (auto)
-            iterations=100,    # more iterations → stabler layout
-            seed=42,           # deterministic output
-            scale=scale / 2,   # half-scale so coords range ±scale/2
+        # --- Per-component layout to avoid rescale compression -----------
+        components = list(nx.connected_components(G))
+
+        # Single component: standard spring layout is fine
+        if len(components) == 1:
+            pos = nx.spring_layout(
+                G,
+                k=None,
+                iterations=100,
+                seed=42,
+                scale=scale / 2,
+            )
+            return {
+                nid: {"x": float(xy[0]), "y": float(xy[1])}
+                for nid, xy in pos.items()
+            }
+
+        # Multiple components: layout each separately, then tile
+        # Sort largest-first so the biggest cluster gets the most space.
+        components.sort(key=len, reverse=True)
+
+        combined: dict[str, tuple[float, float]] = {}
+        half = scale / 2
+        x_cursor = 0.0
+        gap = scale * 0.05  # spacing between tiled components
+
+        for comp in components:
+            sub = G.subgraph(comp)
+            n = len(sub)
+
+            if n == 1:
+                nid = next(iter(sub.nodes()))
+                combined[nid] = (x_cursor, 0.0)
+                x_cursor += gap
+                continue
+
+            # Scale each component proportionally to sqrt(n) so that
+            # larger clusters get more room.
+            comp_radius = half * math.sqrt(n / len(G))
+            comp_radius = max(comp_radius, scale * 0.03)
+
+            raw = nx.spring_layout(
+                sub, k=None, iterations=100, seed=42, scale=comp_radius,
+            )
+
+            # Shift component so its left edge starts at x_cursor
+            xs = [float(xy[0]) for xy in raw.values()]
+            min_x = min(xs)
+            width = max(xs) - min_x
+
+            for nid, xy in raw.items():
+                combined[nid] = (float(xy[0]) - min_x + x_cursor, float(xy[1]))
+
+            x_cursor += width + gap
+
+        # --- Center and rescale to [-half, half] -------------------------
+        all_x = [p[0] for p in combined.values()]
+        all_y = [p[1] for p in combined.values()]
+        cx = (max(all_x) + min(all_x)) / 2
+        cy = (max(all_y) + min(all_y)) / 2
+
+        # Center around origin
+        combined = {nid: (x - cx, y - cy) for nid, (x, y) in combined.items()}
+
+        lim = max(
+            max((abs(x) for x, _ in combined.values()), default=1.0),
+            max((abs(y) for _, y in combined.values()), default=1.0),
         )
-        return {nid: {"x": float(xy[0]), "y": float(xy[1])} for nid, xy in pos.items()}
+        if lim > 0:
+            s = half / lim
+            combined = {nid: (x * s, y * s) for nid, (x, y) in combined.items()}
+
+        return {nid: {"x": xy[0], "y": xy[1]} for nid, xy in combined.items()}
 
     def cytoscape_elements(
         self,
