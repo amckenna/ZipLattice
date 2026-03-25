@@ -178,19 +178,36 @@
                    placeholder="default"
                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
           </div>
-          <div class="space-y-1">
+          <!-- Bedrock embedding toggle -->
+          <div class="col-span-2 flex items-center gap-2 pt-1">
+            <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
+              <input type="checkbox" id="query-bedrock-embed-toggle" checked disabled
+                     class="accent-white" onchange="toggleQueryBedrockEmbed()"> Bedrock Embedding
+            </label>
+          </div>
+          <!-- Bedrock embed model (shown when checkbox is checked) -->
+          <div id="query-bedrock-embed-bedrock" class="space-y-1 col-span-2">
             <label class="block text-xs text-gray-400">Embed Model</label>
-            <input type="text" name="embed_model" value="" disabled
-                   placeholder="From graph, or e.g. amazon.titan-embed-text-v2:0"
+            <input type="text" name="embed_model" value="amazon.titan-embed-text-v2:0" disabled
+                   placeholder="e.g. amazon.titan-embed-text-v2:0"
                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
           </div>
-          <div class="space-y-1">
-            <label class="block text-xs text-gray-400">Embed URL (only for local embeddings)</label>
-            <input type="text" name="embed_url" value="" disabled
-                   placeholder="Leave blank for Bedrock embeddings"
-                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          <!-- Local embed config (shown when checkbox is unchecked) -->
+          <div id="query-bedrock-embed-local" class="hidden col-span-2 grid grid-cols-2 gap-3">
+            <div class="space-y-1">
+              <label class="block text-xs text-gray-400">Embed URL</label>
+              <input type="text" name="embed_url" value="http://localhost:11434" disabled
+                     placeholder="Local embed server"
+                     class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            </div>
+            <div class="space-y-1">
+              <label class="block text-xs text-gray-400">Embed Model</label>
+              <input type="text" name="embed_model" value="qwen3-embedding" disabled
+                     placeholder="e.g. qwen3-embedding"
+                     class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            </div>
           </div>
-          <p class="text-xs text-gray-600 col-span-2">Uses named profiles from ~/.aws/credentials. Leave AWS Profile blank for the default credential chain (env vars, default profile, IAM role). Bedrock model IDs (e.g. amazon.titan-*) are sent to Bedrock; local model names use the Embed URL.</p>
+          <p class="text-xs text-gray-600 col-span-2">Uses named profiles from ~/.aws/credentials. Leave AWS Profile blank for the default credential chain (env vars, default profile, IAM role).</p>
         </div>
       </div>
     </details>
@@ -215,11 +232,30 @@ function showProviderPanel(prefix, provider) {
     if (p === provider) {
       panel.classList.remove('hidden');
       panel.querySelectorAll('input, select').forEach(function(el) { el.disabled = false; });
+      // Re-apply bedrock embed toggle to disable the inactive sub-panel's inputs
+      if (p === 'bedrock') toggleQueryBedrockEmbed();
     } else {
       panel.classList.add('hidden');
       panel.querySelectorAll('input, select').forEach(function(el) { el.disabled = true; });
     }
   });
+}
+
+function toggleQueryBedrockEmbed() {
+  var toggle = document.getElementById('query-bedrock-embed-toggle');
+  var bedrockSection = document.getElementById('query-bedrock-embed-bedrock');
+  var localSection = document.getElementById('query-bedrock-embed-local');
+  if (toggle.checked) {
+    bedrockSection.classList.remove('hidden');
+    bedrockSection.querySelectorAll('input').forEach(function(el) { el.disabled = false; });
+    localSection.classList.add('hidden');
+    localSection.querySelectorAll('input').forEach(function(el) { el.disabled = true; });
+  } else {
+    bedrockSection.classList.add('hidden');
+    bedrockSection.querySelectorAll('input').forEach(function(el) { el.disabled = true; });
+    localSection.classList.remove('hidden');
+    localSection.querySelectorAll('input').forEach(function(el) { el.disabled = false; });
+  }
 }
 
 var modeHints = {
