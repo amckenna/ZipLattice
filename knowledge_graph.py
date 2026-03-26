@@ -918,6 +918,38 @@ def _merge_description(
     existing_props["description"] = "; ".join(seen_texts)
 
 
+def _copy_source_file(
+    src_kg: "KnowledgeGraph",
+    dst_kg: "KnowledgeGraph",
+    manifest_entry: dict[str, Any],
+) -> None:
+    """Copy a source file from one graph's sources directory to another.
+
+    Updates *manifest_entry*'s ``stored_path`` to point to the new location
+    inside *dst_kg*'s sources directory.  If the source file does not exist
+    on disk the entry is kept but no file is copied.
+    """
+    stored = Path(manifest_entry.get("stored_path", ""))
+    if not stored.is_absolute():
+        stored = src_kg.graph_path.parent / stored
+    if not stored.exists():
+        logger.debug("Source file not found during merge copy: %s", stored)
+        return
+
+    dst_kg.sources_dir.mkdir(parents=True, exist_ok=True)
+    dest = dst_kg.sources_dir / stored.name
+    if not dest.exists() or dest.read_bytes() != stored.read_bytes():
+        import shutil
+        shutil.copy2(str(stored), str(dest))
+
+    # Rewrite stored_path relative to the destination graph dir
+    try:
+        rel = dest.relative_to(dst_kg.graph_path.parent)
+    except ValueError:
+        rel = dest
+    manifest_entry["stored_path"] = str(rel)
+
+
 # ---------------------------------------------------------------------------
 # Span-finding helpers
 # ---------------------------------------------------------------------------
@@ -4293,22 +4325,79 @@ TEXT:
 
         Args:
             other: The graph to merge in.
-            prefer: On conflict, prefer 'self' or 'other' node data.
+            prefer: On conflict, prefer ``'self'`` or ``'other'`` node data.
+                    When ``'other'``, conflicting nodes are smart-merged:
+                    confidence is maximised, descriptions are combined via
+                    ``_merge_description``, and timestamps keep the earliest
+                    ``created`` and latest ``updated``.
 
         Returns:
-            Stats dict with counts of nodes_added, nodes_updated, edges_added.
+            Stats dict with merge counts.
         """
-        stats = {"nodes_added": 0, "nodes_updated": 0, "edges_added": 0}
+        stats: dict[str, int] = {
+            "nodes_added": 0,
+            "nodes_updated": 0,
+            "edges_added": 0,
+            "edges_updated": 0,
+            "sources_added": 0,
+            "sources_skipped": 0,
+            "proposals_added": 0,
+            "proposals_updated": 0,
+        }
 
+        # -- Nodes --------------------------------------------------------
         for nid, node in other._data["nodes"].items():
             if nid in self._data["nodes"]:
                 if prefer == "other":
-                    self._data["nodes"][nid] = deepcopy(node)
+                    existing = self._data["nodes"][nid]
+                    incoming = deepcopy(node)
+                    # Smart merge: combine properties, keep best metadata
+                    merged_props = {**existing.get("properties", {})}
+                    inc_props = incoming.get("properties", {})
+                    # Handle description merging via description_sources
+                    inc_desc_sources = inc_props.pop("description_sources", [])
+                    inc_desc = inc_props.pop("description", None)
+                    # Pop description from merged too — it will be rebuilt
+                    merged_props.pop("description", None)
+                    merged_props.update(inc_props)
+                    # Merge description sources
+                    if inc_desc_sources:
+                        for ds in inc_desc_sources:
+                            _merge_description(
+                                merged_props,
+                                ds["text"],
+                                doc_id=ds.get("doc_id", "unknown"),
+                                confidence=ds.get("confidence", 1.0),
+                            )
+                    elif inc_desc:
+                        _merge_description(
+                            merged_props,
+                            inc_desc,
+                            doc_id=incoming.get("source", "unknown"),
+                            confidence=incoming.get("confidence", 1.0),
+                        )
+                    existing["properties"] = merged_props
+                    existing["confidence"] = max(
+                        existing.get("confidence", 0),
+                        incoming.get("confidence", 0),
+                    )
+                    # Keep earliest created, latest updated
+                    if incoming.get("created") and existing.get("created"):
+                        existing["created"] = min(existing["created"], incoming["created"])
+                    if incoming.get("updated") and existing.get("updated"):
+                        existing["updated"] = max(existing["updated"], incoming["updated"])
+                    elif incoming.get("updated"):
+                        existing["updated"] = incoming["updated"]
+                    # Take label/type from higher-confidence source
+                    if incoming.get("confidence", 0) >= existing.get("confidence", 0):
+                        existing["label"] = incoming.get("label", existing.get("label"))
+                        existing["type"] = incoming.get("type", existing.get("type"))
                 stats["nodes_updated"] += 1
             else:
                 self._data["nodes"][nid] = deepcopy(node)
                 stats["nodes_added"] += 1
 
+        # -- Edges --------------------------------------------------------
         existing_edge_keys = {
             (e["source"], e["target"], e["relation"])
             for e in self._data["edges"]
@@ -4319,14 +4408,67 @@ TEXT:
                 self._data["edges"].append(deepcopy(edge))
                 existing_edge_keys.add(key)
                 stats["edges_added"] += 1
+            else:
+                # Smart-merge duplicate edges: max confidence, merge properties
+                for e in self._data["edges"]:
+                    if (e["source"], e["target"], e["relation"]) == key:
+                        e["properties"] = {
+                            **e.get("properties", {}),
+                            **edge.get("properties", {}),
+                        }
+                        e["confidence"] = max(
+                            e.get("confidence", 0),
+                            edge.get("confidence", 0),
+                        )
+                        if edge.get("created") and e.get("created"):
+                            e["created"] = min(e["created"], edge["created"])
+                        if edge.get("updated") and e.get("updated"):
+                            e["updated"] = max(e["updated"], edge["updated"])
+                        elif edge.get("updated"):
+                            e["updated"] = edge["updated"]
+                        stats["edges_updated"] += 1
+                        break
 
-        # Merge custom relations
+        # -- Metadata: custom relations + node types ----------------------
         my_customs = set(self._data["meta"].get("custom_relations", []))
         other_customs = set(other._data["meta"].get("custom_relations", []))
         self._data["meta"]["custom_relations"] = sorted(my_customs | other_customs)
 
-        # Merge embeddings
+        my_types = set(self._data["meta"].get("node_types", []))
+        other_types = set(other._data["meta"].get("node_types", []))
+        self._data["meta"]["node_types"] = sorted(my_types | other_types)
+
+        # -- Source documents ---------------------------------------------
+        my_sources = self._data["meta"].setdefault("sources", {})
+        for doc_slug, entry in other._data["meta"].get("sources", {}).items():
+            if doc_slug not in my_sources:
+                my_sources[doc_slug] = deepcopy(entry)
+                # Copy the actual source file
+                _copy_source_file(other, self, my_sources[doc_slug])
+                stats["sources_added"] += 1
+            elif my_sources[doc_slug].get("content_hash") == entry.get("content_hash"):
+                stats["sources_skipped"] += 1
+            elif prefer == "other":
+                my_sources[doc_slug] = deepcopy(entry)
+                _copy_source_file(other, self, my_sources[doc_slug])
+                stats["sources_added"] += 1
+            else:
+                stats["sources_skipped"] += 1
+
+        # -- Embeddings ---------------------------------------------------
         _emb_changed = False
+        # Warn about incompatible embedding models
+        if (other._embed_meta and self._embed_meta
+                and other._embed_meta.get("model")
+                and self._embed_meta.get("model")
+                and other._embed_meta["model"] != self._embed_meta["model"]):
+            logger.warning(
+                "Merging graphs with different embedding models: %s vs %s",
+                self._embed_meta.get("model"), other._embed_meta.get("model"),
+            )
+        elif other._embed_meta and not self._embed_meta:
+            self._embed_meta = deepcopy(other._embed_meta)
+
         for nid, emb in other._embeddings.items():
             if nid not in self._embeddings or prefer == "other":
                 self._embeddings[nid] = emb
@@ -4334,11 +4476,12 @@ TEXT:
         if _emb_changed:
             self._dirty_embeddings = True
 
-        # Merge proposals
+        # -- Proposals ----------------------------------------------------
         my_proposal_names = {p.name for p in self._proposals}
         for op in other._proposals:
             if op.name not in my_proposal_names:
                 self._proposals.append(deepcopy(op))
+                stats["proposals_added"] += 1
             else:
                 # Augment existing proposal with new examples
                 for mp in self._proposals:
@@ -4350,11 +4493,117 @@ TEXT:
                             if doc not in mp.source_docs:
                                 mp.source_docs.append(doc)
                         mp.confidence = max(mp.confidence, op.confidence)
+                        # Status resolution: ACCEPTED > PENDING > REJECTED
+                        _status_order = {
+                            ProposalStatus.REJECTED.value: 0,
+                            ProposalStatus.PENDING.value: 1,
+                            ProposalStatus.ACCEPTED.value: 2,
+                        }
+                        mp.status = max(
+                            mp.status, op.status,
+                            key=lambda s: _status_order.get(s, 1),
+                        )
+                        stats["proposals_updated"] += 1
                         break
 
         self._rebuild_networkx()
         self._dirty = True
         return stats
+
+    @classmethod
+    def merge_graphs(
+        cls,
+        sources: list["KnowledgeGraph | str | Path"],
+        output_path: str | Path,
+        *,
+        prefer: str = "latest",
+        description: str = "",
+    ) -> "KnowledgeGraph":
+        """Create a new KnowledgeGraph by merging two or more existing graphs.
+
+        The source graphs are **not** modified.  A fresh graph is created at
+        *output_path* and each source is merged into it sequentially.
+
+        Args:
+            sources: KnowledgeGraph instances or paths to graph JSON files.
+                     At least two sources are required.
+            output_path: File path for the new combined graph.
+            prefer: Conflict resolution strategy:
+                ``'latest'`` — node/edge with the most recent ``updated``
+                timestamp wins (default).
+                ``'first'`` — first graph's data wins on conflicts.
+                ``'last'``  — last graph's data wins on conflicts.
+            description: Optional description for the merged graph.
+
+        Returns:
+            The newly created (and saved) KnowledgeGraph instance.
+        """
+        if len(sources) < 2:
+            raise ValueError("merge_graphs requires at least 2 source graphs")
+
+        # Resolve sources: load from path if needed
+        loaded: list[KnowledgeGraph] = []
+        names: list[str] = []
+        for src in sources:
+            if isinstance(src, (str, Path)):
+                kg = cls(src)
+                loaded.append(kg)
+                names.append(str(Path(src).stem))
+            else:
+                loaded.append(src)
+                names.append(str(src.graph_path.stem))
+
+        output = cls(output_path)
+        if not description:
+            description = f"Merged from: {', '.join(names)}"
+        output._data["meta"]["description"] = description
+
+        # For 'latest' strategy we sort each merge so nodes with newer
+        # timestamps overwrite older ones.  We merge all sources with
+        # prefer='other' so that the later source always updates; for
+        # 'latest' we sort ascending by newest updated timestamp so the
+        # newest graph is merged last (and thus wins).
+        if prefer == "latest":
+            def _newest_ts(kg: KnowledgeGraph) -> str:
+                return kg._data["meta"].get("updated", "")
+            ordered = sorted(loaded, key=_newest_ts)
+            merge_prefer = "other"
+        elif prefer == "first":
+            ordered = loaded
+            # First graph populates empty output with prefer='other',
+            # subsequent graphs use prefer='self' so first data wins.
+            merge_prefer = "self"
+        else:  # "last"
+            ordered = loaded
+            merge_prefer = "other"
+
+        all_stats: list[dict[str, int]] = []
+        for i, src_kg in enumerate(ordered):
+            # For 'first' strategy: first merge uses 'other' to populate
+            # the empty output, subsequent merges use 'self' to keep first data
+            if prefer == "first" and i == 0:
+                st = output.merge(src_kg, prefer="other")
+            else:
+                st = output.merge(src_kg, prefer=merge_prefer)
+            all_stats.append(st)
+
+        # Aggregate stats
+        agg: dict[str, int] = {}
+        for st in all_stats:
+            for k, v in st.items():
+                agg[k] = agg.get(k, 0) + v
+        agg["graphs_merged"] = len(loaded)
+
+        logger.info(
+            "Merged %d graphs → %s  (nodes_added=%d, nodes_updated=%d, "
+            "edges_added=%d, edges_updated=%d)",
+            len(loaded), output.graph_path,
+            agg.get("nodes_added", 0), agg.get("nodes_updated", 0),
+            agg.get("edges_added", 0), agg.get("edges_updated", 0),
+        )
+
+        output.save_all()
+        return output
 
     # ------------------------------------------------------------------
     # RAG helpers
@@ -5967,6 +6216,12 @@ def main():
                         help="Check embedding integrity: dimensions, zero vectors, coverage")
     parser.add_argument("--list-models", action="store_true",
                         help="List models available on the API server and exit")
+    parser.add_argument("--merge", nargs="+", metavar="GRAPH",
+                        help="Merge two or more existing graphs into the target graph "
+                             "(specified by the positional 'path' argument)")
+    parser.add_argument("--merge-strategy", choices=["latest", "first", "last"],
+                        default="latest", dest="merge_strategy",
+                        help="Conflict resolution strategy for merge (default: latest)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show detailed progress, timing, and debug info")
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -6001,6 +6256,19 @@ def main():
     if args.list_models:
         from query_graph import _list_models
         _list_models(args.ollama_url)
+        return
+
+    if args.merge:
+        import pprint as _pp
+        source_graphs = [KnowledgeGraph(p) for p in args.merge]
+        merged = KnowledgeGraph.merge_graphs(
+            source_graphs,
+            args.path,
+            prefer=args.merge_strategy,
+        )
+        st = merged.stats()
+        print(f"Merged {len(source_graphs)} graphs → {merged.graph_path}")
+        _pp.pprint(st)
         return
 
     kg = KnowledgeGraph(args.path)

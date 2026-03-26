@@ -1163,6 +1163,76 @@ async def import_graph(
     })
 
 
+@app.get("/merge", response_class=HTMLResponse)
+async def merge_form(request: Request):
+    """Show the merge graph form with checkboxes for each graph."""
+    graphs = _list_graphs()
+    return templates.TemplateResponse("merge.html", {
+        "request": request,
+        "graphs": graphs,
+    })
+
+
+@app.post("/merge", response_class=HTMLResponse)
+async def merge_graphs_route(
+    request: Request,
+    graph_names: list[str] = Form(...),
+    output_name: str = Form(...),
+    strategy: str = Form("latest"),
+):
+    """Merge selected graphs into a new graph."""
+    logger.info("POST /merge graphs=%s output=%s strategy=%s",
+                graph_names, output_name, strategy)
+
+    # Validate output name
+    safe_name = slugify(output_name)
+    if not safe_name:
+        return templates.TemplateResponse("partials/merge_result.html", {
+            "request": request,
+            "error": "Invalid output graph name.",
+        })
+
+    if len(graph_names) < 2:
+        return templates.TemplateResponse("partials/merge_result.html", {
+            "request": request,
+            "error": "Select at least two graphs to merge.",
+        })
+
+    # Check that output doesn't already exist
+    output_dir = GRAPHS_DIR / safe_name
+    if output_dir.exists():
+        return templates.TemplateResponse("partials/merge_result.html", {
+            "request": request,
+            "error": f"A graph named '{safe_name}' already exists.",
+        })
+
+    if strategy not in ("latest", "first", "last"):
+        strategy = "latest"
+
+    try:
+        source_kgs = [_load_graph(name) for name in graph_names]
+        output_path = GRAPHS_DIR / safe_name / f"{safe_name}.json"
+        merged = KnowledgeGraph.merge_graphs(
+            source_kgs, output_path, prefer=strategy,
+        )
+        st = merged.stats()
+    except Exception as exc:
+        logger.error("Merge failed: %s", exc)
+        return templates.TemplateResponse("partials/merge_result.html", {
+            "request": request,
+            "error": f"Merge failed: {exc}",
+        })
+
+    logger.info("Merged %d graphs → '%s': %d nodes, %d edges",
+                len(graph_names), safe_name,
+                st.get("num_nodes", 0), st.get("num_edges", 0))
+    return templates.TemplateResponse("partials/merge_result.html", {
+        "request": request,
+        "graph_name": safe_name,
+        "stats": st,
+    })
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""

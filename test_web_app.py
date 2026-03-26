@@ -585,3 +585,68 @@ def test_query_bedrock_with_profile():
     )
     assert resp.status_code == 200
     assert "Error" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Merge routes
+# ---------------------------------------------------------------------------
+
+
+def test_merge_page():
+    resp = client.get("/merge")
+    assert resp.status_code == 200
+    assert "Merge" in resp.text
+
+
+def test_merge_graphs_success():
+    """POST /merge with two graphs produces a merged graph."""
+    for name in ("src1", "src2"):
+        graph_dir = GRAPHS_DIR / name
+        graph_dir.mkdir(parents=True, exist_ok=True)
+        kg = KnowledgeGraph(graph_dir / f"{name}.json")
+        kg.add_node(f"node-{name}", type="concept", label=f"Node {name}")
+        kg.save()
+
+    resp = client.post(
+        "/merge",
+        data={
+            "graph_names": ["src1", "src2"],
+            "output_name": "merged-test",
+            "strategy": "latest",
+        },
+    )
+    assert resp.status_code == 200
+    assert "merged-test" in resp.text
+    assert "successfully" in resp.text
+    assert (GRAPHS_DIR / "merged-test" / "merged-test.json").exists()
+
+
+def test_merge_graphs_too_few():
+    """POST /merge with fewer than 2 graphs returns an error."""
+    _create_graph("only-one")
+    resp = client.post(
+        "/merge",
+        data={
+            "graph_names": ["only-one"],
+            "output_name": "bad-merge",
+            "strategy": "latest",
+        },
+    )
+    assert resp.status_code == 200
+    assert "Error" in resp.text
+
+
+def test_merge_graphs_existing_name():
+    """POST /merge with an existing output name returns an error."""
+    _create_graph("existing")
+    _create_graph("other")
+    resp = client.post(
+        "/merge",
+        data={
+            "graph_names": ["existing", "other"],
+            "output_name": "existing",
+            "strategy": "latest",
+        },
+    )
+    assert resp.status_code == 200
+    assert "already exists" in resp.text

@@ -595,6 +595,37 @@ def semantic_search(
     return _json(results)
 
 
+@mcp.tool()
+def merge_graphs(
+    graph_paths: list[str],
+    output_path: str,
+    prefer: str = "latest",
+    description: str = "",
+) -> str:
+    """Merge two or more knowledge graphs into a new combined graph.
+
+    Creates a new graph at *output_path* containing all nodes, edges,
+    embeddings, source documents, and relation proposals from the input
+    graphs.  The source graphs are **not** modified.
+
+    Args:
+        graph_paths: Paths to existing graph JSON files (minimum 2).
+        output_path: Path for the new merged graph JSON file.
+        prefer: Conflict resolution: 'latest' (newest timestamp wins),
+                'first' (first graph wins), 'last' (last graph wins).
+        description: Optional description for the merged graph.
+    """
+    logger.info("merge_graphs: %d sources → %s (prefer=%s)",
+                len(graph_paths), output_path, prefer)
+    sources = [_get_graph(p) for p in graph_paths]
+    merged = KnowledgeGraph.merge_graphs(
+        sources, output_path, prefer=prefer, description=description,
+    )
+    # Cache the new graph
+    _graph_cache[str(Path(output_path).resolve())] = merged
+    return _json(merged.stats())
+
+
 # =========================================================================
 # Entry point
 # =========================================================================

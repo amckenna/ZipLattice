@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+
+{% block title %}Merge Graphs — ZipLattice{% endblock %}
+{% block nav_merge %}text-white border-b border-white{% endblock %}
+
+{% block content %}
+<div class="space-y-8 max-w-2xl">
+  <h1 class="text-2xl font-bold">Merge Graphs</h1>
+  <p class="text-gray-400 text-sm">
+    Select two or more graphs to combine into a new graph.
+    Nodes with the same ID are smart-merged (highest confidence wins,
+    descriptions are combined). Duplicate edges are deduplicated.
+  </p>
+
+  {% if graphs|length < 2 %}
+  <div class="border border-gray-800 p-8 text-center text-gray-400">
+    You need at least two graphs to merge.
+    <a href="/upload" class="underline hover:text-white">Upload documents</a> to create more.
+  </div>
+  {% else %}
+  <form hx-post="/merge" hx-target="#merge-result" hx-swap="innerHTML">
+    <div class="space-y-6">
+      <div>
+        <label class="block text-sm text-gray-400 mb-2">Select graphs to merge</label>
+        <div class="space-y-2 border border-gray-800 p-4">
+          {% for g in graphs %}
+          <label class="flex items-center gap-3 hover:bg-gray-950 p-1 cursor-pointer">
+            <input type="checkbox" name="graph_names" value="{{ g.name }}"
+                   class="accent-white">
+            <span>{{ g.name }}</span>
+            <span class="text-gray-400 text-xs ml-auto">
+              {{ g.nodes }} nodes, {{ g.edges }} edges
+            </span>
+          </label>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div>
+        <label class="block text-sm text-gray-400 mb-1" for="output_name">Output graph name</label>
+        <input type="text" name="output_name" id="output_name" required
+               placeholder="merged-graph"
+               class="w-full bg-black border border-gray-800 px-3 py-2 text-sm
+                      focus:border-white focus:outline-none">
+      </div>
+
+      <div>
+        <label class="block text-sm text-gray-400 mb-1" for="strategy">Conflict strategy</label>
+        <select name="strategy" id="strategy"
+                class="bg-black border border-gray-800 px-3 py-2 text-sm
+                       focus:border-white focus:outline-none">
+          <option value="latest" selected>Latest (newest timestamp wins)</option>
+          <option value="first">First (first selected graph wins)</option>
+          <option value="last">Last (last selected graph wins)</option>
+        </select>
+      </div>
+
+      <button type="submit"
+              class="border border-white px-6 py-2 text-sm hover:bg-white
+                     hover:text-black transition-colors">
+        Merge Graphs
+      </button>
+    </div>
+  </form>
+  {% endif %}
+
+  <div id="merge-result"></div>
+</div>
+{% endblock %}
