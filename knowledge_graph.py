@@ -5221,6 +5221,7 @@ TEXT:
                 "edges": len(render_edges),
                 "components": nx.number_weakly_connected_components(self._G),
                 "pending_proposals": len(pending_proposals),
+                "relation_types": len(relations_present),
             },
         }
 
@@ -5356,6 +5357,7 @@ TEXT:
             "edges": len(render_edges),
             "components": nx.number_weakly_connected_components(self._G),
             "pending_proposals": len(pending_proposals),
+            "relation_types": len(relations_present),
         }
         stats_json = json.dumps(stats)
 
@@ -5548,8 +5550,8 @@ TEXT:
   <span class="stat"><b id="stat-nodes">0</b> nodes</span>
   <span class="stat"><b id="stat-edges">0</b> edges</span>
   <span class="stat"><b id="stat-visible-nodes">0</b> visible</span>
-  <span class="stat" id="proposals-stat" style="display:none">
-    <b id="stat-proposals">0</b> pending proposals
+  <span class="stat">
+    <b id="stat-relations">0</b> relation types
   </span>
 </div>
 
@@ -5731,10 +5733,7 @@ function updateStats() {{
   document.getElementById('stat-nodes').textContent = graphStats.nodes;
   document.getElementById('stat-edges').textContent = graphStats.edges;
   document.getElementById('stat-visible-nodes').textContent = visibleNodes;
-  if (graphStats.pending_proposals > 0) {{
-    document.getElementById('proposals-stat').style.display = '';
-    document.getElementById('stat-proposals').textContent = graphStats.pending_proposals;
-  }}
+  document.getElementById('stat-relations').textContent = graphStats.relation_types || 0;
 }}
 updateStats();
 
