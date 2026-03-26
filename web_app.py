@@ -612,8 +612,16 @@ async def ingest_documents(
                     idx = ev.get("index", 0) + 1
                     total = ev.get("total", "?")
                     heading = ev.get("heading", "")
-                    if evt == "section_start":
+                    if evt == "doc_start":
+                        secs = ev.get("total_sections", 0)
+                        ccount = ev.get("char_count", 0)
+                        yield _log(f"  Document: \"{ev.get('doc_id', '?')}\" ({ccount:,} chars, {secs} sections)")
+                    elif evt == "section_start":
                         yield _log(f"  section {idx}/{total}: {heading} ({ev.get('char_count', 0)} chars)...")
+                    elif evt == "extraction_done":
+                        if _verbose:
+                            n = ev.get("triples_returned", 0)
+                            yield _log(f"    LLM returned {n} triples")
                     elif evt == "section_done":
                         elapsed = ev.get("elapsed_seconds", 0)
                         triples = ev.get("triples", 0)
@@ -645,6 +653,10 @@ async def ingest_documents(
                             errors = ev.get("errors", [])
                             for err in errors:
                                 yield _log(f"    warning: {err}")
+                    elif evt == "doc_done":
+                        if _verbose:
+                            yield _log(f"  Document complete: {ev.get('total_triples', 0)} triples, "
+                                       f"{ev.get('total_nodes_added', 0)} nodes, {ev.get('total_edges_added', 0)} edges")
                     elif evt == "section_skip":
                         yield _log(f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})")
 

@@ -2572,6 +2572,7 @@ class KnowledgeGraph:
         max_chars: int = 4000,
         store_text: bool = False,
         model_name: str | None = None,
+        progress_fn: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """
         Generate embeddings for nodes in batch.
@@ -2609,6 +2610,9 @@ class KnowledgeGraph:
             store_text: If True, store the generated embedding text in the
                         node's properties under 'embedding_text' (useful for
                         debugging and inspection).
+            progress_fn: Optional callback for real-time progress reporting.
+                         Events: "embed_start", "embed_batch_done",
+                         "embed_done".
 
         Returns:
             Stats dict: nodes_embedded, nodes_skipped, batches, errors.
@@ -2647,6 +2651,13 @@ class KnowledgeGraph:
 
         total_to_embed = len(candidates)
         logger.info("Preparing to embed %d nodes...", total_to_embed)
+
+        if progress_fn:
+            progress_fn({
+                "event": "embed_start",
+                "total_nodes": total_to_embed,
+                "nodes_skipped": stats["nodes_skipped"],
+            })
 
         # Build embedding texts
         texts: list[tuple[str, str]] = []  # (node_id, text)
@@ -2701,6 +2712,15 @@ class KnowledgeGraph:
                 self._dirty_embeddings = True
                 stats["batches"] += 1
 
+                if progress_fn:
+                    progress_fn({
+                        "event": "embed_batch_done",
+                        "batch": stats["batches"],
+                        "total_batches": total_batches,
+                        "nodes_embedded": stats["nodes_embedded"],
+                        "total_nodes": total_to_embed,
+                    })
+
             except Exception as e:
                 stats["errors"].append(
                     f"Batch {stats['batches']} failed: {e} "
@@ -2722,6 +2742,16 @@ class KnowledgeGraph:
             stats["nodes_embedded"], stats["batches"],
             stats["nodes_skipped"], len(stats["errors"]),
         )
+
+        if progress_fn:
+            progress_fn({
+                "event": "embed_done",
+                "nodes_embedded": stats["nodes_embedded"],
+                "nodes_skipped": stats["nodes_skipped"],
+                "batches": stats["batches"],
+                "errors": len(stats["errors"]),
+            })
+
         return stats
 
     def embed_query(
@@ -3122,6 +3152,7 @@ TEXT:
         auto_add_doc_node: bool = True,
         ingestion_id: str | None = None,
         content_hash: str | None = None,
+        progress_fn: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """
         Process a document through the extraction pipeline:
@@ -3147,6 +3178,10 @@ TEXT:
                           all created nodes and edges for provenance tracking).
             content_hash: Content hash of the source document (propagated to all
                           created nodes and edges).
+            progress_fn: Optional callback for real-time progress reporting.
+                         Called with event dicts containing at least an "event"
+                         key. Events: "extraction_start", "extraction_done",
+                         "triple_done".
 
         Returns:
             Stats dict: nodes_added, edges_added, proposals_created, proposals_augmented,
@@ -3167,6 +3202,9 @@ TEXT:
             text, focus_entities=focus_entities, max_triples=max_triples
         )
 
+        if progress_fn:
+            progress_fn({"event": "extraction_start", "doc_id": doc_id})
+
         try:
             triples = llm_extract_fn(prompt)
         except Exception as e:
@@ -3182,6 +3220,13 @@ TEXT:
             )
             return stats
 
+        if progress_fn:
+            progress_fn({
+                "event": "extraction_done",
+                "doc_id": doc_id,
+                "triples_returned": len(triples),
+            })
+
         return self.ingest_triples(
             triples,
             text=text,
@@ -3190,6 +3235,7 @@ TEXT:
             auto_add_doc_node=auto_add_doc_node,
             ingestion_id=ingestion_id,
             content_hash=content_hash,
+            progress_fn=progress_fn,
         )
 
     def ingest_triples(
@@ -3202,6 +3248,7 @@ TEXT:
         auto_add_doc_node: bool = True,
         ingestion_id: str | None = None,
         content_hash: str | None = None,
+        progress_fn: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """
         Process pre-extracted triples into the knowledge graph.
@@ -3243,6 +3290,9 @@ TEXT:
             ingestion_id: Unique identifier for this ingestion run
                 (propagated to all created nodes and edges).
             content_hash: Content hash of the source document.
+            progress_fn: Optional callback for real-time progress reporting.
+                         Called with ``{"event": "triple_done", ...}`` after
+                         each triple is processed.
 
         Returns:
             Stats dict: nodes_added, nodes_updated, edges_added,
@@ -3353,7 +3403,8 @@ TEXT:
                     source=f"doc_ingest",
                 )
 
-        for triple in triples:
+        _total_triples = len(triples)
+        for _ti, triple in enumerate(triples):
             stats["triples_processed"] += 1
             try:
                 # Normalize list-format triples into dicts.
@@ -3594,6 +3645,18 @@ TEXT:
             except Exception as e:
                 stats["errors"].append(f"Triple processing error: {e} — {triple}")
                 logger.warning("Error processing triple from doc '%s': %s", doc_id, e)
+
+            if progress_fn:
+                progress_fn({
+                    "event": "triple_done",
+                    "index": _ti,
+                    "total": _total_triples,
+                    "doc_id": doc_id,
+                    "nodes_added": stats["nodes_added"],
+                    "nodes_updated": stats["nodes_updated"],
+                    "edges_added": stats["edges_added"],
+                    "edges_updated": stats["edges_updated"],
+                })
 
         # Link extracted entities to the document node
         if auto_add_doc_node and entity_ids:
@@ -3915,8 +3978,13 @@ TEXT:
             doc_properties: Extra properties to attach to the document node.
             progress_fn: Optional callback for real-time progress reporting.
                          Called with event dicts containing at least an "event"
-                         key. Events: "section_start", "section_done",
-                         "section_skip".
+                         key.  Document-level events: "doc_start", "doc_done".
+                         Section-level events: "section_start", "section_done",
+                         "section_skip".  Extraction-level events (fired per
+                         section): "extraction_start", "extraction_done".
+                         Triple-level events: "triple_done" (fired for each
+                         triple processed, includes section_index/section_total/
+                         section_heading for correlation).
 
         Returns:
             Aggregate stats dict with per-section breakdown.
@@ -3988,6 +4056,15 @@ TEXT:
         if not sections:
             aggregate_stats["errors"].append("No sections found in markdown.")
             return aggregate_stats
+
+        # Notify progress callback of document ingestion start
+        if progress_fn:
+            progress_fn({
+                "event": "doc_start",
+                "doc_id": doc_id,
+                "total_sections": len(sections),
+                "char_count": len(text),
+            })
 
         doc_slug = slugify(doc_id)
 
@@ -4119,6 +4196,24 @@ TEXT:
             # Run LLM extraction on this section
             section_text = context_prefix + body
             t0 = time.monotonic()
+            # Build a section-scoped progress callback that injects
+            # section index/total/heading into sub-events so callers can
+            # correlate triple-level progress with the enclosing section.
+            _section_pfn: Callable[[dict[str, Any]], None] | None = None
+            if progress_fn:
+                _sec_i = i
+                _sec_total = len(sections)
+                _sec_heading = heading
+
+                def _section_pfn(event: dict[str, Any],
+                                 _i: int = _sec_i,
+                                 _t: int = _sec_total,
+                                 _h: str = _sec_heading) -> None:
+                    event.setdefault("section_index", _i)
+                    event.setdefault("section_total", _t)
+                    event.setdefault("section_heading", _h)
+                    progress_fn(event)  # type: ignore[misc]
+
             section_stats = self.ingest_document(
                 section_text,
                 doc_id=f"{doc_id}::{heading}",
@@ -4128,6 +4223,7 @@ TEXT:
                 auto_add_doc_node=False,  # we handle doc nodes ourselves
                 ingestion_id=ingestion_id,
                 content_hash=source_content_hash,
+                progress_fn=_section_pfn,
             )
             elapsed = time.monotonic() - t0
 
@@ -4209,6 +4305,22 @@ TEXT:
             aggregate_stats["total_edges_added"],
             aggregate_stats["total_edges_updated"],
         )
+
+        # Notify progress callback of document ingestion completion
+        if progress_fn:
+            progress_fn({
+                "event": "doc_done",
+                "doc_id": doc_id,
+                "total_sections": aggregate_stats["total_sections"],
+                "total_triples": aggregate_stats["total_triples"],
+                "total_nodes_added": aggregate_stats["total_nodes_added"],
+                "total_nodes_updated": aggregate_stats["total_nodes_updated"],
+                "total_edges_added": aggregate_stats["total_edges_added"],
+                "total_edges_updated": aggregate_stats["total_edges_updated"],
+                "total_proposals_created": aggregate_stats["total_proposals_created"],
+                "total_proposals_augmented": aggregate_stats["total_proposals_augmented"],
+            })
+
         return aggregate_stats
 
     def ingest_markdown_file(
@@ -6439,10 +6551,26 @@ def main():
             chars = event.get("char_count", 0)
             tag = f"[{idx + 1}/{total}]"
 
-            if ev == "section_skip":
+            if ev == "doc_start":
+                doc = event.get("doc_id", "?")
+                secs = event.get("total_sections", 0)
+                ccount = event.get("char_count", 0)
+                print(f"  Document: \"{doc}\" ({ccount:,} chars, {secs} sections)")
+            elif ev == "section_skip":
                 print(f"  {tag} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
             elif ev == "section_start":
                 print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars)...", end="", flush=True)
+            elif ev == "extraction_done":
+                n = event.get("triples_returned", 0)
+                if _verbose:
+                    print(f" {n} triples returned, processing...", end="", flush=True)
+            elif ev == "triple_done":
+                if _verbose:
+                    ti = event.get("index", 0)
+                    tt = event.get("total", 0)
+                    # Print a dot every 5 triples to show progress
+                    if tt > 5 and (ti + 1) % 5 == 0:
+                        print(".", end="", flush=True)
             elif ev == "section_done":
                 elapsed = event.get("elapsed_seconds", 0)
                 triples = event.get("triples", 0)
@@ -6478,6 +6606,28 @@ def main():
                             print(f"         ... and {len(errors) - 5} more")
                 else:
                     print(f" {triples} triples → {result_str} ({elapsed}s)")
+            elif ev == "doc_done":
+                if _verbose:
+                    secs = event.get("total_sections", 0)
+                    triples = event.get("total_triples", 0)
+                    na = event.get("total_nodes_added", 0)
+                    ea = event.get("total_edges_added", 0)
+                    print(f"  Document complete: {secs} sections, {triples} triples, {na} nodes, {ea} edges")
+            elif ev == "embed_start":
+                tn = event.get("total_nodes", 0)
+                sk = event.get("nodes_skipped", 0)
+                print(f"  Embedding {tn} nodes ({sk} skipped)...", end="", flush=True)
+            elif ev == "embed_batch_done":
+                b = event.get("batch", 0)
+                tb = event.get("total_batches", 0)
+                ne = event.get("nodes_embedded", 0)
+                tn = event.get("total_nodes", 0)
+                if _verbose:
+                    print(f" batch {b}/{tb} ({ne}/{tn})", end="", flush=True)
+            elif ev == "embed_done":
+                ne = event.get("nodes_embedded", 0)
+                nb = event.get("batches", 0)
+                print(f" {ne} nodes embedded in {nb} batches")
 
         # Resolve embed model once (shared across all files)
         _embed_model = None
@@ -6542,13 +6692,12 @@ def main():
                     if not _quiet:
                         print(f"  Embed config: model='{_embed_model}' url='{_embed_url}'")
 
-                if not _quiet:
-                    print(f"  Embedding nodes with {_embed_model}...", end="", flush=True)
                 _embed_t0 = time.monotonic()
-                _embed_stats = kg.embed_nodes(_embed_fn, skip_existing=True, model_name=_embed_model)
+                _embed_stats = kg.embed_nodes(
+                    _embed_fn, skip_existing=True, model_name=_embed_model,
+                    progress_fn=_progress,
+                )
                 _embed_elapsed = time.monotonic() - _embed_t0
-                if not _quiet:
-                    print(f" {_embed_stats['nodes_embedded']} nodes ({_embed_elapsed:.1f}s)")
 
             kg.save_all()
 
