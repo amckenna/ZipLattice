@@ -192,6 +192,13 @@
           </div>
           <p class="text-xs text-gray-600 col-span-2">Uses named profiles from ~/.aws/credentials. Leave AWS Profile blank for the default credential chain (env vars, default profile, IAM role).</p>
         </div>
+        <!-- Parallel extraction threads -->
+        <div class="space-y-1">
+          <label class="block text-xs text-gray-400">Parallel Extraction Threads</label>
+          <input type="number" name="parallel" value="1" min="1" max="32"
+                 class="w-24 bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          <span class="text-xs text-gray-600 ml-1">LLM calls run concurrently; graph writes remain serial</span>
+        </div>
         <!-- Verbose logging -->
         <div class="flex items-center gap-2 pt-1">
           <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">

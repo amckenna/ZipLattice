@@ -3942,6 +3942,7 @@ TEXT:
         original_path: str | Path | None = None,
         doc_properties: dict[str, Any] | None = None,
         progress_fn: Callable[[dict[str, Any]], None] | None = None,
+        parallel_extractions: int = 1,
     ) -> dict[str, Any]:
         """
         Ingest a markdown document with structure-aware chunking.
@@ -3985,6 +3986,10 @@ TEXT:
                          Triple-level events: "triple_done" (fired for each
                          triple processed, includes section_index/section_total/
                          section_heading for correlation).
+            parallel_extractions: Number of parallel LLM extraction threads.
+                                  When > 1, LLM calls run concurrently in a
+                                  thread pool while graph writes remain serial.
+                                  Defaults to 1 (sequential extraction).
 
         Returns:
             Aggregate stats dict with per-section breakdown.
@@ -4086,9 +4091,14 @@ TEXT:
                 source="markdown_ingest",
             )
 
-        # Track all section node IDs for structural edges
+        # ── Phase 1: Create structural nodes and edges ──────────────
+        # This is fast (no LLM calls) and must be serial because it
+        # mutates the graph.  We also collect the sections that need
+        # LLM extraction for Phase 2.
+
         section_ids: list[str] = []
-        prev_section_id: str | None = None
+        # Each entry: (index, section_dict, section_slug, section_text, heading)
+        extractable: list[tuple[int, dict[str, Any], str, str, str]] = []
 
         for i, section in enumerate(sections):
             heading = section["heading"] or f"Section {i + 1}"
@@ -4183,62 +4193,23 @@ TEXT:
                     })
                 continue
 
-            logger.info(
-                "[%s] [%d/%d] Extracting '%s' (~%s chars)...",
-                doc_id, i + 1, len(sections), heading,
-                f"{section['char_count']:,}",
-            )
-
-            # Notify progress callback before LLM extraction
-            if progress_fn:
-                progress_fn({
-                    "event": "section_start",
-                    "index": i,
-                    "total": len(sections),
-                    "heading": heading,
-                    "char_count": section["char_count"],
-                })
-
-            # Run LLM extraction on this section
             section_text = context_prefix + body
-            t0 = time.monotonic()
-            # Build a section-scoped progress callback that injects
-            # section index/total/heading into sub-events so callers can
-            # correlate triple-level progress with the enclosing section.
-            _section_pfn: Callable[[dict[str, Any]], None] | None = None
-            if progress_fn:
-                _sec_i = i
-                _sec_total = len(sections)
-                _sec_heading = heading
+            extractable.append((i, section, section_slug, section_text, heading))
 
-                def _section_pfn(event: dict[str, Any],
-                                 _i: int = _sec_i,
-                                 _t: int = _sec_total,
-                                 _h: str = _sec_heading) -> None:
-                    event.setdefault("section_index", _i)
-                    event.setdefault("section_total", _t)
-                    event.setdefault("section_heading", _h)
-                    progress_fn(event)  # type: ignore[misc]
-
-            section_stats = self.ingest_document(
-                section_text,
-                doc_id=f"{doc_id}::{heading}",
-                llm_extract_fn=llm_extract_fn,
-                max_triples=max_triples_per_section,
-                low_confidence_threshold=low_confidence_threshold,
-                auto_add_doc_node=False,  # we handle doc nodes ourselves
-                ingestion_id=ingestion_id,
-                content_hash=source_content_hash,
-                progress_fn=_section_pfn,
-            )
-            elapsed = time.monotonic() - t0
-
+        # ── Phase 2: LLM extraction + graph writes ────────────────
+        # Helper to process one section's extraction result into the
+        # graph (must be called from a single thread).
+        def _write_section(
+            idx: int, section: dict[str, Any], section_slug: str,
+            section_text: str, heading: str, section_stats: dict[str, Any],
+            elapsed: float,
+        ) -> None:
+            """Apply extraction results to the graph (serial)."""
             # Link extracted entities to the section node
             if add_structure_nodes and add_structure_edges:
                 for nid in list(self._data["nodes"].keys()):
                     node = self._data["nodes"][nid]
                     if node.get("source", "").startswith(f"doc:{doc_id}::"):
-                        # Check this entity was just added (has this section's source tag)
                         if node.get("source") == f"doc:{doc_id}::{heading}":
                             self.add_edge(
                                 nid, section_slug,
@@ -4268,18 +4239,17 @@ TEXT:
             logger.info(
                 "[%s] [%d/%d] Done '%s': %d triples → "
                 "%d nodes, %d edges (%.1fs)",
-                doc_id, i + 1, len(sections), heading,
+                doc_id, idx + 1, len(sections), heading,
                 section_stats["triples_processed"],
                 section_stats["nodes_added"],
                 section_stats["edges_added"],
                 elapsed,
             )
 
-            # Notify progress callback after extraction
             if progress_fn:
                 progress_fn({
                     "event": "section_done",
-                    "index": i,
+                    "index": idx,
                     "total": len(sections),
                     "heading": heading,
                     "char_count": section["char_count"],
@@ -4293,6 +4263,145 @@ TEXT:
                     "proposals_augmented": section_stats["proposals_augmented"],
                     "errors": section_stats["errors"],
                 })
+
+        _parallel = max(1, parallel_extractions)
+
+        if _parallel <= 1:
+            # ── Serial extraction (original behaviour) ─────────
+            for idx, section, section_slug, section_text, heading in extractable:
+                logger.info(
+                    "[%s] [%d/%d] Extracting '%s' (~%s chars)...",
+                    doc_id, idx + 1, len(sections), heading,
+                    f"{section['char_count']:,}",
+                )
+                if progress_fn:
+                    progress_fn({
+                        "event": "section_start",
+                        "index": idx,
+                        "total": len(sections),
+                        "heading": heading,
+                        "char_count": section["char_count"],
+                    })
+
+                t0 = time.monotonic()
+                _section_pfn: Callable[[dict[str, Any]], None] | None = None
+                if progress_fn:
+                    _sec_i = idx
+                    _sec_total = len(sections)
+                    _sec_heading = heading
+
+                    def _section_pfn(event: dict[str, Any],
+                                     _i: int = _sec_i,
+                                     _t: int = _sec_total,
+                                     _h: str = _sec_heading) -> None:
+                        event.setdefault("section_index", _i)
+                        event.setdefault("section_total", _t)
+                        event.setdefault("section_heading", _h)
+                        progress_fn(event)  # type: ignore[misc]
+
+                section_stats = self.ingest_document(
+                    section_text,
+                    doc_id=f"{doc_id}::{heading}",
+                    llm_extract_fn=llm_extract_fn,
+                    max_triples=max_triples_per_section,
+                    low_confidence_threshold=low_confidence_threshold,
+                    auto_add_doc_node=False,
+                    ingestion_id=ingestion_id,
+                    content_hash=source_content_hash,
+                    progress_fn=_section_pfn,
+                )
+                elapsed = time.monotonic() - t0
+                _write_section(idx, section, section_slug, section_text, heading,
+                               section_stats, elapsed)
+
+        else:
+            # ── Parallel extraction, serial graph writes ───────
+            # LLM calls run concurrently in a thread pool.  As each
+            # extraction completes, the triples are written to the
+            # graph serially (from the main thread) to avoid races.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def _llm_extract(
+                idx: int, section: dict[str, Any], section_slug: str,
+                section_text: str, heading: str,
+            ) -> tuple[int, dict[str, Any], str, str, str, list[dict[str, Any]] | None, str | None, float]:
+                """Run LLM extraction for one section (thread-safe)."""
+                t0 = time.monotonic()
+                prompt = self.build_extraction_prompt(
+                    section_text,
+                    max_triples=max_triples_per_section,
+                )
+                if progress_fn:
+                    progress_fn({
+                        "event": "section_start",
+                        "index": idx,
+                        "total": len(sections),
+                        "heading": heading,
+                        "char_count": section["char_count"],
+                    })
+                try:
+                    triples = llm_extract_fn(prompt)
+                except Exception as exc:
+                    return (idx, section, section_slug, section_text, heading,
+                            None, f"LLM extraction failed: {exc}",
+                            time.monotonic() - t0)
+                if progress_fn:
+                    progress_fn({
+                        "event": "extraction_done",
+                        "doc_id": f"{doc_id}::{heading}",
+                        "triples_returned": len(triples) if isinstance(triples, list) else 0,
+                    })
+                return (idx, section, section_slug, section_text, heading,
+                        triples, None, time.monotonic() - t0)
+
+            logger.info(
+                "[%s] Parallel extraction with %d threads for %d sections",
+                doc_id, _parallel, len(extractable),
+            )
+
+            with ThreadPoolExecutor(max_workers=_parallel) as executor:
+                futures = {
+                    executor.submit(_llm_extract, *args): args
+                    for args in extractable
+                }
+
+                for future in as_completed(futures):
+                    (idx, section, section_slug, section_text, heading,
+                     triples, error, elapsed) = future.result()
+
+                    if error:
+                        section_stats: dict[str, Any] = {
+                            "triples_processed": 0, "nodes_added": 0,
+                            "nodes_updated": 0, "edges_added": 0,
+                            "edges_updated": 0, "proposals_created": 0,
+                            "proposals_augmented": 0, "errors": [error],
+                        }
+                        logger.error(
+                            "[%s] [%d/%d] %s",
+                            doc_id, idx + 1, len(sections), error,
+                        )
+                    elif not isinstance(triples, list):
+                        section_stats = {
+                            "triples_processed": 0, "nodes_added": 0,
+                            "nodes_updated": 0, "edges_added": 0,
+                            "edges_updated": 0, "proposals_created": 0,
+                            "proposals_augmented": 0,
+                            "errors": [f"LLM returned non-list: {type(triples)}"],
+                        }
+                    else:
+                        # Serial graph write — safe, no concurrent mutation
+                        section_stats = self.ingest_triples(
+                            triples,
+                            text=section_text,
+                            doc_id=f"{doc_id}::{heading}",
+                            low_confidence_threshold=low_confidence_threshold,
+                            auto_add_doc_node=False,
+                            ingestion_id=ingestion_id,
+                            content_hash=source_content_hash,
+                        )
+
+                    _write_section(idx, section, section_slug, section_text,
+                                   heading, section_stats, elapsed)
 
         # Add links found in the document as lightweight reference edges
         all_links: list[dict[str, str]] = []
@@ -6333,6 +6442,11 @@ def main():
                              "Useful for using a fast model (e.g. Haiku) for extraction.")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip automatic visualization export after ingestion")
+    parser.add_argument("-j", "--parallel", type=int, default=1, metavar="N",
+                        dest="parallel",
+                        help="Number of parallel LLM extraction threads during ingestion. "
+                             "LLM calls run concurrently while graph writes remain serial. "
+                             "(default: 1, sequential)")
     parser.add_argument("--auto-accept", action="store_true",
                         help="Automatically accept all new relation proposals created during ingestion")
     parser.add_argument("--sources", action="store_true",
@@ -6557,6 +6671,9 @@ def main():
             # nodes and store the source. Entity extraction is skipped.
             extract_fn = lambda _text: []
 
+        if args.parallel > 1 and not _quiet:
+            print(f"  Parallel extractions: {args.parallel} threads")
+
         def _progress(event: dict[str, Any]) -> None:
             if _quiet:
                 return
@@ -6689,6 +6806,7 @@ def main():
                     "file_size": md_path.stat().st_size,
                 },
                 progress_fn=_progress,
+                parallel_extractions=args.parallel,
             )
             _total_elapsed = time.monotonic() - _ingest_t0
 

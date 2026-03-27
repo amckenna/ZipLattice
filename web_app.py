@@ -593,13 +593,18 @@ async def ingest_documents(
     bedrock_region: str = Form(""),
     bedrock_profile: str = Form(""),
     verbose: str = Form(""),
+    parallel: str = Form("1"),
 ):
     """Run LLM ingestion with streaming progress log."""
     _verbose = verbose.strip() == "1"
+    try:
+        _parallel = max(1, int(parallel.strip() or "1"))
+    except (ValueError, TypeError):
+        _parallel = 1
     logger.info(
-        "POST /ingest graph=%s batch=%s provider=%s model=%s embed=%s verbose=%s",
+        "POST /ingest graph=%s batch=%s provider=%s model=%s embed=%s verbose=%s parallel=%d",
         graph_name, batch_id, provider,
-        extract_model.strip() or query_model, embed_model, _verbose,
+        extract_model.strip() or query_model, embed_model, _verbose, _parallel,
     )
 
     batch_entry = _upload_batches.pop(batch_id, None)
@@ -651,11 +656,15 @@ async def ingest_documents(
         total_docs = len(batch)
         graph_stats_before = kg.stats()
 
+        if _parallel > 1:
+            yield _log(f"Parallel extractions: {_parallel} threads")
+
         if _verbose:
             yield _log(
                 f"Config: provider={provider} extract_model={_model} "
                 f"embed_model={embed_model} api_url={api_url} "
-                f"embed_url={embed_url.strip() or api_url}"
+                f"embed_url={embed_url.strip() or api_url} "
+                f"parallel={_parallel}"
             )
             yield _log(
                 f"Graph before: {graph_stats_before.get('num_nodes', 0)} nodes, "
@@ -693,6 +702,7 @@ async def ingest_documents(
                             llm_extract_fn=extract_fn,
                             original_path=doc.get("filename"),
                             progress_fn=_capture_progress,
+                            parallel_extractions=_parallel,
                         )
                         ingest_result.update(stats)
                     except Exception as exc:

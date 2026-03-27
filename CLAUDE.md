@@ -88,6 +88,8 @@ python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
 python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b --embed-model qwen3-embedding
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --api-url http://exo:11434
+# Parallel ingestion: 4 concurrent LLM extraction threads, serial graph writes
+python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b -j 4
 
 # Ingest with Claude API (Haiku for fast extraction, local embeddings)
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-haiku-4-5 --embed-model qwen3-embedding
@@ -177,6 +179,7 @@ python -c "from query_graph import search_nodes, build_context, ask"
 - **LLM provider abstraction:** Chat/extraction functions accept callables (`llm_fn`, `llm_extract_fn`), making the core logic provider-agnostic. The `--provider` flag selects between `local` (OpenAI-compatible servers), `anthropic` (Claude API via `ANTHROPIC_API_KEY` env var), and `bedrock` (AWS Bedrock via `boto3` and standard AWS credentials). The Bedrock provider uses the Converse API for chat/extraction and `invoke_model` for embeddings (Titan and Cohere models). By default, embeddings use a local server unless `--embed-model` is explicitly set with the `bedrock` provider.
 - **MCP server / orchestrator-as-extractor:** `mcp_server.py` exposes graph operations as MCP tools via FastMCP. The key insight is that the calling orchestrator (e.g. Claude Code) *is* an LLM, so it can perform entity extraction itself using `build_extraction_prompt` and pass structured triples to `ingest_triples`, eliminating the need for a second LLM backend. The `ingest_triples()` method on `KnowledgeGraph` is the public API for this pattern — it accepts pre-extracted triples and handles all validation, node/edge creation, and proposal management.
 - **Pre-computed graph layout:** Cytoscape.js visualizations use server-side layout pre-computation via `nx.spring_layout()` (Fruchterman-Reingold). Node x/y positions are embedded in the Cytoscape element JSON and rendered with the `preset` layout, which is instant (no client-side force simulation). The `_compute_layout_positions()` static method handles this for both `cytoscape_elements()` (web frontend) and `export_cytoscape()` (standalone HTML export). Users can still switch to other layout algorithms (cose, circle, breadthfirst, grid, concentric) interactively.
+- **Parallel extraction:** `ingest_markdown()` supports a `parallel_extractions` parameter (CLI: `-j N`, web UI: "Parallel Extraction Threads" field). When > 1, LLM extraction calls run concurrently in a `ThreadPoolExecutor` while graph writes (`ingest_triples`, `add_node`, `add_edge`) remain serial on the main thread. Phase 1 creates all structural nodes/edges (fast, serial), Phase 2 dispatches LLM calls in parallel and applies results serially as they complete. This is safe because `build_extraction_prompt()` only reads graph state and `llm_extract_fn` is a pure network call with no graph mutations.
 
 ## Common patterns when modifying this code
 
