@@ -24,12 +24,23 @@
             <span class="text-red-400">{{ f.error }}</span>
             {% else %}
             <span class="text-green-400">OK</span>
+            <a href="/download-markdown/{{ batch_id }}/{{ f.doc_index }}"
+               class="ml-2 text-gray-400 hover:text-white text-xs underline"
+               title="Download converted markdown">&#8595; .md</a>
             {% endif %}
           </td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
+    {% if files|selectattr('doc_index', 'defined')|list|length > 1 %}
+    <div class="mt-2">
+      <a href="/download-markdown-zip/{{ batch_id }}"
+         class="text-gray-400 hover:text-white text-xs underline">
+        &#8595; Download all as .zip
+      </a>
+    </div>
+    {% endif %}
   </div>
 
   <!-- Ingest form -->

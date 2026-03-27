@@ -474,13 +474,15 @@ async def upload_files(
             continue
         md_text, err = _convert_file(f.filename or "unknown", content)
         doc_id = Path(f.filename or "unknown").stem
-        results.append({
+        entry: dict[str, Any] = {
             "name": f.filename,
             "chars": len(md_text),
             "error": err,
-        })
+        }
         if not err:
+            entry["doc_index"] = len(batch_docs)
             batch_docs.append({"doc_id": doc_id, "text": md_text, "filename": f.filename})
+        results.append(entry)
 
     _evict_stale_batches()
     batch_id = uuid.uuid4().hex[:12]
@@ -496,6 +498,47 @@ async def upload_files(
         "files": results,
         "batch_id": batch_id,
     })
+
+
+@app.get("/download-markdown/{batch_id}/{doc_index}")
+async def download_markdown(batch_id: str, doc_index: int):
+    """Download a single converted markdown file from an upload batch."""
+    batch_entry = _upload_batches.get(batch_id)
+    if not batch_entry:
+        return HTMLResponse("Batch not found or expired.", status_code=404)
+    docs = batch_entry.get("docs", [])
+    if doc_index < 0 or doc_index >= len(docs):
+        return HTMLResponse("Document not found.", status_code=404)
+    doc = docs[doc_index]
+    stem = Path(doc["filename"]).stem
+    filename = f"{stem}.md"
+    return StreamingResponse(
+        io.BytesIO(doc["text"].encode("utf-8")),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/download-markdown-zip/{batch_id}")
+async def download_markdown_zip(batch_id: str):
+    """Download all converted markdown files from an upload batch as a ZIP."""
+    batch_entry = _upload_batches.get(batch_id)
+    if not batch_entry:
+        return HTMLResponse("Batch not found or expired.", status_code=404)
+    docs = batch_entry.get("docs", [])
+    if not docs:
+        return HTMLResponse("No documents in batch.", status_code=404)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for doc in docs:
+            stem = Path(doc["filename"]).stem
+            zf.writestr(f"{stem}.md", doc["text"])
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="converted_markdown.zip"'},
+    )
 
 
 @app.post("/ingest")

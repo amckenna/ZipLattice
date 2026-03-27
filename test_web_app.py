@@ -19,7 +19,7 @@ _tmp_dir = tempfile.mkdtemp(prefix="ziplattice_test_")
 os.environ["ZIPLATTICE_GRAPHS_DIR"] = _tmp_dir
 
 from knowledge_graph import KnowledgeGraph  # noqa: E402
-from web_app import app, GRAPHS_DIR  # noqa: E402
+from web_app import app, GRAPHS_DIR, _upload_batches  # noqa: E402
 
 
 def _create_graph(name: str) -> None:
@@ -650,3 +650,68 @@ def test_merge_graphs_existing_name():
     )
     assert resp.status_code == 200
     assert "already exists" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Markdown download tests
+# ---------------------------------------------------------------------------
+
+
+def _seed_batch(batch_id: str, docs: list[dict]) -> None:
+    """Seed _upload_batches with test data."""
+    import time
+    _upload_batches[batch_id] = {"docs": docs, "created_at": time.time()}
+
+
+def test_download_markdown_single():
+    """GET /download-markdown/<batch>/<index> returns the markdown file."""
+    _seed_batch("testbatch1", [
+        {"doc_id": "readme", "text": "# Hello\nWorld", "filename": "readme.pdf"},
+    ])
+    resp = client.get("/download-markdown/testbatch1/0")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert "readme.md" in resp.headers["content-disposition"]
+    assert resp.text == "# Hello\nWorld"
+    _upload_batches.pop("testbatch1", None)
+
+
+def test_download_markdown_not_found():
+    """GET /download-markdown with invalid batch returns 404."""
+    resp = client.get("/download-markdown/nonexistent/0")
+    assert resp.status_code == 404
+
+
+def test_download_markdown_bad_index():
+    """GET /download-markdown with out-of-range index returns 404."""
+    _seed_batch("testbatch2", [
+        {"doc_id": "doc", "text": "content", "filename": "doc.md"},
+    ])
+    resp = client.get("/download-markdown/testbatch2/5")
+    assert resp.status_code == 404
+    _upload_batches.pop("testbatch2", None)
+
+
+def test_download_markdown_zip():
+    """GET /download-markdown-zip/<batch> returns a ZIP with all markdown files."""
+    import zipfile as zf
+    import io
+    _seed_batch("testbatch3", [
+        {"doc_id": "a", "text": "AAA", "filename": "a.pdf"},
+        {"doc_id": "b", "text": "BBB", "filename": "b.docx"},
+    ])
+    resp = client.get("/download-markdown-zip/testbatch3")
+    assert resp.status_code == 200
+    assert "application/zip" in resp.headers["content-type"]
+    with zf.ZipFile(io.BytesIO(resp.content)) as z:
+        names = sorted(z.namelist())
+        assert names == ["a.md", "b.md"]
+        assert z.read("a.md").decode() == "AAA"
+        assert z.read("b.md").decode() == "BBB"
+    _upload_batches.pop("testbatch3", None)
+
+
+def test_download_markdown_zip_not_found():
+    """GET /download-markdown-zip with invalid batch returns 404."""
+    resp = client.get("/download-markdown-zip/nonexistent")
+    assert resp.status_code == 404
