@@ -19,7 +19,7 @@ _tmp_dir = tempfile.mkdtemp(prefix="ziplattice_test_")
 os.environ["ZIPLATTICE_GRAPHS_DIR"] = _tmp_dir
 
 from knowledge_graph import KnowledgeGraph  # noqa: E402
-from web_app import app, GRAPHS_DIR  # noqa: E402
+from web_app import app, GRAPHS_DIR, _upload_batches  # noqa: E402
 
 
 def _create_graph(name: str) -> None:
@@ -585,3 +585,133 @@ def test_query_bedrock_with_profile():
     )
     assert resp.status_code == 200
     assert "Error" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Merge routes
+# ---------------------------------------------------------------------------
+
+
+def test_merge_page():
+    resp = client.get("/merge")
+    assert resp.status_code == 200
+    assert "Merge" in resp.text
+
+
+def test_merge_graphs_success():
+    """POST /merge with two graphs produces a merged graph."""
+    for name in ("src1", "src2"):
+        graph_dir = GRAPHS_DIR / name
+        graph_dir.mkdir(parents=True, exist_ok=True)
+        kg = KnowledgeGraph(graph_dir / f"{name}.json")
+        kg.add_node(f"node-{name}", type="concept", label=f"Node {name}")
+        kg.save()
+
+    resp = client.post(
+        "/merge",
+        data={
+            "graph_names": ["src1", "src2"],
+            "output_name": "merged-test",
+            "strategy": "latest",
+        },
+    )
+    assert resp.status_code == 200
+    assert "merged-test" in resp.text
+    assert "successfully" in resp.text
+    assert (GRAPHS_DIR / "merged-test" / "merged-test.json").exists()
+
+
+def test_merge_graphs_too_few():
+    """POST /merge with fewer than 2 graphs returns an error."""
+    _create_graph("only-one")
+    resp = client.post(
+        "/merge",
+        data={
+            "graph_names": ["only-one"],
+            "output_name": "bad-merge",
+            "strategy": "latest",
+        },
+    )
+    assert resp.status_code == 200
+    assert "Error" in resp.text
+
+
+def test_merge_graphs_existing_name():
+    """POST /merge with an existing output name returns an error."""
+    _create_graph("existing")
+    _create_graph("other")
+    resp = client.post(
+        "/merge",
+        data={
+            "graph_names": ["existing", "other"],
+            "output_name": "existing",
+            "strategy": "latest",
+        },
+    )
+    assert resp.status_code == 200
+    assert "already exists" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Markdown download tests
+# ---------------------------------------------------------------------------
+
+
+def _seed_batch(batch_id: str, docs: list[dict]) -> None:
+    """Seed _upload_batches with test data."""
+    import time
+    _upload_batches[batch_id] = {"docs": docs, "created_at": time.time()}
+
+
+def test_download_markdown_single():
+    """GET /download-markdown/<batch>/<index> returns the markdown file."""
+    _seed_batch("testbatch1", [
+        {"doc_id": "readme", "text": "# Hello\nWorld", "filename": "readme.pdf"},
+    ])
+    resp = client.get("/download-markdown/testbatch1/0")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert "readme.md" in resp.headers["content-disposition"]
+    assert resp.text == "# Hello\nWorld"
+    _upload_batches.pop("testbatch1", None)
+
+
+def test_download_markdown_not_found():
+    """GET /download-markdown with invalid batch returns 404."""
+    resp = client.get("/download-markdown/nonexistent/0")
+    assert resp.status_code == 404
+
+
+def test_download_markdown_bad_index():
+    """GET /download-markdown with out-of-range index returns 404."""
+    _seed_batch("testbatch2", [
+        {"doc_id": "doc", "text": "content", "filename": "doc.md"},
+    ])
+    resp = client.get("/download-markdown/testbatch2/5")
+    assert resp.status_code == 404
+    _upload_batches.pop("testbatch2", None)
+
+
+def test_download_markdown_zip():
+    """GET /download-markdown-zip/<batch> returns a ZIP with all markdown files."""
+    import zipfile as zf
+    import io
+    _seed_batch("testbatch3", [
+        {"doc_id": "a", "text": "AAA", "filename": "a.pdf"},
+        {"doc_id": "b", "text": "BBB", "filename": "b.docx"},
+    ])
+    resp = client.get("/download-markdown-zip/testbatch3")
+    assert resp.status_code == 200
+    assert "application/zip" in resp.headers["content-type"]
+    with zf.ZipFile(io.BytesIO(resp.content)) as z:
+        names = sorted(z.namelist())
+        assert names == ["a.md", "b.md"]
+        assert z.read("a.md").decode() == "AAA"
+        assert z.read("b.md").decode() == "BBB"
+    _upload_batches.pop("testbatch3", None)
+
+
+def test_download_markdown_zip_not_found():
+    """GET /download-markdown-zip with invalid batch returns 404."""
+    resp = client.get("/download-markdown-zip/nonexistent")
+    assert resp.status_code == 404

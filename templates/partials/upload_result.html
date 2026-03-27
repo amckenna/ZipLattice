@@ -10,7 +10,7 @@
       <thead>
         <tr class="border-b border-gray-800 text-gray-400 text-left">
           <th class="pb-1 font-normal">File</th>
-          <th class="pb-1 font-normal text-right">Characters</th>
+          <th class="pb-1 font-normal text-right">Tokens (est.)</th>
           <th class="pb-1 font-normal text-right">Status</th>
         </tr>
       </thead>
@@ -18,18 +18,29 @@
         {% for f in files %}
         <tr class="border-b border-gray-800">
           <td class="py-1">{{ f.name }}</td>
-          <td class="py-1 text-right text-gray-400">{{ f.chars }}</td>
+          <td class="py-1 text-right text-gray-400">~{{ "{:,}".format(f.tokens) }}</td>
           <td class="py-1 text-right">
             {% if f.error %}
             <span class="text-red-400">{{ f.error }}</span>
             {% else %}
             <span class="text-green-400">OK</span>
+            <a href="/download-markdown/{{ batch_id }}/{{ f.doc_index }}"
+               class="ml-2 text-gray-400 hover:text-white text-xs underline"
+               title="Download converted markdown">&#8595; .md</a>
             {% endif %}
           </td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
+    {% if files|selectattr('doc_index', 'defined')|list|length > 1 %}
+    <div class="mt-2">
+      <a href="/download-markdown-zip/{{ batch_id }}"
+         class="text-gray-400 hover:text-white text-xs underline">
+        &#8595; Download all as .zip
+      </a>
+    </div>
+    {% endif %}
   </div>
 
   <!-- Ingest form -->
@@ -65,24 +76,38 @@
         <div id="ingest-local-cfg" class="grid grid-cols-2 gap-3">
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">API URL</label>
-            <input type="text" name="api_url" value="http://localhost:11434"
-                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            <div class="flex gap-1">
+              <input type="text" name="api_url" id="ingest-api-url" value="http://localhost:11434"
+                     class="flex-1 bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+              <button type="button" onclick="fetchModels('api')"
+                      class="border border-gray-800 px-2 py-1 text-xs text-gray-400 hover:text-white hover:border-white transition-colors whitespace-nowrap"
+                      id="fetch-api-models-btn">Fetch Models</button>
+            </div>
           </div>
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Extraction Model</label>
-            <input type="text" name="query_model" value="qwen3-coder:30b"
+            <input type="text" name="query_model" id="ingest-query-model" value="qwen3-coder:30b"
+                   list="api-models-list"
                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            <datalist id="api-models-list"></datalist>
           </div>
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Embed URL</label>
-            <input type="text" name="embed_url" value=""
-                   placeholder="Same as API URL"
-                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            <div class="flex gap-1">
+              <input type="text" name="embed_url" id="ingest-embed-url" value=""
+                     placeholder="Same as API URL"
+                     class="flex-1 bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+              <button type="button" onclick="fetchModels('embed')"
+                      class="border border-gray-800 px-2 py-1 text-xs text-gray-400 hover:text-white hover:border-white transition-colors whitespace-nowrap"
+                      id="fetch-embed-models-btn">Fetch Models</button>
+            </div>
           </div>
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Embed Model</label>
-            <input type="text" name="embed_model" value="qwen3-embedding"
+            <input type="text" name="embed_model" id="ingest-embed-model" value="qwen3-embedding"
+                   list="embed-models-list"
                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            <datalist id="embed-models-list"></datalist>
           </div>
         </div>
 
@@ -216,6 +241,50 @@
       localSection.classList.remove('hidden');
       localSection.querySelectorAll('input').forEach(function(el) { el.disabled = false; });
     }
+  }
+
+  async function fetchModels(target) {
+    var urlInput, listId, btn;
+    if (target === 'api') {
+      urlInput = document.getElementById('ingest-api-url');
+      listId = 'api-models-list';
+      btn = document.getElementById('fetch-api-models-btn');
+    } else {
+      urlInput = document.getElementById('ingest-embed-url');
+      listId = 'embed-models-list';
+      btn = document.getElementById('fetch-embed-models-btn');
+    }
+    var baseUrl = urlInput.value.trim();
+    // For embed URL, fall back to API URL if empty
+    if (!baseUrl && target === 'embed') {
+      baseUrl = document.getElementById('ingest-api-url').value.trim();
+    }
+    if (!baseUrl) return;
+
+    btn.disabled = true;
+    var origText = btn.textContent;
+    btn.textContent = 'Fetching…';
+
+    try {
+      var resp = await fetch('/api/models?url=' + encodeURIComponent(baseUrl));
+      var data = await resp.json();
+      var datalist = document.getElementById(listId);
+      datalist.innerHTML = '';
+      if (data.models && data.models.length > 0) {
+        data.models.forEach(function(m) {
+          var opt = document.createElement('option');
+          opt.value = m;
+          datalist.appendChild(opt);
+        });
+        btn.textContent = data.models.length + ' found';
+      } else {
+        btn.textContent = data.error ? 'Error' : 'None found';
+      }
+    } catch(err) {
+      btn.textContent = 'Error';
+    }
+    btn.disabled = false;
+    setTimeout(function() { btn.textContent = origText; }, 3000);
   }
 
   document.getElementById('ingest-form').addEventListener('submit', async function(e) {

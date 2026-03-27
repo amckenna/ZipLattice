@@ -24,6 +24,8 @@ import re
 import shutil
 import tempfile
 import time
+import urllib.request
+import urllib.error
 import uuid
 import threading
 import zipfile
@@ -235,7 +237,7 @@ def _chat_multi_turn(
                 "anthropic-version": _ANTHROPIC_VERSION,
             },
         )
-        with urllib.request.urlopen(req, timeout=1200) as resp:
+        with urllib.request.urlopen(req, timeout=1800) as resp:
             body = json.loads(resp.read())
         return body["content"][0]["text"]
 
@@ -278,7 +280,7 @@ def _chat_multi_turn(
         endpoint, data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=1200) as resp:
+    with urllib.request.urlopen(req, timeout=1800) as resp:
         body = json.loads(resp.read())
     return body["choices"][0]["message"]["content"]
 
@@ -423,6 +425,41 @@ async def get_source_text(name: str, doc_id: str):
     return {"doc_id": doc_id, "text": text}
 
 
+@app.get("/api/models")
+async def list_models(url: str = "http://localhost:11434"):
+    """Proxy request to a local inference endpoint to list available models.
+
+    Tries Ollama ``/api/tags`` first, then the OpenAI-compatible ``/v1/models``
+    endpoint.  Returns ``{"models": ["name", ...]}`` on success.
+    """
+    logger.info("GET /api/models — querying %s for available models", url)
+    base = url.rstrip("/")
+    timeout = 5  # seconds
+
+    # 1) Try Ollama /api/tags
+    try:
+        req = urllib.request.Request(f"{base}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        names = sorted({m.get("name") or m.get("model", "") for m in data.get("models", [])})
+        return {"models": [n for n in names if n]}
+    except Exception:
+        pass
+
+    # 2) Try OpenAI-compatible /v1/models
+    try:
+        req = urllib.request.Request(f"{base}/v1/models", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        names = sorted({m.get("id", "") for m in data.get("data", [])})
+        return {"models": [n for n in names if n]}
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"Could not reach {base}: {exc}"},
+            status_code=502,
+        )
+
+
 @app.get("/upload", response_class=HTMLResponse)
 async def upload_page(request: Request, graph: str = ""):
     """Upload form page."""
@@ -474,13 +511,15 @@ async def upload_files(
             continue
         md_text, err = _convert_file(f.filename or "unknown", content)
         doc_id = Path(f.filename or "unknown").stem
-        results.append({
+        entry: dict[str, Any] = {
             "name": f.filename,
-            "chars": len(md_text),
+            "tokens": len(md_text) // 4,
             "error": err,
-        })
+        }
         if not err:
+            entry["doc_index"] = len(batch_docs)
             batch_docs.append({"doc_id": doc_id, "text": md_text, "filename": f.filename})
+        results.append(entry)
 
     _evict_stale_batches()
     batch_id = uuid.uuid4().hex[:12]
@@ -496,6 +535,47 @@ async def upload_files(
         "files": results,
         "batch_id": batch_id,
     })
+
+
+@app.get("/download-markdown/{batch_id}/{doc_index}")
+async def download_markdown(batch_id: str, doc_index: int):
+    """Download a single converted markdown file from an upload batch."""
+    batch_entry = _upload_batches.get(batch_id)
+    if not batch_entry:
+        return HTMLResponse("Batch not found or expired.", status_code=404)
+    docs = batch_entry.get("docs", [])
+    if doc_index < 0 or doc_index >= len(docs):
+        return HTMLResponse("Document not found.", status_code=404)
+    doc = docs[doc_index]
+    stem = Path(doc["filename"]).stem
+    filename = f"{stem}.md"
+    return StreamingResponse(
+        io.BytesIO(doc["text"].encode("utf-8")),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/download-markdown-zip/{batch_id}")
+async def download_markdown_zip(batch_id: str):
+    """Download all converted markdown files from an upload batch as a ZIP."""
+    batch_entry = _upload_batches.get(batch_id)
+    if not batch_entry:
+        return HTMLResponse("Batch not found or expired.", status_code=404)
+    docs = batch_entry.get("docs", [])
+    if not docs:
+        return HTMLResponse("No documents in batch.", status_code=404)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for doc in docs:
+            stem = Path(doc["filename"]).stem
+            zf.writestr(f"{stem}.md", doc["text"])
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="converted_markdown.zip"'},
+    )
 
 
 @app.post("/ingest")
@@ -582,9 +662,9 @@ async def ingest_documents(
             )
 
         for di, doc in enumerate(batch):
-            doc_chars = len(doc.get("text", ""))
+            doc_tokens = len(doc.get("text", "")) // 4
             if _verbose:
-                yield _log(f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}' ({doc_chars} chars)...")
+                yield _log(f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}' (~{doc_tokens:,} tokens)...")
             else:
                 yield _log(f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}'...")
 
@@ -612,8 +692,16 @@ async def ingest_documents(
                     idx = ev.get("index", 0) + 1
                     total = ev.get("total", "?")
                     heading = ev.get("heading", "")
-                    if evt == "section_start":
-                        yield _log(f"  section {idx}/{total}: {heading} ({ev.get('char_count', 0)} chars)...")
+                    if evt == "doc_start":
+                        secs = ev.get("total_sections", 0)
+                        ccount = ev.get("char_count", 0)
+                        yield _log(f"  Document: \"{ev.get('doc_id', '?')}\" (~{ccount // 4:,} tokens, {secs} sections)")
+                    elif evt == "section_start":
+                        yield _log(f"  section {idx}/{total}: {heading} (~{ev.get('char_count', 0) // 4:,} tokens)...")
+                    elif evt == "extraction_done":
+                        if _verbose:
+                            n = ev.get("triples_returned", 0)
+                            yield _log(f"    LLM returned {n} triples")
                     elif evt == "section_done":
                         elapsed = ev.get("elapsed_seconds", 0)
                         triples = ev.get("triples", 0)
@@ -645,6 +733,10 @@ async def ingest_documents(
                             errors = ev.get("errors", [])
                             for err in errors:
                                 yield _log(f"    warning: {err}")
+                    elif evt == "doc_done":
+                        if _verbose:
+                            yield _log(f"  Document complete: {ev.get('total_triples', 0)} triples, "
+                                       f"{ev.get('total_nodes_added', 0)} nodes, {ev.get('total_edges_added', 0)} edges")
                     elif evt == "section_skip":
                         yield _log(f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})")
 
@@ -1157,6 +1249,76 @@ async def import_graph(
         safe_name, st.get("num_nodes", 0), st.get("num_edges", 0),
     )
     return templates.TemplateResponse("partials/import_result.html", {
+        "request": request,
+        "graph_name": safe_name,
+        "stats": st,
+    })
+
+
+@app.get("/merge", response_class=HTMLResponse)
+async def merge_form(request: Request):
+    """Show the merge graph form with checkboxes for each graph."""
+    graphs = _list_graphs()
+    return templates.TemplateResponse("merge.html", {
+        "request": request,
+        "graphs": graphs,
+    })
+
+
+@app.post("/merge", response_class=HTMLResponse)
+async def merge_graphs_route(
+    request: Request,
+    graph_names: list[str] = Form(...),
+    output_name: str = Form(...),
+    strategy: str = Form("latest"),
+):
+    """Merge selected graphs into a new graph."""
+    logger.info("POST /merge graphs=%s output=%s strategy=%s",
+                graph_names, output_name, strategy)
+
+    # Validate output name
+    safe_name = slugify(output_name)
+    if not safe_name:
+        return templates.TemplateResponse("partials/merge_result.html", {
+            "request": request,
+            "error": "Invalid output graph name.",
+        })
+
+    if len(graph_names) < 2:
+        return templates.TemplateResponse("partials/merge_result.html", {
+            "request": request,
+            "error": "Select at least two graphs to merge.",
+        })
+
+    # Check that output doesn't already exist
+    output_dir = GRAPHS_DIR / safe_name
+    if output_dir.exists():
+        return templates.TemplateResponse("partials/merge_result.html", {
+            "request": request,
+            "error": f"A graph named '{safe_name}' already exists.",
+        })
+
+    if strategy not in ("latest", "first", "last"):
+        strategy = "latest"
+
+    try:
+        source_kgs = [_load_graph(name) for name in graph_names]
+        output_path = GRAPHS_DIR / safe_name / f"{safe_name}.json"
+        merged = KnowledgeGraph.merge_graphs(
+            source_kgs, output_path, prefer=strategy,
+        )
+        st = merged.stats()
+    except Exception as exc:
+        logger.error("Merge failed: %s", exc)
+        return templates.TemplateResponse("partials/merge_result.html", {
+            "request": request,
+            "error": f"Merge failed: {exc}",
+        })
+
+    logger.info("Merged %d graphs → '%s': %d nodes, %d edges",
+                len(graph_names), safe_name,
+                st.get("num_nodes", 0), st.get("num_edges", 0))
+    return templates.TemplateResponse("partials/merge_result.html", {
         "request": request,
         "graph_name": safe_name,
         "stats": st,

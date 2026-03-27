@@ -502,6 +502,286 @@ def test_merge_embeddings_dirty(tmp_path):
     assert kg1.get_embedding("a") == [1.0, 2.0]
 
 
+def test_merge_smart_node_conflict(tmp_path):
+    """Smart merge keeps max confidence and combines descriptions."""
+    kg1 = KnowledgeGraph(tmp_path / "sc1.json")
+    kg1.add_node("radar", type="concept", label="Radar",
+                 properties={"description": "A detection system"},
+                 source="doc:a", confidence=0.7)
+
+    kg2 = KnowledgeGraph(tmp_path / "sc2.json")
+    kg2.add_node("radar", type="system", label="RADAR",
+                 properties={"description": "Radio detection and ranging"},
+                 source="doc:b", confidence=0.9)
+
+    stats = kg1.merge(kg2, prefer="other")
+    node = kg1.get_node("radar")
+    assert node["confidence"] == 0.9
+    # Both descriptions should be present
+    assert "detection system" in node["properties"]["description"]
+    assert "Radio detection" in node["properties"]["description"]
+    assert stats["nodes_updated"] == 1
+
+
+def test_merge_smart_edge_conflict(tmp_path):
+    """Smart merge keeps max confidence for duplicate edges."""
+    kg1 = KnowledgeGraph(tmp_path / "ec1.json")
+    kg1.add_node("a", type="concept")
+    kg1.add_node("b", type="concept")
+    kg1.add_edge("a", "b", relation="uses", confidence=0.5)
+
+    kg2 = KnowledgeGraph(tmp_path / "ec2.json")
+    kg2.add_node("a", type="concept")
+    kg2.add_node("b", type="concept")
+    kg2.add_edge("a", "b", relation="uses", confidence=0.9,
+                 properties={"context": "high"})
+
+    stats = kg1.merge(kg2)
+    edges = kg1.get_edges("a", direction="outgoing")
+    assert len(edges) == 1
+    assert edges[0]["confidence"] == 0.9
+    assert edges[0]["properties"]["context"] == "high"
+    assert stats["edges_updated"] == 1
+
+
+def test_merge_node_types(tmp_path):
+    """Merge unions node_types from both graphs."""
+    kg1 = KnowledgeGraph(tmp_path / "nt1.json")
+    kg1._data["meta"]["node_types"] = ["concept", "tool"]
+
+    kg2 = KnowledgeGraph(tmp_path / "nt2.json")
+    kg2._data["meta"]["node_types"] = ["concept", "system", "person"]
+
+    kg1.merge(kg2)
+    types = set(kg1._data["meta"]["node_types"])
+    assert types == {"concept", "tool", "system", "person"}
+
+
+def test_merge_source_documents(tmp_path):
+    """Merge copies source documents from the other graph."""
+    kg1 = KnowledgeGraph(tmp_path / "ms1.json")
+    kg1.store_source("Content A", "doc-a")
+
+    kg2 = KnowledgeGraph(tmp_path / "ms2.json")
+    kg2.store_source("Content B", "doc-b")
+
+    stats = kg1.merge(kg2)
+    assert stats["sources_added"] == 1
+    manifest = kg1._data["meta"]["sources"]
+    assert "doc-a" in manifest
+    assert "doc-b" in manifest
+
+
+def test_merge_source_documents_dedup(tmp_path):
+    """Same content hash in both graphs is skipped."""
+    kg1 = KnowledgeGraph(tmp_path / "sd1.json")
+    kg1.store_source("Same content", "doc-1")
+
+    kg2 = KnowledgeGraph(tmp_path / "sd2.json")
+    kg2.store_source("Same content", "doc-1")
+
+    stats = kg1.merge(kg2)
+    assert stats["sources_skipped"] == 1
+
+
+def test_merge_proposals_status(tmp_path):
+    """Proposal status resolution: ACCEPTED > PENDING > REJECTED."""
+    from knowledge_graph import RelationProposal, ProposalStatus
+
+    kg1 = KnowledgeGraph(tmp_path / "ps1.json")
+    p1 = RelationProposal(name="feeds_into", justification="test",
+                          status=ProposalStatus.PENDING.value, confidence=0.5)
+    kg1._proposals.append(p1)
+
+    kg2 = KnowledgeGraph(tmp_path / "ps2.json")
+    p2 = RelationProposal(name="feeds_into", justification="test",
+                          status=ProposalStatus.ACCEPTED.value, confidence=0.8)
+    kg2._proposals.append(p2)
+
+    kg1.merge(kg2)
+    merged_p = [p for p in kg1._proposals if p.name == "feeds_into"][0]
+    assert merged_p.status == ProposalStatus.ACCEPTED.value
+    assert merged_p.confidence == 0.8
+
+
+def test_merge_embed_meta_warning(tmp_path, caplog):
+    """Merging graphs with different embedding models logs a warning."""
+    import logging
+
+    kg1 = KnowledgeGraph(tmp_path / "ew1.json")
+    kg1.add_node("a", type="concept")
+    kg1._embed_meta = {"model": "model-a", "dimension": 128}
+
+    kg2 = KnowledgeGraph(tmp_path / "ew2.json")
+    kg2.add_node("a", type="concept")
+    kg2._embed_meta = {"model": "model-b", "dimension": 128}
+    kg2._embeddings["a"] = [1.0] * 128
+
+    with caplog.at_level(logging.WARNING):
+        kg1.merge(kg2)
+    assert "different embedding models" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# merge_graphs classmethod
+# ---------------------------------------------------------------------------
+
+
+def test_merge_graphs_basic(tmp_path):
+    """merge_graphs creates a new graph with nodes from both sources."""
+    kg1 = KnowledgeGraph(tmp_path / "mg1.json")
+    kg1.add_node("a", type="concept", label="Alpha")
+    kg1.add_edge("a", "a", relation="self_ref")
+    kg1.save()
+
+    kg2 = KnowledgeGraph(tmp_path / "mg2.json")
+    kg2.add_node("b", type="concept", label="Beta")
+    kg2.save()
+
+    merged = KnowledgeGraph.merge_graphs(
+        [kg1, kg2], tmp_path / "merged.json",
+    )
+    assert merged.has_node("a")
+    assert merged.has_node("b")
+    assert merged.graph_path.exists()
+    st = merged.stats()
+    assert st["num_nodes"] == 2
+    assert st["num_edges"] == 1
+
+
+def test_merge_graphs_from_paths(tmp_path):
+    """merge_graphs accepts file paths as strings."""
+    kg1 = KnowledgeGraph(tmp_path / "p1.json")
+    kg1.add_node("x", type="concept")
+    kg1.save()
+
+    kg2 = KnowledgeGraph(tmp_path / "p2.json")
+    kg2.add_node("y", type="concept")
+    kg2.save()
+
+    merged = KnowledgeGraph.merge_graphs(
+        [str(kg1.graph_path), str(kg2.graph_path)],
+        tmp_path / "pm.json",
+    )
+    assert merged.has_node("x")
+    assert merged.has_node("y")
+
+
+def test_merge_graphs_prefer_first(tmp_path):
+    """'first' strategy keeps first graph's data on conflict."""
+    kg1 = KnowledgeGraph(tmp_path / "f1.json")
+    kg1.add_node("n", type="concept", label="First", confidence=0.5)
+    kg1.save()
+
+    kg2 = KnowledgeGraph(tmp_path / "f2.json")
+    kg2.add_node("n", type="concept", label="Second", confidence=0.9)
+    kg2.save()
+
+    merged = KnowledgeGraph.merge_graphs(
+        [kg1, kg2], tmp_path / "first.json", prefer="first",
+    )
+    node = merged.get_node("n")
+    # First graph's label wins
+    assert node["label"] == "First"
+
+
+def test_merge_graphs_prefer_last(tmp_path):
+    """'last' strategy keeps last graph's data on conflict."""
+    kg1 = KnowledgeGraph(tmp_path / "l1.json")
+    kg1.add_node("n", type="concept", label="First", confidence=0.5)
+    kg1.save()
+
+    kg2 = KnowledgeGraph(tmp_path / "l2.json")
+    kg2.add_node("n", type="concept", label="Second", confidence=0.9)
+    kg2.save()
+
+    merged = KnowledgeGraph.merge_graphs(
+        [kg1, kg2], tmp_path / "last.json", prefer="last",
+    )
+    node = merged.get_node("n")
+    assert node["label"] == "Second"
+
+
+def test_merge_graphs_three_sources(tmp_path):
+    """Merging three graphs works correctly."""
+    graphs = []
+    for i, name in enumerate(["t1", "t2", "t3"]):
+        kg = KnowledgeGraph(tmp_path / f"{name}.json")
+        kg.add_node(f"node-{i}", type="concept", label=f"Node {i}")
+        kg.save()
+        graphs.append(kg)
+
+    merged = KnowledgeGraph.merge_graphs(
+        graphs, tmp_path / "three.json",
+    )
+    assert merged.stats()["num_nodes"] == 3
+
+
+def test_merge_graphs_roundtrip(tmp_path):
+    """Merged graph survives save/load round-trip."""
+    kg1 = KnowledgeGraph(tmp_path / "rt1.json")
+    kg1.add_node("a", type="concept", label="Alpha",
+                 properties={"description": "A"})
+    kg1.add_node("b", type="concept", label="Beta")
+    kg1.add_edge("a", "b", relation="uses")
+    kg1._embeddings["a"] = [1.0, 2.0, 3.0]
+    kg1.save_all()
+
+    kg2 = KnowledgeGraph(tmp_path / "rt2.json")
+    kg2.add_node("c", type="concept", label="Gamma")
+    kg2.save()
+
+    merged = KnowledgeGraph.merge_graphs(
+        [kg1, kg2], tmp_path / "roundtrip.json",
+    )
+
+    # Reload from disk
+    reloaded = KnowledgeGraph(merged.graph_path)
+    assert reloaded.has_node("a")
+    assert reloaded.has_node("b")
+    assert reloaded.has_node("c")
+    assert len(reloaded._data["edges"]) == 1
+    assert reloaded.get_embedding("a") == [1.0, 2.0, 3.0]
+
+
+def test_merge_graphs_empty(tmp_path):
+    """Merging two empty graphs produces an empty graph."""
+    kg1 = KnowledgeGraph(tmp_path / "e1.json")
+    kg1.save()
+    kg2 = KnowledgeGraph(tmp_path / "e2.json")
+    kg2.save()
+
+    merged = KnowledgeGraph.merge_graphs(
+        [kg1, kg2], tmp_path / "empty.json",
+    )
+    st = merged.stats()
+    assert st["num_nodes"] == 0
+    assert st["num_edges"] == 0
+
+
+def test_merge_graphs_requires_two(tmp_path):
+    """merge_graphs raises ValueError with fewer than 2 sources."""
+    import pytest
+    kg = KnowledgeGraph(tmp_path / "one.json")
+    with pytest.raises(ValueError, match="at least 2"):
+        KnowledgeGraph.merge_graphs([kg], tmp_path / "out.json")
+
+
+def test_merge_graphs_description(tmp_path):
+    """Auto-generated description lists source graph names."""
+    kg1 = KnowledgeGraph(tmp_path / "d1.json")
+    kg1.save()
+    kg2 = KnowledgeGraph(tmp_path / "d2.json")
+    kg2.save()
+
+    merged = KnowledgeGraph.merge_graphs(
+        [kg1, kg2], tmp_path / "desc.json",
+    )
+    desc = merged._data["meta"]["description"]
+    assert "d1" in desc
+    assert "d2" in desc
+
+
 # ---------------------------------------------------------------------------
 # store_source
 # ---------------------------------------------------------------------------

@@ -71,7 +71,7 @@ def ollama_embed(
     )
     logger.debug("ollama_embed: POST %s  model=%s  texts=%d", endpoint, model, len(texts))
     try:
-        with urllib.request.urlopen(req, timeout=240) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -221,7 +221,7 @@ def local_extract(
     logger.debug("local_extract: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=1200) as resp:
+        with urllib.request.urlopen(req, timeout=1800) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -323,7 +323,7 @@ def _anthropic_request(
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            with urllib.request.urlopen(req, timeout=1200) as resp:
+            with urllib.request.urlopen(req, timeout=1800) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             detail = ""
@@ -916,6 +916,38 @@ def _merge_description(
         if entry["text"] not in seen_texts:
             seen_texts.append(entry["text"])
     existing_props["description"] = "; ".join(seen_texts)
+
+
+def _copy_source_file(
+    src_kg: "KnowledgeGraph",
+    dst_kg: "KnowledgeGraph",
+    manifest_entry: dict[str, Any],
+) -> None:
+    """Copy a source file from one graph's sources directory to another.
+
+    Updates *manifest_entry*'s ``stored_path`` to point to the new location
+    inside *dst_kg*'s sources directory.  If the source file does not exist
+    on disk the entry is kept but no file is copied.
+    """
+    stored = Path(manifest_entry.get("stored_path", ""))
+    if not stored.is_absolute():
+        stored = src_kg.graph_path.parent / stored
+    if not stored.exists():
+        logger.debug("Source file not found during merge copy: %s", stored)
+        return
+
+    dst_kg.sources_dir.mkdir(parents=True, exist_ok=True)
+    dest = dst_kg.sources_dir / stored.name
+    if not dest.exists() or dest.read_bytes() != stored.read_bytes():
+        import shutil
+        shutil.copy2(str(stored), str(dest))
+
+    # Rewrite stored_path relative to the destination graph dir
+    try:
+        rel = dest.relative_to(dst_kg.graph_path.parent)
+    except ValueError:
+        rel = dest
+    manifest_entry["stored_path"] = str(rel)
 
 
 # ---------------------------------------------------------------------------
@@ -2540,6 +2572,7 @@ class KnowledgeGraph:
         max_chars: int = 4000,
         store_text: bool = False,
         model_name: str | None = None,
+        progress_fn: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """
         Generate embeddings for nodes in batch.
@@ -2577,6 +2610,9 @@ class KnowledgeGraph:
             store_text: If True, store the generated embedding text in the
                         node's properties under 'embedding_text' (useful for
                         debugging and inspection).
+            progress_fn: Optional callback for real-time progress reporting.
+                         Events: "embed_start", "embed_batch_done",
+                         "embed_done".
 
         Returns:
             Stats dict: nodes_embedded, nodes_skipped, batches, errors.
@@ -2615,6 +2651,13 @@ class KnowledgeGraph:
 
         total_to_embed = len(candidates)
         logger.info("Preparing to embed %d nodes...", total_to_embed)
+
+        if progress_fn:
+            progress_fn({
+                "event": "embed_start",
+                "total_nodes": total_to_embed,
+                "nodes_skipped": stats["nodes_skipped"],
+            })
 
         # Build embedding texts
         texts: list[tuple[str, str]] = []  # (node_id, text)
@@ -2669,6 +2712,15 @@ class KnowledgeGraph:
                 self._dirty_embeddings = True
                 stats["batches"] += 1
 
+                if progress_fn:
+                    progress_fn({
+                        "event": "embed_batch_done",
+                        "batch": stats["batches"],
+                        "total_batches": total_batches,
+                        "nodes_embedded": stats["nodes_embedded"],
+                        "total_nodes": total_to_embed,
+                    })
+
             except Exception as e:
                 stats["errors"].append(
                     f"Batch {stats['batches']} failed: {e} "
@@ -2690,6 +2742,16 @@ class KnowledgeGraph:
             stats["nodes_embedded"], stats["batches"],
             stats["nodes_skipped"], len(stats["errors"]),
         )
+
+        if progress_fn:
+            progress_fn({
+                "event": "embed_done",
+                "nodes_embedded": stats["nodes_embedded"],
+                "nodes_skipped": stats["nodes_skipped"],
+                "batches": stats["batches"],
+                "errors": len(stats["errors"]),
+            })
+
         return stats
 
     def embed_query(
@@ -3090,6 +3152,7 @@ TEXT:
         auto_add_doc_node: bool = True,
         ingestion_id: str | None = None,
         content_hash: str | None = None,
+        progress_fn: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """
         Process a document through the extraction pipeline:
@@ -3115,6 +3178,10 @@ TEXT:
                           all created nodes and edges for provenance tracking).
             content_hash: Content hash of the source document (propagated to all
                           created nodes and edges).
+            progress_fn: Optional callback for real-time progress reporting.
+                         Called with event dicts containing at least an "event"
+                         key. Events: "extraction_start", "extraction_done",
+                         "triple_done".
 
         Returns:
             Stats dict: nodes_added, edges_added, proposals_created, proposals_augmented,
@@ -3135,6 +3202,9 @@ TEXT:
             text, focus_entities=focus_entities, max_triples=max_triples
         )
 
+        if progress_fn:
+            progress_fn({"event": "extraction_start", "doc_id": doc_id})
+
         try:
             triples = llm_extract_fn(prompt)
         except Exception as e:
@@ -3150,6 +3220,13 @@ TEXT:
             )
             return stats
 
+        if progress_fn:
+            progress_fn({
+                "event": "extraction_done",
+                "doc_id": doc_id,
+                "triples_returned": len(triples),
+            })
+
         return self.ingest_triples(
             triples,
             text=text,
@@ -3158,6 +3235,7 @@ TEXT:
             auto_add_doc_node=auto_add_doc_node,
             ingestion_id=ingestion_id,
             content_hash=content_hash,
+            progress_fn=progress_fn,
         )
 
     def ingest_triples(
@@ -3170,6 +3248,7 @@ TEXT:
         auto_add_doc_node: bool = True,
         ingestion_id: str | None = None,
         content_hash: str | None = None,
+        progress_fn: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """
         Process pre-extracted triples into the knowledge graph.
@@ -3211,6 +3290,9 @@ TEXT:
             ingestion_id: Unique identifier for this ingestion run
                 (propagated to all created nodes and edges).
             content_hash: Content hash of the source document.
+            progress_fn: Optional callback for real-time progress reporting.
+                         Called with ``{"event": "triple_done", ...}`` after
+                         each triple is processed.
 
         Returns:
             Stats dict: nodes_added, nodes_updated, edges_added,
@@ -3321,7 +3403,8 @@ TEXT:
                     source=f"doc_ingest",
                 )
 
-        for triple in triples:
+        _total_triples = len(triples)
+        for _ti, triple in enumerate(triples):
             stats["triples_processed"] += 1
             try:
                 # Normalize list-format triples into dicts.
@@ -3562,6 +3645,18 @@ TEXT:
             except Exception as e:
                 stats["errors"].append(f"Triple processing error: {e} — {triple}")
                 logger.warning("Error processing triple from doc '%s': %s", doc_id, e)
+
+            if progress_fn:
+                progress_fn({
+                    "event": "triple_done",
+                    "index": _ti,
+                    "total": _total_triples,
+                    "doc_id": doc_id,
+                    "nodes_added": stats["nodes_added"],
+                    "nodes_updated": stats["nodes_updated"],
+                    "edges_added": stats["edges_added"],
+                    "edges_updated": stats["edges_updated"],
+                })
 
         # Link extracted entities to the document node
         if auto_add_doc_node and entity_ids:
@@ -3883,8 +3978,13 @@ TEXT:
             doc_properties: Extra properties to attach to the document node.
             progress_fn: Optional callback for real-time progress reporting.
                          Called with event dicts containing at least an "event"
-                         key. Events: "section_start", "section_done",
-                         "section_skip".
+                         key.  Document-level events: "doc_start", "doc_done".
+                         Section-level events: "section_start", "section_done",
+                         "section_skip".  Extraction-level events (fired per
+                         section): "extraction_start", "extraction_done".
+                         Triple-level events: "triple_done" (fired for each
+                         triple processed, includes section_index/section_total/
+                         section_heading for correlation).
 
         Returns:
             Aggregate stats dict with per-section breakdown.
@@ -3956,6 +4056,15 @@ TEXT:
         if not sections:
             aggregate_stats["errors"].append("No sections found in markdown.")
             return aggregate_stats
+
+        # Notify progress callback of document ingestion start
+        if progress_fn:
+            progress_fn({
+                "event": "doc_start",
+                "doc_id": doc_id,
+                "total_sections": len(sections),
+                "char_count": len(text),
+            })
 
         doc_slug = slugify(doc_id)
 
@@ -4087,6 +4196,24 @@ TEXT:
             # Run LLM extraction on this section
             section_text = context_prefix + body
             t0 = time.monotonic()
+            # Build a section-scoped progress callback that injects
+            # section index/total/heading into sub-events so callers can
+            # correlate triple-level progress with the enclosing section.
+            _section_pfn: Callable[[dict[str, Any]], None] | None = None
+            if progress_fn:
+                _sec_i = i
+                _sec_total = len(sections)
+                _sec_heading = heading
+
+                def _section_pfn(event: dict[str, Any],
+                                 _i: int = _sec_i,
+                                 _t: int = _sec_total,
+                                 _h: str = _sec_heading) -> None:
+                    event.setdefault("section_index", _i)
+                    event.setdefault("section_total", _t)
+                    event.setdefault("section_heading", _h)
+                    progress_fn(event)  # type: ignore[misc]
+
             section_stats = self.ingest_document(
                 section_text,
                 doc_id=f"{doc_id}::{heading}",
@@ -4096,6 +4223,7 @@ TEXT:
                 auto_add_doc_node=False,  # we handle doc nodes ourselves
                 ingestion_id=ingestion_id,
                 content_hash=source_content_hash,
+                progress_fn=_section_pfn,
             )
             elapsed = time.monotonic() - t0
 
@@ -4177,6 +4305,22 @@ TEXT:
             aggregate_stats["total_edges_added"],
             aggregate_stats["total_edges_updated"],
         )
+
+        # Notify progress callback of document ingestion completion
+        if progress_fn:
+            progress_fn({
+                "event": "doc_done",
+                "doc_id": doc_id,
+                "total_sections": aggregate_stats["total_sections"],
+                "total_triples": aggregate_stats["total_triples"],
+                "total_nodes_added": aggregate_stats["total_nodes_added"],
+                "total_nodes_updated": aggregate_stats["total_nodes_updated"],
+                "total_edges_added": aggregate_stats["total_edges_added"],
+                "total_edges_updated": aggregate_stats["total_edges_updated"],
+                "total_proposals_created": aggregate_stats["total_proposals_created"],
+                "total_proposals_augmented": aggregate_stats["total_proposals_augmented"],
+            })
+
         return aggregate_stats
 
     def ingest_markdown_file(
@@ -4293,22 +4437,79 @@ TEXT:
 
         Args:
             other: The graph to merge in.
-            prefer: On conflict, prefer 'self' or 'other' node data.
+            prefer: On conflict, prefer ``'self'`` or ``'other'`` node data.
+                    When ``'other'``, conflicting nodes are smart-merged:
+                    confidence is maximised, descriptions are combined via
+                    ``_merge_description``, and timestamps keep the earliest
+                    ``created`` and latest ``updated``.
 
         Returns:
-            Stats dict with counts of nodes_added, nodes_updated, edges_added.
+            Stats dict with merge counts.
         """
-        stats = {"nodes_added": 0, "nodes_updated": 0, "edges_added": 0}
+        stats: dict[str, int] = {
+            "nodes_added": 0,
+            "nodes_updated": 0,
+            "edges_added": 0,
+            "edges_updated": 0,
+            "sources_added": 0,
+            "sources_skipped": 0,
+            "proposals_added": 0,
+            "proposals_updated": 0,
+        }
 
+        # -- Nodes --------------------------------------------------------
         for nid, node in other._data["nodes"].items():
             if nid in self._data["nodes"]:
                 if prefer == "other":
-                    self._data["nodes"][nid] = deepcopy(node)
+                    existing = self._data["nodes"][nid]
+                    incoming = deepcopy(node)
+                    # Smart merge: combine properties, keep best metadata
+                    merged_props = {**existing.get("properties", {})}
+                    inc_props = incoming.get("properties", {})
+                    # Handle description merging via description_sources
+                    inc_desc_sources = inc_props.pop("description_sources", [])
+                    inc_desc = inc_props.pop("description", None)
+                    # Pop description from merged too — it will be rebuilt
+                    merged_props.pop("description", None)
+                    merged_props.update(inc_props)
+                    # Merge description sources
+                    if inc_desc_sources:
+                        for ds in inc_desc_sources:
+                            _merge_description(
+                                merged_props,
+                                ds["text"],
+                                doc_id=ds.get("doc_id", "unknown"),
+                                confidence=ds.get("confidence", 1.0),
+                            )
+                    elif inc_desc:
+                        _merge_description(
+                            merged_props,
+                            inc_desc,
+                            doc_id=incoming.get("source", "unknown"),
+                            confidence=incoming.get("confidence", 1.0),
+                        )
+                    existing["properties"] = merged_props
+                    existing["confidence"] = max(
+                        existing.get("confidence", 0),
+                        incoming.get("confidence", 0),
+                    )
+                    # Keep earliest created, latest updated
+                    if incoming.get("created") and existing.get("created"):
+                        existing["created"] = min(existing["created"], incoming["created"])
+                    if incoming.get("updated") and existing.get("updated"):
+                        existing["updated"] = max(existing["updated"], incoming["updated"])
+                    elif incoming.get("updated"):
+                        existing["updated"] = incoming["updated"]
+                    # Take label/type from higher-confidence source
+                    if incoming.get("confidence", 0) >= existing.get("confidence", 0):
+                        existing["label"] = incoming.get("label", existing.get("label"))
+                        existing["type"] = incoming.get("type", existing.get("type"))
                 stats["nodes_updated"] += 1
             else:
                 self._data["nodes"][nid] = deepcopy(node)
                 stats["nodes_added"] += 1
 
+        # -- Edges --------------------------------------------------------
         existing_edge_keys = {
             (e["source"], e["target"], e["relation"])
             for e in self._data["edges"]
@@ -4319,14 +4520,67 @@ TEXT:
                 self._data["edges"].append(deepcopy(edge))
                 existing_edge_keys.add(key)
                 stats["edges_added"] += 1
+            else:
+                # Smart-merge duplicate edges: max confidence, merge properties
+                for e in self._data["edges"]:
+                    if (e["source"], e["target"], e["relation"]) == key:
+                        e["properties"] = {
+                            **e.get("properties", {}),
+                            **edge.get("properties", {}),
+                        }
+                        e["confidence"] = max(
+                            e.get("confidence", 0),
+                            edge.get("confidence", 0),
+                        )
+                        if edge.get("created") and e.get("created"):
+                            e["created"] = min(e["created"], edge["created"])
+                        if edge.get("updated") and e.get("updated"):
+                            e["updated"] = max(e["updated"], edge["updated"])
+                        elif edge.get("updated"):
+                            e["updated"] = edge["updated"]
+                        stats["edges_updated"] += 1
+                        break
 
-        # Merge custom relations
+        # -- Metadata: custom relations + node types ----------------------
         my_customs = set(self._data["meta"].get("custom_relations", []))
         other_customs = set(other._data["meta"].get("custom_relations", []))
         self._data["meta"]["custom_relations"] = sorted(my_customs | other_customs)
 
-        # Merge embeddings
+        my_types = set(self._data["meta"].get("node_types", []))
+        other_types = set(other._data["meta"].get("node_types", []))
+        self._data["meta"]["node_types"] = sorted(my_types | other_types)
+
+        # -- Source documents ---------------------------------------------
+        my_sources = self._data["meta"].setdefault("sources", {})
+        for doc_slug, entry in other._data["meta"].get("sources", {}).items():
+            if doc_slug not in my_sources:
+                my_sources[doc_slug] = deepcopy(entry)
+                # Copy the actual source file
+                _copy_source_file(other, self, my_sources[doc_slug])
+                stats["sources_added"] += 1
+            elif my_sources[doc_slug].get("content_hash") == entry.get("content_hash"):
+                stats["sources_skipped"] += 1
+            elif prefer == "other":
+                my_sources[doc_slug] = deepcopy(entry)
+                _copy_source_file(other, self, my_sources[doc_slug])
+                stats["sources_added"] += 1
+            else:
+                stats["sources_skipped"] += 1
+
+        # -- Embeddings ---------------------------------------------------
         _emb_changed = False
+        # Warn about incompatible embedding models
+        if (other._embed_meta and self._embed_meta
+                and other._embed_meta.get("model")
+                and self._embed_meta.get("model")
+                and other._embed_meta["model"] != self._embed_meta["model"]):
+            logger.warning(
+                "Merging graphs with different embedding models: %s vs %s",
+                self._embed_meta.get("model"), other._embed_meta.get("model"),
+            )
+        elif other._embed_meta and not self._embed_meta:
+            self._embed_meta = deepcopy(other._embed_meta)
+
         for nid, emb in other._embeddings.items():
             if nid not in self._embeddings or prefer == "other":
                 self._embeddings[nid] = emb
@@ -4334,11 +4588,12 @@ TEXT:
         if _emb_changed:
             self._dirty_embeddings = True
 
-        # Merge proposals
+        # -- Proposals ----------------------------------------------------
         my_proposal_names = {p.name for p in self._proposals}
         for op in other._proposals:
             if op.name not in my_proposal_names:
                 self._proposals.append(deepcopy(op))
+                stats["proposals_added"] += 1
             else:
                 # Augment existing proposal with new examples
                 for mp in self._proposals:
@@ -4350,11 +4605,117 @@ TEXT:
                             if doc not in mp.source_docs:
                                 mp.source_docs.append(doc)
                         mp.confidence = max(mp.confidence, op.confidence)
+                        # Status resolution: ACCEPTED > PENDING > REJECTED
+                        _status_order = {
+                            ProposalStatus.REJECTED.value: 0,
+                            ProposalStatus.PENDING.value: 1,
+                            ProposalStatus.ACCEPTED.value: 2,
+                        }
+                        mp.status = max(
+                            mp.status, op.status,
+                            key=lambda s: _status_order.get(s, 1),
+                        )
+                        stats["proposals_updated"] += 1
                         break
 
         self._rebuild_networkx()
         self._dirty = True
         return stats
+
+    @classmethod
+    def merge_graphs(
+        cls,
+        sources: list["KnowledgeGraph | str | Path"],
+        output_path: str | Path,
+        *,
+        prefer: str = "latest",
+        description: str = "",
+    ) -> "KnowledgeGraph":
+        """Create a new KnowledgeGraph by merging two or more existing graphs.
+
+        The source graphs are **not** modified.  A fresh graph is created at
+        *output_path* and each source is merged into it sequentially.
+
+        Args:
+            sources: KnowledgeGraph instances or paths to graph JSON files.
+                     At least two sources are required.
+            output_path: File path for the new combined graph.
+            prefer: Conflict resolution strategy:
+                ``'latest'`` — node/edge with the most recent ``updated``
+                timestamp wins (default).
+                ``'first'`` — first graph's data wins on conflicts.
+                ``'last'``  — last graph's data wins on conflicts.
+            description: Optional description for the merged graph.
+
+        Returns:
+            The newly created (and saved) KnowledgeGraph instance.
+        """
+        if len(sources) < 2:
+            raise ValueError("merge_graphs requires at least 2 source graphs")
+
+        # Resolve sources: load from path if needed
+        loaded: list[KnowledgeGraph] = []
+        names: list[str] = []
+        for src in sources:
+            if isinstance(src, (str, Path)):
+                kg = cls(src)
+                loaded.append(kg)
+                names.append(str(Path(src).stem))
+            else:
+                loaded.append(src)
+                names.append(str(src.graph_path.stem))
+
+        output = cls(output_path)
+        if not description:
+            description = f"Merged from: {', '.join(names)}"
+        output._data["meta"]["description"] = description
+
+        # For 'latest' strategy we sort each merge so nodes with newer
+        # timestamps overwrite older ones.  We merge all sources with
+        # prefer='other' so that the later source always updates; for
+        # 'latest' we sort ascending by newest updated timestamp so the
+        # newest graph is merged last (and thus wins).
+        if prefer == "latest":
+            def _newest_ts(kg: KnowledgeGraph) -> str:
+                return kg._data["meta"].get("updated", "")
+            ordered = sorted(loaded, key=_newest_ts)
+            merge_prefer = "other"
+        elif prefer == "first":
+            ordered = loaded
+            # First graph populates empty output with prefer='other',
+            # subsequent graphs use prefer='self' so first data wins.
+            merge_prefer = "self"
+        else:  # "last"
+            ordered = loaded
+            merge_prefer = "other"
+
+        all_stats: list[dict[str, int]] = []
+        for i, src_kg in enumerate(ordered):
+            # For 'first' strategy: first merge uses 'other' to populate
+            # the empty output, subsequent merges use 'self' to keep first data
+            if prefer == "first" and i == 0:
+                st = output.merge(src_kg, prefer="other")
+            else:
+                st = output.merge(src_kg, prefer=merge_prefer)
+            all_stats.append(st)
+
+        # Aggregate stats
+        agg: dict[str, int] = {}
+        for st in all_stats:
+            for k, v in st.items():
+                agg[k] = agg.get(k, 0) + v
+        agg["graphs_merged"] = len(loaded)
+
+        logger.info(
+            "Merged %d graphs → %s  (nodes_added=%d, nodes_updated=%d, "
+            "edges_added=%d, edges_updated=%d)",
+            len(loaded), output.graph_path,
+            agg.get("nodes_added", 0), agg.get("nodes_updated", 0),
+            agg.get("edges_added", 0), agg.get("edges_updated", 0),
+        )
+
+        output.save_all()
+        return output
 
     # ------------------------------------------------------------------
     # RAG helpers
@@ -4972,6 +5333,7 @@ TEXT:
                 "edges": len(render_edges),
                 "components": nx.number_weakly_connected_components(self._G),
                 "pending_proposals": len(pending_proposals),
+                "relation_types": len(relations_present),
             },
         }
 
@@ -5107,6 +5469,7 @@ TEXT:
             "edges": len(render_edges),
             "components": nx.number_weakly_connected_components(self._G),
             "pending_proposals": len(pending_proposals),
+            "relation_types": len(relations_present),
         }
         stats_json = json.dumps(stats)
 
@@ -5299,8 +5662,8 @@ TEXT:
   <span class="stat"><b id="stat-nodes">0</b> nodes</span>
   <span class="stat"><b id="stat-edges">0</b> edges</span>
   <span class="stat"><b id="stat-visible-nodes">0</b> visible</span>
-  <span class="stat" id="proposals-stat" style="display:none">
-    <b id="stat-proposals">0</b> pending proposals
+  <span class="stat">
+    <b id="stat-relations">0</b> relation types
   </span>
 </div>
 
@@ -5482,10 +5845,7 @@ function updateStats() {{
   document.getElementById('stat-nodes').textContent = graphStats.nodes;
   document.getElementById('stat-edges').textContent = graphStats.edges;
   document.getElementById('stat-visible-nodes').textContent = visibleNodes;
-  if (graphStats.pending_proposals > 0) {{
-    document.getElementById('proposals-stat').style.display = '';
-    document.getElementById('stat-proposals').textContent = graphStats.pending_proposals;
-  }}
+  document.getElementById('stat-relations').textContent = graphStats.relation_types || 0;
 }}
 updateStats();
 
@@ -5967,6 +6327,12 @@ def main():
                         help="Check embedding integrity: dimensions, zero vectors, coverage")
     parser.add_argument("--list-models", action="store_true",
                         help="List models available on the API server and exit")
+    parser.add_argument("--merge", nargs="+", metavar="GRAPH",
+                        help="Merge two or more existing graphs into the target graph "
+                             "(specified by the positional 'path' argument)")
+    parser.add_argument("--merge-strategy", choices=["latest", "first", "last"],
+                        default="latest", dest="merge_strategy",
+                        help="Conflict resolution strategy for merge (default: latest)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show detailed progress, timing, and debug info")
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -6001,6 +6367,19 @@ def main():
     if args.list_models:
         from query_graph import _list_models
         _list_models(args.ollama_url)
+        return
+
+    if args.merge:
+        import pprint as _pp
+        source_graphs = [KnowledgeGraph(p) for p in args.merge]
+        merged = KnowledgeGraph.merge_graphs(
+            source_graphs,
+            args.path,
+            prefer=args.merge_strategy,
+        )
+        st = merged.stats()
+        print(f"Merged {len(source_graphs)} graphs → {merged.graph_path}")
+        _pp.pprint(st)
         return
 
     kg = KnowledgeGraph(args.path)
@@ -6172,10 +6551,26 @@ def main():
             chars = event.get("char_count", 0)
             tag = f"[{idx + 1}/{total}]"
 
-            if ev == "section_skip":
+            if ev == "doc_start":
+                doc = event.get("doc_id", "?")
+                secs = event.get("total_sections", 0)
+                ccount = event.get("char_count", 0)
+                print(f"  Document: \"{doc}\" ({ccount:,} chars, {secs} sections)")
+            elif ev == "section_skip":
                 print(f"  {tag} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
             elif ev == "section_start":
                 print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars)...", end="", flush=True)
+            elif ev == "extraction_done":
+                n = event.get("triples_returned", 0)
+                if _verbose:
+                    print(f" {n} triples returned, processing...", end="", flush=True)
+            elif ev == "triple_done":
+                if _verbose:
+                    ti = event.get("index", 0)
+                    tt = event.get("total", 0)
+                    # Print a dot every 5 triples to show progress
+                    if tt > 5 and (ti + 1) % 5 == 0:
+                        print(".", end="", flush=True)
             elif ev == "section_done":
                 elapsed = event.get("elapsed_seconds", 0)
                 triples = event.get("triples", 0)
@@ -6211,6 +6606,28 @@ def main():
                             print(f"         ... and {len(errors) - 5} more")
                 else:
                     print(f" {triples} triples → {result_str} ({elapsed}s)")
+            elif ev == "doc_done":
+                if _verbose:
+                    secs = event.get("total_sections", 0)
+                    triples = event.get("total_triples", 0)
+                    na = event.get("total_nodes_added", 0)
+                    ea = event.get("total_edges_added", 0)
+                    print(f"  Document complete: {secs} sections, {triples} triples, {na} nodes, {ea} edges")
+            elif ev == "embed_start":
+                tn = event.get("total_nodes", 0)
+                sk = event.get("nodes_skipped", 0)
+                print(f"  Embedding {tn} nodes ({sk} skipped)...", end="", flush=True)
+            elif ev == "embed_batch_done":
+                b = event.get("batch", 0)
+                tb = event.get("total_batches", 0)
+                ne = event.get("nodes_embedded", 0)
+                tn = event.get("total_nodes", 0)
+                if _verbose:
+                    print(f" batch {b}/{tb} ({ne}/{tn})", end="", flush=True)
+            elif ev == "embed_done":
+                ne = event.get("nodes_embedded", 0)
+                nb = event.get("batches", 0)
+                print(f" {ne} nodes embedded in {nb} batches")
 
         # Resolve embed model once (shared across all files)
         _embed_model = None
@@ -6275,13 +6692,12 @@ def main():
                     if not _quiet:
                         print(f"  Embed config: model='{_embed_model}' url='{_embed_url}'")
 
-                if not _quiet:
-                    print(f"  Embedding nodes with {_embed_model}...", end="", flush=True)
                 _embed_t0 = time.monotonic()
-                _embed_stats = kg.embed_nodes(_embed_fn, skip_existing=True, model_name=_embed_model)
+                _embed_stats = kg.embed_nodes(
+                    _embed_fn, skip_existing=True, model_name=_embed_model,
+                    progress_fn=_progress,
+                )
                 _embed_elapsed = time.monotonic() - _embed_t0
-                if not _quiet:
-                    print(f" {_embed_stats['nodes_embedded']} nodes ({_embed_elapsed:.1f}s)")
 
             kg.save_all()
 

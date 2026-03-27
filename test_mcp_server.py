@@ -503,3 +503,34 @@ class TestMCPServerTools:
         stats = json.loads(graph_stats(graph_path=graph_path))
         assert stats["num_nodes"] >= 3
         assert stats["num_edges"] >= 2
+
+
+# ---------------------------------------------------------------------------
+# merge_graphs MCP tool
+# ---------------------------------------------------------------------------
+
+
+class TestMergeGraphsTool:
+    """Tests for the merge_graphs MCP tool."""
+
+    def test_merge_two_graphs(self, tmp_path):
+        """merge_graphs creates a combined graph from two sources."""
+        from mcp_server import merge_graphs, _graph_cache
+
+        # Create two source graphs
+        kg1 = KnowledgeGraph(tmp_path / "mcp1.json")
+        kg1.add_node("a", type="concept", label="Alpha")
+        kg1.save()
+
+        kg2 = KnowledgeGraph(tmp_path / "mcp2.json")
+        kg2.add_node("b", type="concept", label="Beta")
+        kg2.save()
+
+        output = str(tmp_path / "mcp_merged.json")
+        result = json.loads(merge_graphs(
+            graph_paths=[str(kg1.graph_path), str(kg2.graph_path)],
+            output_path=output,
+        ))
+        assert result["num_nodes"] == 2
+        # Clean up cache
+        _graph_cache.clear()
