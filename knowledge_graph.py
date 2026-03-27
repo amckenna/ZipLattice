@@ -4843,6 +4843,290 @@ TEXT:
         return output
 
     # ------------------------------------------------------------------
+    # Document subgraph extract / import (transplant)
+    # ------------------------------------------------------------------
+
+    def extract_document_subgraph(self, doc_id: str) -> dict[str, Any]:
+        """Extract a document and all its associated nodes, edges, source text,
+        and embeddings into a portable dict that can be imported into another
+        graph via :meth:`import_document_subgraph`.
+
+        The subgraph includes:
+        - All nodes whose ``source`` field references this document
+          (``doc:<doc_id>`` or ``doc:<doc_id>::<section>``).
+        - All edges where **both** endpoints are in the extracted node set,
+          or whose ``source_tag`` references this document.
+        - The source manifest entry and the raw source text (if stored).
+        - Embeddings for extracted nodes.
+        - Relation proposals that reference this document.
+
+        Args:
+            doc_id: The document identifier (will be slugified).
+
+        Returns:
+            A dict with keys ``doc_id``, ``nodes``, ``edges``, ``source_info``,
+            ``source_text``, ``embeddings``, ``proposals``,
+            ``origin_graph`` and ``custom_relations``.
+
+        Raises:
+            KeyError: If the document is not found in the graph sources.
+        """
+        doc_slug = slugify(doc_id)
+        manifest = self._data["meta"].get("sources", {})
+        if doc_slug not in manifest:
+            raise KeyError(f"Document '{doc_id}' not found in graph sources")
+
+        # --- Collect nodes attributed to this document --------------------
+        node_ids: set[str] = set()
+        nodes: dict[str, dict] = {}
+        for nid, node in self._data["nodes"].items():
+            src = node.get("source", "")
+            # Match  doc:<slug>  or  doc:<slug>::<section>
+            if src.startswith("doc:"):
+                src_slug = slugify(src.split("::")[0].removeprefix("doc:"))
+                if src_slug == doc_slug:
+                    node_ids.add(nid)
+                    nodes[nid] = deepcopy(node)
+
+        # --- Collect edges ------------------------------------------------
+        edges: list[dict] = []
+        for edge in self._data["edges"]:
+            # Include edge if both endpoints are in the node set
+            in_subgraph = (edge["source"] in node_ids and
+                           edge["target"] in node_ids)
+            # Also include if source_tag references this doc (even if one
+            # endpoint is outside the extracted set — we still carry the edge
+            # so the relationship is preserved on import)
+            tag = edge.get("source_tag", "")
+            tag_match = False
+            if tag.startswith("doc:"):
+                tag_slug = slugify(tag.split("::")[0].removeprefix("doc:"))
+                tag_match = tag_slug == doc_slug
+            if in_subgraph or tag_match:
+                edges.append(deepcopy(edge))
+                # Ensure referenced endpoints are in node_ids so they get
+                # included if they exist (cross-doc shared nodes)
+                for endpoint in ("source", "target"):
+                    eid = edge[endpoint]
+                    if eid not in nodes and eid in self._data["nodes"]:
+                        nodes[eid] = deepcopy(self._data["nodes"][eid])
+                        node_ids.add(eid)
+
+        # --- Source text and manifest entry --------------------------------
+        source_info = deepcopy(manifest[doc_slug])
+        source_text = self.get_source_text(doc_slug)
+
+        # --- Embeddings for extracted nodes --------------------------------
+        embeddings: dict[str, list[float]] = {}
+        for nid in node_ids:
+            if nid in self._embeddings:
+                embeddings[nid] = list(self._embeddings[nid])
+
+        # --- Relation proposals referencing this doc -----------------------
+        proposals: list[dict] = []
+        for p in self._proposals:
+            if doc_slug in p.source_docs:
+                proposals.append({
+                    "name": p.name,
+                    "justification": p.justification,
+                    "examples": deepcopy(p.examples),
+                    "source_docs": list(p.source_docs),
+                    "confidence": p.confidence,
+                    "status": p.status if isinstance(p.status, str) else p.status.value,
+                    "proposed_at": p.proposed_at,
+                    "reviewed_at": p.reviewed_at,
+                    "review_note": p.review_note,
+                })
+
+        # Custom relations used by extracted edges
+        custom_rels = set(self._data["meta"].get("custom_relations", []))
+        used_rels = {e["relation"] for e in edges}
+        relevant_customs = sorted(custom_rels & used_rels)
+
+        origin_graph = str(self.graph_path.stem)
+
+        logger.info(
+            "Extracted subgraph for doc '%s': %d nodes, %d edges, "
+            "%d embeddings, %d proposals",
+            doc_slug, len(nodes), len(edges), len(embeddings), len(proposals),
+        )
+
+        return {
+            "doc_id": doc_slug,
+            "nodes": nodes,
+            "edges": edges,
+            "source_info": source_info,
+            "source_text": source_text,
+            "embeddings": embeddings,
+            "proposals": proposals,
+            "custom_relations": relevant_customs,
+            "origin_graph": origin_graph,
+        }
+
+    def import_document_subgraph(
+        self,
+        subgraph: dict[str, Any],
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, int]:
+        """Import a document subgraph previously extracted with
+        :meth:`extract_document_subgraph` into this graph.
+
+        Nodes are smart-merged (descriptions combined, confidence maximised)
+        when they already exist.  Edges are deduplicated by
+        ``(source, target, relation)``.
+
+        Args:
+            subgraph: The dict returned by ``extract_document_subgraph()``.
+            overwrite: If *True*, overwrite the source entry and text even if
+                the document already exists in this graph.
+
+        Returns:
+            Stats dict with counts of nodes/edges/sources added or updated.
+        """
+        doc_slug = subgraph["doc_id"]
+        stats: dict[str, int] = {
+            "nodes_added": 0,
+            "nodes_updated": 0,
+            "edges_added": 0,
+            "edges_updated": 0,
+            "embeddings_added": 0,
+            "source_stored": 0,
+            "proposals_added": 0,
+        }
+
+        # --- Import nodes (smart-merge) -----------------------------------
+        for nid, node in subgraph["nodes"].items():
+            if nid in self._data["nodes"]:
+                existing = self._data["nodes"][nid]
+                incoming = deepcopy(node)
+                merged_props = {**existing.get("properties", {})}
+                inc_props = incoming.get("properties", {})
+                inc_desc_sources = inc_props.pop("description_sources", [])
+                inc_desc = inc_props.pop("description", None)
+                merged_props.pop("description", None)
+                merged_props.update(inc_props)
+                if inc_desc_sources:
+                    for ds in inc_desc_sources:
+                        _merge_description(
+                            merged_props,
+                            ds["text"],
+                            doc_id=ds.get("doc_id", "unknown"),
+                            confidence=ds.get("confidence", 1.0),
+                        )
+                elif inc_desc:
+                    _merge_description(
+                        merged_props,
+                        inc_desc,
+                        doc_id=incoming.get("source", "unknown"),
+                        confidence=incoming.get("confidence", 1.0),
+                    )
+                existing["properties"] = merged_props
+                existing["confidence"] = max(
+                    existing.get("confidence", 0),
+                    incoming.get("confidence", 0),
+                )
+                if incoming.get("created") and existing.get("created"):
+                    existing["created"] = min(existing["created"], incoming["created"])
+                if incoming.get("updated") and existing.get("updated"):
+                    existing["updated"] = max(existing["updated"], incoming["updated"])
+                elif incoming.get("updated"):
+                    existing["updated"] = incoming["updated"]
+                if incoming.get("confidence", 0) >= existing.get("confidence", 0):
+                    existing["label"] = incoming.get("label", existing.get("label"))
+                    existing["type"] = incoming.get("type", existing.get("type"))
+                stats["nodes_updated"] += 1
+            else:
+                self._data["nodes"][nid] = deepcopy(node)
+                stats["nodes_added"] += 1
+
+        # --- Import edges (dedup) -----------------------------------------
+        existing_edge_keys = {
+            (e["source"], e["target"], e["relation"])
+            for e in self._data["edges"]
+        }
+        for edge in subgraph["edges"]:
+            key = (edge["source"], edge["target"], edge["relation"])
+            if key not in existing_edge_keys:
+                self._data["edges"].append(deepcopy(edge))
+                existing_edge_keys.add(key)
+                stats["edges_added"] += 1
+            else:
+                for e in self._data["edges"]:
+                    if (e["source"], e["target"], e["relation"]) == key:
+                        e["properties"] = {
+                            **e.get("properties", {}),
+                            **edge.get("properties", {}),
+                        }
+                        e["confidence"] = max(
+                            e.get("confidence", 0),
+                            edge.get("confidence", 0),
+                        )
+                        stats["edges_updated"] += 1
+                        break
+
+        # --- Store source text --------------------------------------------
+        manifest = self._data["meta"].setdefault("sources", {})
+        if subgraph.get("source_text") and (doc_slug not in manifest or overwrite):
+            result = self.store_source(subgraph["source_text"], doc_slug)
+            if not result.get("is_duplicate"):
+                stats["source_stored"] = 1
+            # Record transplant provenance
+            entry = manifest.get(doc_slug, {})
+            transplant_history = entry.get("transplanted_from", [])
+            if subgraph.get("origin_graph"):
+                transplant_history.append({
+                    "graph": subgraph["origin_graph"],
+                    "transplanted_at": now_iso(),
+                })
+            entry["transplanted_from"] = transplant_history
+            manifest[doc_slug] = entry
+
+        # --- Import embeddings --------------------------------------------
+        for nid, emb in subgraph.get("embeddings", {}).items():
+            if nid not in self._embeddings:
+                self._embeddings[nid] = emb
+                self._dirty_embeddings = True
+                stats["embeddings_added"] += 1
+
+        # --- Import custom relations --------------------------------------
+        my_customs = set(self._data["meta"].get("custom_relations", []))
+        for rel in subgraph.get("custom_relations", []):
+            my_customs.add(rel)
+        self._data["meta"]["custom_relations"] = sorted(my_customs)
+
+        # --- Import relation proposals ------------------------------------
+        my_proposal_names = {p.name for p in self._proposals}
+        for pd in subgraph.get("proposals", []):
+            if pd["name"] not in my_proposal_names:
+                self._proposals.append(RelationProposal(
+                    name=pd["name"],
+                    justification=pd.get("justification", ""),
+                    examples=pd.get("examples", []),
+                    source_docs=pd.get("source_docs", []),
+                    confidence=pd.get("confidence", 0.5),
+                    status=pd.get("status", ProposalStatus.PENDING.value),
+                    proposed_at=pd.get("proposed_at", now_iso()),
+                    reviewed_at=pd.get("reviewed_at"),
+                    review_note=pd.get("review_note", ""),
+                ))
+                stats["proposals_added"] += 1
+
+        self._rebuild_networkx()
+        self._dirty = True
+
+        logger.info(
+            "Imported subgraph for doc '%s': "
+            "nodes +%d ~%d, edges +%d ~%d, embeddings +%d, source=%d",
+            doc_slug,
+            stats["nodes_added"], stats["nodes_updated"],
+            stats["edges_added"], stats["edges_updated"],
+            stats["embeddings_added"], stats["source_stored"],
+        )
+
+        return stats
+
+    # ------------------------------------------------------------------
     # RAG helpers
     # ------------------------------------------------------------------
 

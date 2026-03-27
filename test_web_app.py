@@ -715,3 +715,114 @@ def test_download_markdown_zip_not_found():
     """GET /download-markdown-zip with invalid batch returns 404."""
     resp = client.get("/download-markdown-zip/nonexistent")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Documents page and transplant tests
+# ---------------------------------------------------------------------------
+
+
+def _create_graph_with_doc(name: str, doc_id: str, text: str) -> None:
+    """Create a graph with an ingested document and stored source."""
+    graph_dir = GRAPHS_DIR / name
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    kg = KnowledgeGraph(graph_dir / f"{name}.json")
+    kg.store_source(text, doc_id)
+    triples = [
+        {"source": "NodeA", "target": "NodeB", "relation": "related_to",
+         "confidence": 0.9, "context": text},
+    ]
+    kg.ingest_document(text, doc_id=doc_id, llm_extract_fn=lambda _: triples)
+    kg.save()
+
+
+def test_documents_page_empty():
+    """GET /documents with no graphs shows empty state."""
+    resp = client.get("/documents")
+    assert resp.status_code == 200
+    assert "Documents" in resp.text
+    assert "No documents found" in resp.text
+
+
+def test_documents_page_with_docs():
+    """GET /documents lists documents from all graphs."""
+    _create_graph_with_doc("graph-a", "doc-one", "Hello world document text.")
+    _create_graph_with_doc("graph-b", "doc-two", "Another document for testing.")
+    resp = client.get("/documents")
+    assert resp.status_code == 200
+    assert "doc-one" in resp.text
+    assert "doc-two" in resp.text
+    assert "graph-a" in resp.text
+    assert "graph-b" in resp.text
+
+
+def test_documents_page_search():
+    """GET /documents?q= filters documents by name."""
+    _create_graph_with_doc("graph-s", "alpha-doc", "Alpha document.")
+    _create_graph_with_doc("graph-s2", "beta-doc", "Beta document.")
+    resp = client.get("/documents?q=alpha")
+    assert resp.status_code == 200
+    assert "alpha-doc" in resp.text
+    assert "beta-doc" not in resp.text
+
+
+def test_extract_document_api():
+    """GET /graphs/{name}/documents/{doc_id}/extract returns JSON subgraph."""
+    _create_graph_with_doc("graph-ext", "ext-doc", "Extraction test.")
+    resp = client.get("/graphs/graph-ext/documents/ext-doc/extract")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["doc_id"] == "ext-doc"
+    assert "nodes" in data
+    assert "edges" in data
+    assert data["source_text"] is not None
+
+
+def test_extract_document_api_not_found():
+    """GET extract for missing doc returns 404."""
+    _create_graph("graph-noext")
+    resp = client.get("/graphs/graph-noext/documents/nonexistent/extract")
+    assert resp.status_code == 404
+
+
+def test_transplant_document():
+    """POST /transplant moves a document subgraph between graphs."""
+    _create_graph_with_doc("src-graph", "transplant-doc", "Transplant test content.")
+    _create_graph("dst-graph")
+    resp = client.post("/transplant", data={
+        "source_graph": "src-graph",
+        "doc_id": "transplant-doc",
+        "target_graph": "dst-graph",
+    })
+    assert resp.status_code == 200
+    assert "Transplanted" in resp.text
+    assert "transplant-doc" in resp.text
+
+    # Verify the doc now exists in the target graph
+    dst_kg = KnowledgeGraph(GRAPHS_DIR / "dst-graph" / "dst-graph.json")
+    assert dst_kg.has_source("transplant-doc")
+
+
+def test_transplant_same_graph():
+    """POST /transplant with same source and target returns error."""
+    _create_graph_with_doc("same-graph", "some-doc", "Content.")
+    resp = client.post("/transplant", data={
+        "source_graph": "same-graph",
+        "doc_id": "some-doc",
+        "target_graph": "same-graph",
+    })
+    assert resp.status_code == 200
+    assert "Error" in resp.text
+
+
+def test_transplant_missing_doc():
+    """POST /transplant with missing document returns error."""
+    _create_graph("src-empty")
+    _create_graph("dst-empty")
+    resp = client.post("/transplant", data={
+        "source_graph": "src-empty",
+        "doc_id": "nonexistent",
+        "target_graph": "dst-empty",
+    })
+    assert resp.status_code == 200
+    assert "Error" in resp.text

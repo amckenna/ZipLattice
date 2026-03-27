@@ -1150,3 +1150,126 @@ def test_mentions_roundtrip(tmp_path):
     edges = kg2.get_edges("radar", direction="outgoing")
     uses_edges = [e for e in edges if e["relation"] == "uses"]
     assert uses_edges[0]["properties"].get("context_span") is not None
+
+
+# ---------------------------------------------------------------------------
+# Document subgraph extract / import
+# ---------------------------------------------------------------------------
+
+
+def _ingest_with_source(kg, text, doc_id, triples):
+    """Helper: ingest a document and store its source text."""
+    kg.store_source(text, doc_id)
+    kg.ingest_document(text, doc_id=doc_id, llm_extract_fn=lambda _: triples)
+
+
+def test_extract_document_subgraph(tmp_path):
+    """Extract a document subgraph captures nodes, edges, source text."""
+    kg = KnowledgeGraph(tmp_path / "extract.json")
+    triples = [
+        {"source": "Radar", "target": "Radio waves", "relation": "uses",
+         "confidence": 0.9, "context": "Radar uses radio waves."},
+        {"source": "Radar", "target": "Antenna", "relation": "depends_on",
+         "confidence": 0.85, "context": "Radar depends on an antenna."},
+    ]
+    _ingest_with_source(kg, "Radar uses radio waves. Radar depends on an antenna.",
+                        "radar-doc", triples)
+    kg.save()
+
+    subgraph = kg.extract_document_subgraph("radar-doc")
+    assert subgraph["doc_id"] == "radar-doc"
+    assert len(subgraph["nodes"]) > 0
+    assert len(subgraph["edges"]) > 0
+    assert subgraph["source_text"] is not None
+    assert "Radar" in subgraph["source_text"]
+    assert subgraph["source_info"]["content_hash"]
+    assert subgraph["origin_graph"] == "extract"
+
+
+def test_extract_document_subgraph_missing(tmp_graph):
+    """Extracting a non-existent document raises KeyError."""
+    with pytest.raises(KeyError):
+        tmp_graph.extract_document_subgraph("nonexistent")
+
+
+def test_import_document_subgraph(tmp_path):
+    """Import a document subgraph into a different graph."""
+    # Build source graph
+    src_kg = KnowledgeGraph(tmp_path / "src.json")
+    triples = [
+        {"source": "Radar", "target": "Radio waves", "relation": "uses",
+         "confidence": 0.9, "context": "Radar uses radio waves."},
+    ]
+    _ingest_with_source(src_kg, "Radar uses radio waves for detection.",
+                        "radar-doc", triples)
+    src_kg.save()
+
+    # Extract subgraph
+    subgraph = src_kg.extract_document_subgraph("radar-doc")
+
+    # Import into destination graph
+    dst_kg = KnowledgeGraph(tmp_path / "dst.json")
+    dst_kg.add_node("existing", type="concept", label="Existing Node")
+    stats = dst_kg.import_document_subgraph(subgraph)
+
+    assert stats["nodes_added"] > 0
+    assert stats["source_stored"] == 1
+
+    # Verify nodes were imported
+    assert dst_kg.get_node("radar") is not None
+    # Verify source text was stored
+    assert dst_kg.has_source("radar-doc")
+    # Verify transplant provenance
+    info = dst_kg.get_source_info("radar-doc")
+    assert info is not None
+    assert len(info.get("transplanted_from", [])) == 1
+    assert info["transplanted_from"][0]["graph"] == "src"
+
+
+def test_import_subgraph_smart_merge(tmp_path):
+    """Importing into a graph with overlapping nodes does smart merge."""
+    # Source graph
+    src_kg = KnowledgeGraph(tmp_path / "src2.json")
+    triples = [
+        {"source": "Python", "target": "Language", "relation": "is_a",
+         "confidence": 0.9, "context": "Python is a language."},
+    ]
+    _ingest_with_source(src_kg, "Python is a language.", "py-doc", triples)
+    src_kg.save()
+
+    # Destination graph with an overlapping node
+    dst_kg = KnowledgeGraph(tmp_path / "dst2.json")
+    dst_kg.add_node("python", type="concept", label="Python", source="manual",
+                     properties={"description": "A great language"}, confidence=0.5)
+    dst_kg.save()
+
+    subgraph = src_kg.extract_document_subgraph("py-doc")
+    stats = dst_kg.import_document_subgraph(subgraph)
+
+    assert stats["nodes_updated"] >= 1
+    # The existing node should still be there with merged data
+    node = dst_kg.get_node("python")
+    assert node is not None
+    assert node["confidence"] >= 0.5  # should keep max confidence
+
+
+def test_extract_import_roundtrip(tmp_path):
+    """Extract → import → extract produces compatible subgraphs."""
+    kg1 = KnowledgeGraph(tmp_path / "kg1.json")
+    triples = [
+        {"source": "A", "target": "B", "relation": "related_to",
+         "confidence": 0.8, "context": "A relates to B."},
+    ]
+    _ingest_with_source(kg1, "A relates to B in this document.",
+                        "test-doc", triples)
+    kg1.save()
+
+    sub1 = kg1.extract_document_subgraph("test-doc")
+    kg2 = KnowledgeGraph(tmp_path / "kg2.json")
+    kg2.import_document_subgraph(sub1)
+    kg2.save()
+
+    # The destination graph should now also be able to extract the same doc
+    sub2 = kg2.extract_document_subgraph("test-doc")
+    assert sub2["doc_id"] == sub1["doc_id"]
+    assert sub2["source_text"] == sub1["source_text"]

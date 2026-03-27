@@ -1372,6 +1372,166 @@ async def merge_graphs_route(
     })
 
 
+# ---------------------------------------------------------------------------
+# Cross-graph document browser & transplant
+# ---------------------------------------------------------------------------
+
+
+def _list_all_documents() -> list[dict[str, Any]]:
+    """Scan all graphs and build a unified document inventory.
+
+    Each entry includes the document metadata plus a ``graphs`` list showing
+    which graphs the document belongs to and whether it was transplanted there.
+    """
+    GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
+    # doc_slug → { doc info + graphs: [{name, node_count, edge_count, is_transplant, transplanted_from}] }
+    docs: dict[str, dict[str, Any]] = {}
+    for entry in sorted(GRAPHS_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        json_file = entry / f"{entry.name}.json"
+        if not json_file.exists():
+            continue
+        try:
+            kg = KnowledgeGraph(json_file)
+        except Exception:
+            continue
+        sources = kg._data.get("meta", {}).get("sources", {})
+
+        # Count nodes/edges per doc in this graph
+        doc_node_counts: dict[str, int] = {}
+        doc_edge_counts: dict[str, int] = {}
+        for node in kg._data.get("nodes", {}).values():
+            src = node.get("source", "")
+            if src.startswith("doc:"):
+                doc_key = slugify(src.split("::")[0].removeprefix("doc:"))
+                doc_node_counts[doc_key] = doc_node_counts.get(doc_key, 0) + 1
+        for edge in kg._data.get("edges", []):
+            src_tag = edge.get("source_tag", "")
+            if src_tag.startswith("doc:"):
+                doc_key = slugify(src_tag.split("::")[0].removeprefix("doc:"))
+                doc_edge_counts[doc_key] = doc_edge_counts.get(doc_key, 0) + 1
+
+        for doc_slug, info in sources.items():
+            if doc_slug not in docs:
+                docs[doc_slug] = {
+                    "doc_id": doc_slug,
+                    "content_hash": info.get("content_hash", ""),
+                    "char_count": info.get("char_count", 0),
+                    "original_path": info.get("original_path"),
+                    "stored_at": info.get("stored_at", ""),
+                    "version": info.get("version", 1),
+                    "graphs": [],
+                }
+            transplanted_from = info.get("transplanted_from", [])
+            is_transplant = len(transplanted_from) > 0
+            docs[doc_slug]["graphs"].append({
+                "name": entry.name,
+                "node_count": doc_node_counts.get(doc_slug, 0),
+                "edge_count": doc_edge_counts.get(doc_slug, 0),
+                "is_transplant": is_transplant,
+                "transplanted_from": transplanted_from,
+            })
+            # Update top-level metadata to latest version seen
+            if info.get("stored_at", "") > docs[doc_slug].get("stored_at", ""):
+                docs[doc_slug]["stored_at"] = info.get("stored_at", "")
+                docs[doc_slug]["char_count"] = info.get("char_count", 0)
+                docs[doc_slug]["version"] = info.get("version", 1)
+    return sorted(docs.values(), key=lambda d: d["doc_id"])
+
+
+@app.get("/documents", response_class=HTMLResponse)
+async def documents_page(request: Request, q: str = ""):
+    """Cross-graph document browser."""
+    all_docs = _list_all_documents()
+    graphs = _list_graphs()
+    if q:
+        q_lower = q.lower()
+        all_docs = [
+            d for d in all_docs
+            if q_lower in d["doc_id"].lower()
+            or q_lower in (d.get("original_path") or "").lower()
+        ]
+    return templates.TemplateResponse("documents.html", {
+        "request": request,
+        "documents": all_docs,
+        "graphs": graphs,
+        "query": q,
+    })
+
+
+@app.get("/graphs/{name}/documents/{doc_id}/extract")
+async def extract_document(name: str, doc_id: str):
+    """Extract a document subgraph as JSON."""
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    try:
+        subgraph = kg.extract_document_subgraph(doc_id)
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse(
+        json.loads(json.dumps(subgraph, cls=GraphEncoder)),
+    )
+
+
+@app.post("/transplant", response_class=HTMLResponse)
+async def transplant_document(
+    request: Request,
+    source_graph: str = Form(...),
+    doc_id: str = Form(...),
+    target_graph: str = Form(...),
+):
+    """Transplant a document subgraph from one graph to another."""
+    logger.info(
+        "POST /transplant doc=%s from=%s to=%s",
+        doc_id, source_graph, target_graph,
+    )
+    if source_graph == target_graph:
+        return templates.TemplateResponse("partials/transplant_result.html", {
+            "request": request,
+            "error": "Source and target graph must be different.",
+        })
+    try:
+        src_kg = _load_graph(source_graph)
+    except Exception as exc:
+        return templates.TemplateResponse("partials/transplant_result.html", {
+            "request": request,
+            "error": f"Cannot load source graph: {exc}",
+        })
+    try:
+        dst_kg = _load_graph(target_graph)
+    except Exception as exc:
+        return templates.TemplateResponse("partials/transplant_result.html", {
+            "request": request,
+            "error": f"Cannot load target graph: {exc}",
+        })
+    try:
+        subgraph = src_kg.extract_document_subgraph(doc_id)
+        stats = dst_kg.import_document_subgraph(subgraph)
+        dst_kg.save_all()
+    except KeyError as exc:
+        return templates.TemplateResponse("partials/transplant_result.html", {
+            "request": request,
+            "error": f"Document not found: {exc}",
+        })
+    except Exception as exc:
+        logger.error("Transplant failed: %s", exc, exc_info=True)
+        return templates.TemplateResponse("partials/transplant_result.html", {
+            "request": request,
+            "error": f"Transplant failed: {exc}",
+        })
+
+    return templates.TemplateResponse("partials/transplant_result.html", {
+        "request": request,
+        "doc_id": doc_id,
+        "source_graph": source_graph,
+        "target_graph": target_graph,
+        "stats": stats,
+    })
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""

@@ -19,6 +19,7 @@ templates/               # Jinja2 HTML templates for the web frontend
   graph_detail.html      #   Graph detail — Cytoscape.js visualization
   upload.html            #   File upload form
   query.html             #   Query form (search, context, ask)
+  documents.html         #   Cross-graph document browser & transplant
   partials/              #   HTMX partial response fragments
 test_knowledge_graph.py  # Tests for knowledge_graph.py
 test_query_graph.py      # Tests for query_graph.py
@@ -68,6 +69,8 @@ knowledge_graph/                  # dedicated graph directory
 - `bedrock_extract()` (module-level) -- Calls the AWS Bedrock Converse API for JSON entity/relation extraction. Same three-tier JSON recovery as the local path.
 - `bedrock_embed()` (module-level) -- Calls AWS Bedrock for embeddings. Supports Titan (`invoke_model`) and Cohere (batched) embedding models.
 - `KnowledgeGraph.ingest_triples()` -- Public method that accepts pre-extracted triples directly (no LLM call). Enables the orchestrator-as-extractor pattern used by the MCP server.
+- `KnowledgeGraph.extract_document_subgraph()` -- Extracts a document and all its associated nodes, edges, source text, embeddings, and proposals into a portable dict. Used for transplanting documents between graphs.
+- `KnowledgeGraph.import_document_subgraph()` -- Imports a previously extracted document subgraph into this graph with smart-merge semantics (descriptions combined, confidence maximised, edges deduplicated). Records transplant provenance.
 
 ## How to run
 
@@ -180,6 +183,7 @@ python -c "from query_graph import search_nodes, build_context, ask"
 - **MCP server / orchestrator-as-extractor:** `mcp_server.py` exposes graph operations as MCP tools via FastMCP. The key insight is that the calling orchestrator (e.g. Claude Code) *is* an LLM, so it can perform entity extraction itself using `build_extraction_prompt` and pass structured triples to `ingest_triples`, eliminating the need for a second LLM backend. The `ingest_triples()` method on `KnowledgeGraph` is the public API for this pattern — it accepts pre-extracted triples and handles all validation, node/edge creation, and proposal management.
 - **Pre-computed graph layout:** Cytoscape.js visualizations use server-side layout pre-computation via `nx.spring_layout()` (Fruchterman-Reingold). Node x/y positions are embedded in the Cytoscape element JSON and rendered with the `preset` layout, which is instant (no client-side force simulation). The `_compute_layout_positions()` static method handles this for both `cytoscape_elements()` (web frontend) and `export_cytoscape()` (standalone HTML export). Users can still switch to other layout algorithms (cose, circle, breadthfirst, grid, concentric) interactively.
 - **Parallel extraction:** `ingest_markdown()` supports a `parallel_extractions` parameter (CLI: `-j N`, web UI: "Parallel Extraction Threads" field). When > 1, LLM extraction calls run concurrently in a `ThreadPoolExecutor` while graph writes (`ingest_triples`, `add_node`, `add_edge`) remain serial on the main thread. Phase 1 creates all structural nodes/edges (fast, serial), Phase 2 dispatches LLM calls in parallel and applies results serially as they complete. This is safe because `build_extraction_prompt()` only reads graph state and `llm_extract_fn` is a pure network call with no graph mutations.
+- **Document subgraph transplant:** `extract_document_subgraph()` extracts a document and all its associated nodes, edges, source text, embeddings, and relation proposals into a portable dict. `import_document_subgraph()` imports that dict into another graph with smart-merge semantics (same as merge). Transplant provenance is recorded in the source manifest as `transplanted_from` entries. The web UI at `/documents` provides a cross-graph document browser showing which graphs each document belongs to (primary vs transplanted) with node/edge counts, search, and one-click transplant.
 
 ## Common patterns when modifying this code
 
