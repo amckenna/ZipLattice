@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import tempfile
@@ -661,6 +662,9 @@ async def ingest_documents(
                 f"{graph_stats_before.get('num_edges', 0)} edges"
             )
 
+        # Sentinel value to signal ingestion thread completion
+        _DONE = object()
+
         for di, doc in enumerate(batch):
             doc_tokens = len(doc.get("text", "")) // 4
             if _verbose:
@@ -669,25 +673,46 @@ async def ingest_documents(
                 yield _log(f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}'...")
 
             try:
-                section_events: list[dict] = []
+                # Use a queue so progress events stream in real-time
+                # instead of being batched until ingest_markdown returns.
+                event_queue: queue.Queue = queue.Queue()
 
                 def _capture_progress(event: dict):
-                    section_events.append(event)
+                    event_queue.put(event)
 
-                stats = kg.ingest_markdown(
-                    doc["text"],
-                    doc["doc_id"],
-                    llm_extract_fn=extract_fn,
-                    original_path=doc.get("filename"),
-                    progress_fn=_capture_progress,
-                )
-                results.append(stats)
+                # Run ingestion in a background thread so the generator
+                # can yield log lines as events arrive.
+                ingest_result: dict = {}
+                ingest_error: list = []
 
-                # Drain any captured knowledge_graph logs (verbose mode)
-                yield from _drain_captured()
+                def _run_ingest():
+                    try:
+                        stats = kg.ingest_markdown(
+                            doc["text"],
+                            doc["doc_id"],
+                            llm_extract_fn=extract_fn,
+                            original_path=doc.get("filename"),
+                            progress_fn=_capture_progress,
+                        )
+                        ingest_result.update(stats)
+                    except Exception as exc:
+                        ingest_error.append(exc)
+                    finally:
+                        event_queue.put(_DONE)
 
-                # Replay captured progress events as log lines
-                for ev in section_events:
+                ingest_thread = threading.Thread(target=_run_ingest, daemon=True)
+                ingest_thread.start()
+
+                # Stream events in real-time as they arrive from the
+                # ingestion thread.
+                while True:
+                    ev = event_queue.get()
+                    if ev is _DONE:
+                        break
+
+                    # Drain any captured knowledge_graph debug logs
+                    yield from _drain_captured()
+
                     evt = ev.get("event", "")
                     idx = ev.get("index", 0) + 1
                     total = ev.get("total", "?")
@@ -739,6 +764,18 @@ async def ingest_documents(
                                        f"{ev.get('total_nodes_added', 0)} nodes, {ev.get('total_edges_added', 0)} edges")
                     elif evt == "section_skip":
                         yield _log(f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})")
+
+                ingest_thread.join()
+
+                # Drain any remaining captured logs after thread completes
+                yield from _drain_captured()
+
+                # Re-raise ingestion errors
+                if ingest_error:
+                    raise ingest_error[0]
+
+                stats = ingest_result
+                results.append(stats)
 
                 _na = stats['total_nodes_added']
                 _nu = stats.get('total_nodes_updated', 0)
