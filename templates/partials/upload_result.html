@@ -12,6 +12,7 @@
           <th class="pb-1 font-normal">File</th>
           <th class="pb-1 font-normal text-right">Tokens (est.)</th>
           <th class="pb-1 font-normal text-right">Status</th>
+          <th class="pb-1 font-normal text-right w-12"></th>
         </tr>
       </thead>
       <tbody>
@@ -24,8 +25,12 @@
             <span class="text-red-400">{{ f.error }}</span>
             {% else %}
             <span class="text-green-400">OK</span>
+            {% endif %}
+          </td>
+          <td class="py-1 text-right">
+            {% if not f.error %}
             <a href="/download-markdown/{{ batch_id }}/{{ f.doc_index }}"
-               class="ml-2 text-gray-400 hover:text-white text-xs underline"
+               class="text-gray-400 hover:text-white text-xs underline whitespace-nowrap"
                title="Download converted markdown">&#8595; .md</a>
             {% endif %}
           </td>
@@ -86,10 +91,10 @@
           </div>
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Extraction Model</label>
-            <input type="text" name="query_model" id="ingest-query-model" value="qwen3-coder:30b"
-                   list="api-models-list"
-                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
-            <datalist id="api-models-list"></datalist>
+            <select name="query_model" id="ingest-query-model"
+                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+              <option value="qwen3-coder:30b" selected>qwen3-coder:30b</option>
+            </select>
           </div>
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Embed URL</label>
@@ -104,10 +109,10 @@
           </div>
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Embed Model</label>
-            <input type="text" name="embed_model" id="ingest-embed-model" value="qwen3-embedding"
-                   list="embed-models-list"
-                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
-            <datalist id="embed-models-list"></datalist>
+            <select name="embed_model" id="ingest-embed-model"
+                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+              <option value="qwen3-embedding" selected>qwen3-embedding</option>
+            </select>
           </div>
         </div>
 
@@ -244,14 +249,14 @@
   }
 
   async function fetchModels(target) {
-    var urlInput, listId, btn;
+    var urlInput, selectId, btn;
     if (target === 'api') {
       urlInput = document.getElementById('ingest-api-url');
-      listId = 'api-models-list';
+      selectId = 'ingest-query-model';
       btn = document.getElementById('fetch-api-models-btn');
     } else {
       urlInput = document.getElementById('ingest-embed-url');
-      listId = 'embed-models-list';
+      selectId = 'ingest-embed-model';
       btn = document.getElementById('fetch-embed-models-btn');
     }
     var baseUrl = urlInput.value.trim();
@@ -268,14 +273,21 @@
     try {
       var resp = await fetch('/api/models?url=' + encodeURIComponent(baseUrl));
       var data = await resp.json();
-      var datalist = document.getElementById(listId);
-      datalist.innerHTML = '';
+      var selectEl = document.getElementById(selectId);
+      var currentVal = selectEl.value;
       if (data.models && data.models.length > 0) {
+        selectEl.innerHTML = '';
         data.models.forEach(function(m) {
           var opt = document.createElement('option');
           opt.value = m;
-          datalist.appendChild(opt);
+          opt.textContent = m;
+          if (m === currentVal) opt.selected = true;
+          selectEl.appendChild(opt);
         });
+        // If previous value wasn't in the list, select the first option
+        if (!selectEl.value && selectEl.options.length > 0) {
+          selectEl.options[0].selected = true;
+        }
         btn.textContent = data.models.length + ' found';
       } else {
         btn.textContent = data.error ? 'Error' : 'None found';
