@@ -476,7 +476,7 @@ async def upload_files(
         doc_id = Path(f.filename or "unknown").stem
         entry: dict[str, Any] = {
             "name": f.filename,
-            "chars": len(md_text),
+            "tokens": len(md_text) // 4,
             "error": err,
         }
         if not err:
@@ -625,9 +625,9 @@ async def ingest_documents(
             )
 
         for di, doc in enumerate(batch):
-            doc_chars = len(doc.get("text", ""))
+            doc_tokens = len(doc.get("text", "")) // 4
             if _verbose:
-                yield _log(f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}' ({doc_chars} chars)...")
+                yield _log(f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}' (~{doc_tokens:,} tokens)...")
             else:
                 yield _log(f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}'...")
 
@@ -658,9 +658,9 @@ async def ingest_documents(
                     if evt == "doc_start":
                         secs = ev.get("total_sections", 0)
                         ccount = ev.get("char_count", 0)
-                        yield _log(f"  Document: \"{ev.get('doc_id', '?')}\" ({ccount:,} chars, {secs} sections)")
+                        yield _log(f"  Document: \"{ev.get('doc_id', '?')}\" (~{ccount // 4:,} tokens, {secs} sections)")
                     elif evt == "section_start":
-                        yield _log(f"  section {idx}/{total}: {heading} ({ev.get('char_count', 0)} chars)...")
+                        yield _log(f"  section {idx}/{total}: {heading} (~{ev.get('char_count', 0) // 4:,} tokens)...")
                     elif evt == "extraction_done":
                         if _verbose:
                             n = ev.get("triples_returned", 0)

@@ -275,7 +275,7 @@
           <th class="pb-2 font-normal text-right">Version</th>
           <th class="pb-2 font-normal text-right">Nodes</th>
           <th class="pb-2 font-normal text-right">Edges</th>
-          <th class="pb-2 font-normal text-right">Characters</th>
+          <th class="pb-2 font-normal text-right">Tokens (est.)</th>
         </tr>
       </thead>
       <tbody>
@@ -286,7 +286,7 @@
           <td class="py-2 text-right text-gray-400">v{{ info.get("version", 1) }}</td>
           <td class="py-2 text-right text-gray-400">{{ info.get("node_count", 0) }}</td>
           <td class="py-2 text-right text-gray-400">{{ info.get("edge_count", 0) }}</td>
-          <td class="py-2 text-right text-gray-400">{{ "{:,}".format(info.get("char_count", 0)) }}</td>
+          <td class="py-2 text-right text-gray-400">{{ "{:,}".format(info.get("char_count", 0) // 4) }}</td>
         </tr>
         <tr class="source-content-row" id="source-content-{{ doc_id }}" style="display:none">
           <td colspan="6" class="p-0">
