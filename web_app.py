@@ -542,6 +542,21 @@ async def get_source_text(name: str, doc_id: str) -> Response:
     return {"doc_id": doc_id, "text": text}
 
 
+@app.get("/graphs/{name}/validate")
+async def validate_graph(name: str) -> Response:
+    """Run consistency checks on a graph and return the validation report."""
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return JSONResponse({"error": "Graph not found"}, status_code=404)
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        logger.error("Failed to load graph '%s' for validation: %s", name, exc)
+        return JSONResponse({"error": f"Cannot load graph: {exc}"}, status_code=500)
+    report = kg.validate()
+    return JSONResponse(report.to_dict())
+
+
 @app.get("/api/models")
 async def list_models(url: str = "http://localhost:11434") -> Response:
     """Proxy request to a local inference endpoint to list available models.

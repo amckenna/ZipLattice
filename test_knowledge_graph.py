@@ -11,6 +11,7 @@ import pytest
 from knowledge_graph import (
     KnowledgeGraph,
     CoreRelation,
+    ValidationReport,
     _merge_description,
     find_entity_spans,
     find_context_span,
@@ -1273,3 +1274,126 @@ def test_extract_import_roundtrip(tmp_path):
     sub2 = kg2.extract_document_subgraph("test-doc")
     assert sub2["doc_id"] == sub1["doc_id"]
     assert sub2["source_text"] == sub1["source_text"]
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+def test_validate_clean_graph(populated_graph):
+    """A well-formed graph should pass validation with no errors."""
+    report = populated_graph.validate()
+    assert report.is_valid
+    assert len(report.errors) == 0
+
+
+def test_validate_dangling_edge(tmp_graph):
+    """Edges referencing non-existent nodes should be reported as errors."""
+    kg = tmp_graph
+    kg.add_node("a", type="concept", label="A")
+    kg.add_node("b", type="concept", label="B")
+    kg.add_edge("a", "b", relation="related_to")
+    # Manually inject a dangling edge
+    kg._data["edges"].append({
+        "source": "a", "target": "ghost", "relation": "uses",
+        "properties": {}, "source_tag": "test", "confidence": 0.8, "weight": 1.0,
+    })
+    report = kg.validate()
+    assert not report.is_valid
+    assert any("ghost" in e for e in report.errors)
+
+
+def test_validate_taxonomic_cycle(tmp_graph):
+    """Cycles in is_a relations should be flagged as errors."""
+    kg = tmp_graph
+    kg.add_node("a", type="concept", label="A")
+    kg.add_node("b", type="concept", label="B")
+    kg.add_node("c", type="concept", label="C")
+    kg.add_edge("a", "b", relation="is_a")
+    kg.add_edge("b", "c", relation="is_a")
+    kg.add_edge("c", "a", relation="is_a")
+    report = kg.validate()
+    assert not report.is_valid
+    assert any("cycle" in e.lower() for e in report.errors)
+
+
+def test_validate_no_cycle_in_non_taxonomic(tmp_graph):
+    """Cycles in non-taxonomic relations should NOT be flagged as errors."""
+    kg = tmp_graph
+    kg.add_node("a", type="concept", label="A")
+    kg.add_node("b", type="concept", label="B")
+    kg.add_edge("a", "b", relation="related_to")
+    kg.add_edge("b", "a", relation="related_to")
+    report = kg.validate()
+    # No taxonomic cycle error
+    assert not any("cycle" in e.lower() for e in report.errors)
+
+
+def test_validate_contradictory_edges(tmp_graph):
+    """Contradictory edges on the same pair should produce warnings."""
+    kg = tmp_graph
+    kg.add_node("a", type="concept", label="A")
+    kg.add_node("b", type="concept", label="B")
+    kg.add_edge("a", "b", relation="supersedes")
+    kg.add_edge("a", "b", relation="superseded_by")
+    report = kg.validate()
+    assert any("contradictory" in w.lower() for w in report.warnings)
+
+
+def test_validate_reflexive_contradiction(tmp_graph):
+    """A is_a B and B is_a A should be flagged as a reflexive contradiction."""
+    kg = tmp_graph
+    kg.add_node("a", type="concept", label="A")
+    kg.add_node("b", type="concept", label="B")
+    kg.add_edge("a", "b", relation="is_a")
+    kg.add_edge("b", "a", relation="is_a")
+    report = kg.validate()
+    # Should be caught as either a cycle error or a reflexive contradiction warning
+    has_cycle = any("cycle" in e.lower() for e in report.errors)
+    has_reflexive = any("reflexive" in w.lower() for w in report.warnings)
+    assert has_cycle or has_reflexive
+
+
+def test_validate_orphan_nodes(tmp_graph):
+    """Nodes with no edges should be flagged as orphans (warnings)."""
+    kg = tmp_graph
+    kg.add_node("connected-a", type="concept", label="A")
+    kg.add_node("connected-b", type="concept", label="B")
+    kg.add_edge("connected-a", "connected-b", relation="related_to")
+    kg.add_node("orphan", type="concept", label="Orphan")
+    report = kg.validate()
+    assert any("orphan" in w.lower() for w in report.warnings)
+    assert any("'orphan'" in w for w in report.warnings)
+
+
+def test_validate_orphan_document_nodes_excluded(tmp_graph):
+    """Document nodes with no edges should NOT be flagged as orphans."""
+    kg = tmp_graph
+    kg.add_node("doc-node", type="document", label="My Doc")
+    report = kg.validate()
+    assert not any("orphan" in w.lower() for w in report.warnings)
+
+
+def test_validate_zero_confidence(tmp_graph):
+    """Nodes/edges with confidence=0 should be flagged as warnings."""
+    kg = tmp_graph
+    kg.add_node("a", type="concept", label="A", confidence=0.0)
+    kg.add_node("b", type="concept", label="B")
+    kg.add_edge("a", "b", relation="related_to", confidence=0.0)
+    report = kg.validate()
+    zero_warnings = [w for w in report.warnings if "confidence=0" in w]
+    assert len(zero_warnings) >= 2  # one for node, one for edge
+
+
+def test_validate_report_to_dict(populated_graph):
+    """ValidationReport.to_dict() should return a well-structured dict."""
+    report = populated_graph.validate()
+    d = report.to_dict()
+    assert "is_valid" in d
+    assert "errors" in d
+    assert "warnings" in d
+    assert "info" in d
+    assert "summary" in d
+    assert d["summary"]["error_count"] == len(d["errors"])
+    assert d["summary"]["warning_count"] == len(d["warnings"])

@@ -72,6 +72,8 @@ knowledge_graph/                  # dedicated graph directory
 - `KnowledgeGraph.ingest_triples()` -- Public method that accepts pre-extracted triples directly (no LLM call). Enables the orchestrator-as-extractor pattern used by the MCP server.
 - `KnowledgeGraph.extract_document_subgraph()` -- Extracts a document and all its associated nodes, edges, source text, embeddings, and proposals into a portable dict. Used for transplanting documents between graphs.
 - `KnowledgeGraph.import_document_subgraph()` -- Imports a previously extracted document subgraph into this graph with smart-merge semantics (descriptions combined, confidence maximised, edges deduplicated). Records transplant provenance.
+- `KnowledgeGraph.validate()` -- Runs read-only consistency checks on the graph. Returns a `ValidationReport` with errors (dangling edges, taxonomic cycles, sync issues), warnings (contradictory edges, orphan nodes, zero-confidence items), and info (missing embeddings). Available via CLI (`--validate`), web API (`GET /graphs/{name}/validate`), and MCP tool (`validate_graph`).
+- `ValidationReport` -- Dataclass returned by `validate()` with `errors`, `warnings`, `info` lists and helper properties `is_valid` and `total_issues`.
 
 ## How to run
 
@@ -88,6 +90,7 @@ python knowledge_graph.py <path-to-graph.json> --node <id>
 python knowledge_graph.py <path-to-graph.json> --neighbors <id> --depth 2
 python knowledge_graph.py <path-to-graph.json> --pyvis output.html
 python knowledge_graph.py <path-to-graph.json> --cytoscape output.html
+python knowledge_graph.py <path-to-graph.json> --validate
 python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
 python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b --embed-model qwen3-embedding

@@ -198,6 +198,61 @@
     </div>
   </div>
 
+  <!-- Validation card (loaded via HTMX) -->
+  <div id="validation-card" class="border border-gray-800 p-4 mt-4" style="display:none;">
+    <div class="flex items-center justify-between">
+      <div class="text-xs text-gray-400">Validation</div>
+      <button class="text-xs px-2 py-1 border border-gray-700 hover:border-gray-500"
+              onclick="runValidation()">Run Checks</button>
+    </div>
+    <div id="validation-result" class="mt-2 text-sm"></div>
+  </div>
+  <script>
+  // Show the validation card after page loads
+  document.getElementById('validation-card').style.display = 'block';
+
+  function runValidation() {
+    const resultDiv = document.getElementById('validation-result');
+    resultDiv.innerHTML = '<span class="text-gray-500">Validating…</span>';
+    fetch('/graphs/{{ name }}/validate')
+      .then(r => r.json())
+      .then(data => {
+        let html = '';
+        if (data.is_valid && data.summary.warning_count === 0) {
+          html = '<span style="color:#10b981;">&#10003; All checks passed</span>';
+        } else {
+          const parts = [];
+          if (data.summary.error_count > 0) {
+            parts.push('<span style="color:#ef4444;">' + data.summary.error_count + ' error(s)</span>');
+          }
+          if (data.summary.warning_count > 0) {
+            parts.push('<span style="color:#f59e0b;">' + data.summary.warning_count + ' warning(s)</span>');
+          }
+          html = parts.join(', ');
+          if (data.errors.length > 0) {
+            html += '<details class="mt-2"><summary class="cursor-pointer text-xs text-gray-400">Errors</summary><ul class="mt-1 text-xs" style="color:#ef4444;">';
+            data.errors.forEach(e => { html += '<li class="mt-1">' + e.replace(/</g,'&lt;') + '</li>'; });
+            html += '</ul></details>';
+          }
+          if (data.warnings.length > 0) {
+            html += '<details class="mt-2"><summary class="cursor-pointer text-xs text-gray-400">Warnings</summary><ul class="mt-1 text-xs" style="color:#f59e0b;">';
+            data.warnings.forEach(w => { html += '<li class="mt-1">' + w.replace(/</g,'&lt;') + '</li>'; });
+            html += '</ul></details>';
+          }
+        }
+        if (data.info.length > 0) {
+          html += '<details class="mt-2"><summary class="cursor-pointer text-xs text-gray-400">Info</summary><ul class="mt-1 text-xs text-gray-500">';
+          data.info.forEach(i => { html += '<li class="mt-1">' + i.replace(/</g,'&lt;') + '</li>'; });
+          html += '</ul></details>';
+        }
+        resultDiv.innerHTML = html;
+      })
+      .catch(err => {
+        resultDiv.innerHTML = '<span style="color:#ef4444;">Validation failed: ' + err + '</span>';
+      });
+  }
+  </script>
+
   <!-- Cytoscape visualization -->
   <div id="cy-container">
     <!-- Controls -->

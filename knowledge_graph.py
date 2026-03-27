@@ -1210,6 +1210,65 @@ class RelationProposal:
 
 
 # ---------------------------------------------------------------------------
+# Graph Validation
+# ---------------------------------------------------------------------------
+
+# Taxonomic relations that should not form cycles
+TAXONOMIC_RELATIONS = {"is_a", "subclass_of", "instance_of", "part_of"}
+
+# Pairs of relations that are contradictory on the same (source, target) pair
+CONTRADICTORY_PAIRS: set[tuple[str, str]] = {
+    ("is_a", "has_part"),
+    ("supersedes", "superseded_by"),
+    ("causes", "caused_by"),
+    ("depends_on", "required_by"),
+    ("uses", "used_by"),
+    ("documents", "documented_by"),
+    ("references", "referenced_by"),
+    ("contains", "part_of"),
+}
+
+
+@dataclass
+class ValidationReport:
+    """Result of graph validation checks.
+
+    Attributes:
+        errors: Serious issues that indicate data corruption or logical
+                inconsistency (e.g., dangling edges, taxonomic cycles).
+        warnings: Potential problems worth investigating (e.g., orphan
+                  nodes, contradictory edge pairs, zero-confidence items).
+        info: Informational observations (e.g., missing embeddings,
+              graph structure notes).
+    """
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    info: list[str] = field(default_factory=list)
+
+    @property
+    def is_valid(self) -> bool:
+        """True if no errors were found."""
+        return len(self.errors) == 0
+
+    @property
+    def total_issues(self) -> int:
+        return len(self.errors) + len(self.warnings)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "is_valid": self.is_valid,
+            "errors": self.errors,
+            "warnings": self.warnings,
+            "info": self.info,
+            "summary": {
+                "error_count": len(self.errors),
+                "warning_count": len(self.warnings),
+                "info_count": len(self.info),
+            },
+        }
+
+
+# ---------------------------------------------------------------------------
 # KnowledgeGraph
 # ---------------------------------------------------------------------------
 
@@ -5252,6 +5311,189 @@ TEXT:
             "sources": self.source_stats(),
         }
 
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def validate(self) -> "ValidationReport":
+        """Run consistency checks on the graph. Read-only — never mutates.
+
+        Checks performed:
+          - **Dangling edges** (error): edges referencing non-existent nodes.
+          - **Taxonomic cycles** (error): cycles in is_a / subclass_of /
+            instance_of / part_of subgraph.
+          - **Contradictory edges** (warning): pairs like A is_a B and
+            B is_a A, or A supersedes B and B supersedes A.
+          - **Orphan nodes** (warning): nodes with no edges (degree 0),
+            excluding document nodes.
+          - **Zero-confidence items** (warning): nodes or edges with
+            confidence == 0.
+          - **Missing embeddings** (info): entity/concept nodes that
+            lack an embedding vector.
+        """
+        report = ValidationReport()
+        node_ids = set(self._data["nodes"].keys())
+
+        # -- Dangling edges --------------------------------------------------
+        for i, edge in enumerate(self._data["edges"]):
+            src, tgt = edge.get("source"), edge.get("target")
+            if src not in node_ids:
+                report.errors.append(
+                    f"Edge [{i}] references non-existent source node '{src}' "
+                    f"(relation: {edge.get('relation')}, target: {tgt})"
+                )
+            if tgt not in node_ids:
+                report.errors.append(
+                    f"Edge [{i}] references non-existent target node '{tgt}' "
+                    f"(relation: {edge.get('relation')}, source: {src})"
+                )
+
+        # -- Taxonomic cycles ------------------------------------------------
+        tax_graph = nx.DiGraph()
+        for edge in self._data["edges"]:
+            rel = edge.get("relation", "")
+            if rel in TAXONOMIC_RELATIONS:
+                src, tgt = edge["source"], edge["target"]
+                if src in node_ids and tgt in node_ids:
+                    tax_graph.add_edge(src, tgt, relation=rel)
+        try:
+            cycles = list(nx.simple_cycles(tax_graph))
+            for cycle in cycles:
+                path_str = " -> ".join(cycle + [cycle[0]])
+                report.errors.append(
+                    f"Taxonomic cycle detected: {path_str}"
+                )
+        except nx.NetworkXError:
+            pass  # empty graph
+
+        # -- Contradictory edges ---------------------------------------------
+        # Build a lookup: (src, tgt) -> set of relations
+        pair_rels: dict[tuple[str, str], set[str]] = defaultdict(set)
+        for edge in self._data["edges"]:
+            src, tgt = edge.get("source", ""), edge.get("target", "")
+            rel = edge.get("relation", "")
+            pair_rels[(src, tgt)].add(rel)
+
+        # Check for same-direction contradictions
+        for (src, tgt), rels in pair_rels.items():
+            for rel_a, rel_b in CONTRADICTORY_PAIRS:
+                if rel_a in rels and rel_b in rels:
+                    report.warnings.append(
+                        f"Contradictory edges on ({src}, {tgt}): "
+                        f"'{rel_a}' and '{rel_b}' both present"
+                    )
+
+        # Check for reflexive contradictions (A rel B and B rel A for
+        # relations that form contradictory inverse pairs)
+        checked_pairs: set[tuple[str, str]] = set()
+        for (src, tgt), rels in pair_rels.items():
+            if (tgt, src) in checked_pairs:
+                continue
+            reverse_rels = pair_rels.get((tgt, src), set())
+            if not reverse_rels:
+                continue
+            for rel in rels:
+                # Self-contradictory: A rel B and B rel A for hierarchical rels
+                if rel in TAXONOMIC_RELATIONS and rel in reverse_rels:
+                    report.warnings.append(
+                        f"Reflexive contradiction: '{src}' {rel} '{tgt}' "
+                        f"and '{tgt}' {rel} '{src}'"
+                    )
+                # Cross-contradictory: A supersedes B and B supersedes A
+                for rel_a, rel_b in CONTRADICTORY_PAIRS:
+                    if rel == rel_a and rel_b in reverse_rels:
+                        report.warnings.append(
+                            f"Contradictory pair: '{src}' {rel_a} '{tgt}' "
+                            f"and '{tgt}' {rel_b} '{src}'"
+                        )
+            checked_pairs.add((src, tgt))
+
+        # -- Orphan nodes ----------------------------------------------------
+        structural_types = {"document", "section"}
+        orphans = []
+        for nid in node_ids:
+            if self._G.degree(nid) == 0:
+                ntype = self._data["nodes"][nid].get("type", "unknown")
+                if ntype not in structural_types:
+                    orphans.append(nid)
+        if orphans:
+            if len(orphans) <= 10:
+                report.warnings.append(
+                    f"{len(orphans)} orphan node(s) with no edges: "
+                    + ", ".join(f"'{n}'" for n in orphans)
+                )
+            else:
+                report.warnings.append(
+                    f"{len(orphans)} orphan node(s) with no edges "
+                    f"(showing first 10): "
+                    + ", ".join(f"'{n}'" for n in orphans[:10])
+                    + ", ..."
+                )
+
+        # -- Zero-confidence items -------------------------------------------
+        zero_conf_nodes = [
+            nid for nid, node in self._data["nodes"].items()
+            if node.get("confidence", 1.0) == 0
+        ]
+        if zero_conf_nodes:
+            report.warnings.append(
+                f"{len(zero_conf_nodes)} node(s) with confidence=0: "
+                + ", ".join(f"'{n}'" for n in zero_conf_nodes[:5])
+                + ("..." if len(zero_conf_nodes) > 5 else "")
+            )
+
+        zero_conf_edges = []
+        for i, edge in enumerate(self._data["edges"]):
+            if edge.get("confidence", 1.0) == 0:
+                zero_conf_edges.append(
+                    f"{edge.get('source')}-[{edge.get('relation')}]->{edge.get('target')}"
+                )
+        if zero_conf_edges:
+            report.warnings.append(
+                f"{len(zero_conf_edges)} edge(s) with confidence=0: "
+                + ", ".join(zero_conf_edges[:5])
+                + ("..." if len(zero_conf_edges) > 5 else "")
+            )
+
+        # -- Missing embeddings (info) ---------------------------------------
+        embeddable_types = node_ids - {
+            nid for nid, node in self._data["nodes"].items()
+            if node.get("type") in structural_types
+        }
+        missing_embeds = embeddable_types - set(self._embeddings.keys())
+        if missing_embeds and self._embeddings:
+            pct = len(missing_embeds) / len(embeddable_types) * 100 if embeddable_types else 0
+            report.info.append(
+                f"{len(missing_embeds)} of {len(embeddable_types)} "
+                f"embeddable nodes ({pct:.0f}%) lack embeddings"
+            )
+
+        # -- NetworkX / dict sync check (info) -------------------------------
+        nx_nodes = set(self._G.nodes())
+        dict_nodes = node_ids
+        if nx_nodes != dict_nodes:
+            only_nx = nx_nodes - dict_nodes
+            only_dict = dict_nodes - nx_nodes
+            if only_nx:
+                report.errors.append(
+                    f"Nodes in NetworkX but not in data dict: {sorted(only_nx)[:5]}"
+                )
+            if only_dict:
+                report.errors.append(
+                    f"Nodes in data dict but not in NetworkX: {sorted(only_dict)[:5]}"
+                )
+
+        # -- Summary info -----------------------------------------------------
+        if report.is_valid and not report.warnings:
+            report.info.append("All validation checks passed.")
+        else:
+            report.info.append(
+                f"Validation complete: {len(report.errors)} error(s), "
+                f"{len(report.warnings)} warning(s)."
+            )
+
+        return report
+
     def __repr__(self) -> str:
         pending = len(self.get_proposals(status=ProposalStatus.PENDING.value))
         return (
@@ -7203,6 +7445,9 @@ def main() -> None:
                         help="Verify integrity of stored source files")
     parser.add_argument("--verify-embeddings", action="store_true",
                         help="Check embedding integrity: dimensions, zero vectors, coverage")
+    parser.add_argument("--validate", action="store_true",
+                        help="Run consistency checks: dangling edges, taxonomic cycles, "
+                             "contradictions, orphan nodes, confidence anomalies")
     parser.add_argument("--list-models", action="store_true",
                         help="List models available on the API server and exit")
     parser.add_argument("--merge", nargs="+", metavar="GRAPH",
@@ -7387,16 +7632,37 @@ def main() -> None:
     if args.verify_embeddings:
         _cmd_verify_embeddings(kg)
 
+    if args.validate:
+        report = kg.validate()
+        if report.errors:
+            print(f"\n  ERRORS ({len(report.errors)}):")
+            for msg in report.errors:
+                print(f"    [ERROR] {msg}")
+        if report.warnings:
+            print(f"\n  WARNINGS ({len(report.warnings)}):")
+            for msg in report.warnings:
+                print(f"    [WARN]  {msg}")
+        if report.info:
+            print(f"\n  INFO ({len(report.info)}):")
+            for msg in report.info:
+                print(f"    [INFO]  {msg}")
+        if report.is_valid:
+            print(f"\n  Result: VALID ({report.total_issues} warning(s))")
+        else:
+            print(f"\n  Result: INVALID ({len(report.errors)} error(s), "
+                  f"{len(report.warnings)} warning(s))")
+
     if not any([args.stats, args.node, args.neighbors, args.split,
                 args.proposals, args.accept, args.accept_all, args.reject,
                 args.patterns, args.pyvis, args.cytoscape,
                 args.preview_md, args.ingest_md,
-                args.sources, args.check_sources, args.verify_embeddings]):
+                args.sources, args.check_sources, args.verify_embeddings,
+                args.validate]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
               f"--accept, --accept-all, --reject, --patterns, --pyvis, --cytoscape, "
               f"--preview-md, --ingest-md, --sources, --check-sources, "
-              f"--verify-embeddings for details.")
+              f"--verify-embeddings, --validate for details.")
 
 
 if __name__ == "__main__":

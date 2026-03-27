@@ -440,6 +440,22 @@ def graph_stats(graph_path: str) -> str:
 
 
 @mcp.tool()
+def validate_graph(graph_path: str) -> str:
+    """Run consistency checks on the knowledge graph.
+
+    Detects dangling edges, taxonomic cycles, contradictory edge pairs,
+    orphan nodes, zero-confidence items, and missing embeddings.
+    Returns a structured report with errors, warnings, and info.
+
+    Args:
+        graph_path: Path to the knowledge graph JSON file.
+    """
+    kg = _get_graph(graph_path)
+    report = kg.validate()
+    return _json(report.to_dict())
+
+
+@mcp.tool()
 def save_graph(graph_path: str) -> str:
     """Explicitly save the knowledge graph to disk.
 
