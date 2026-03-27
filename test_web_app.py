@@ -785,6 +785,26 @@ def test_extract_document_api_not_found():
     assert resp.status_code == 404
 
 
+def test_document_history_api():
+    """GET /graphs/{name}/documents/{doc_id}/history returns version timeline."""
+    _create_graph_with_doc("graph-hist", "hist-doc", "# Intro\n\nFirst version text.\n")
+    resp = client.get("/graphs/graph-hist/documents/hist-doc/history")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert isinstance(data, list)
+    assert len(data) >= 1
+    assert data[-1]["is_current"] is True
+    assert "section_count" in data[-1]
+    assert "node_count" in data[-1]
+
+
+def test_document_history_api_not_found():
+    """GET history for missing doc returns 404."""
+    _create_graph("graph-nohist")
+    resp = client.get("/graphs/graph-nohist/documents/nonexistent/history")
+    assert resp.status_code == 404
+
+
 def test_transplant_document():
     """POST /transplant moves a document subgraph between graphs."""
     _create_graph_with_doc("src-graph", "transplant-doc", "Transplant test content.")

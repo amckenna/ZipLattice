@@ -1268,6 +1268,88 @@ class ValidationReport:
         }
 
 
+@dataclass
+class DocumentDiff:
+    """Result of comparing two document versions at section level.
+
+    Attributes:
+        doc_id: The document identifier.
+        version_from: The older version number.
+        version_to: The newer version number.
+        added: Section headings present only in the newer version.
+        removed: Section headings present only in the older version.
+        modified: Section headings present in both but with different hashes.
+        unchanged: Section headings present in both with identical hashes.
+    """
+    doc_id: str
+    version_from: int
+    version_to: int
+    added: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    modified: list[str] = field(default_factory=list)
+    unchanged: list[str] = field(default_factory=list)
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(self.added or self.removed or self.modified)
+
+    @property
+    def summary(self) -> str:
+        parts = []
+        if self.added:
+            parts.append(f"{len(self.added)} added")
+        if self.removed:
+            parts.append(f"{len(self.removed)} removed")
+        if self.modified:
+            parts.append(f"{len(self.modified)} modified")
+        if self.unchanged:
+            parts.append(f"{len(self.unchanged)} unchanged")
+        return ", ".join(parts) if parts else "no sections"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "doc_id": self.doc_id,
+            "version_from": self.version_from,
+            "version_to": self.version_to,
+            "added": self.added,
+            "removed": self.removed,
+            "modified": self.modified,
+            "unchanged": self.unchanged,
+            "has_changes": self.has_changes,
+            "summary": self.summary,
+        }
+
+
+def compute_section_hashes(
+    text: str,
+    *,
+    min_section_chars: int = 80,
+    max_section_chars: int = 6000,
+) -> dict[str, str]:
+    """Compute SHA-256 hashes for each section in a markdown document.
+
+    Args:
+        text: Raw markdown text.
+        min_section_chars: Passed through to ``parse_markdown_sections``.
+        max_section_chars: Passed through to ``parse_markdown_sections``.
+
+    Returns:
+        Dict mapping section heading (or ``"__preamble__"`` for the
+        untitled preamble) to the 12-char SHA-256 hash of that
+        section's body text.
+    """
+    sections = KnowledgeGraph.parse_markdown_sections(
+        text,
+        min_section_chars=min_section_chars,
+        max_section_chars=max_section_chars,
+    )
+    hashes: dict[str, str] = {}
+    for section in sections:
+        heading = section["heading"] or "__preamble__"
+        hashes[heading] = content_hash(section["body"])
+    return hashes
+
+
 # ---------------------------------------------------------------------------
 # KnowledgeGraph
 # ---------------------------------------------------------------------------
@@ -1482,6 +1564,7 @@ class KnowledgeGraph:
         *,
         original_path: str | Path | None = None,
         encoding: str = "utf-8",
+        section_hashes: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """
         Store a source document's text in the managed sources directory.
@@ -1529,6 +1612,7 @@ class KnowledgeGraph:
                     "is_update": False,
                     "version": entry.get("version", 1),
                     "ingestion_id": ingestion_id,
+                    "section_hashes": entry.get("section_hashes", {}),
                 }
 
         # Check if same content was already stored for this doc_id
@@ -1544,6 +1628,7 @@ class KnowledgeGraph:
                     "is_update": False,
                     "version": old_entry.get("version", 1),
                     "ingestion_id": ingestion_id,
+                    "section_hashes": old_entry.get("section_hashes", {}),
                 }
 
         # Determine filename: {hash}_{slug}.md
@@ -1600,6 +1685,7 @@ class KnowledgeGraph:
             "stored_at": ts,
             "version": version,
             "ingestion_id": ingestion_id,
+            "section_hashes": section_hashes or {},
         }
 
         # Build version history: carry over old history + append the just-archived version
@@ -1616,6 +1702,7 @@ class KnowledgeGraph:
                     "stored_at": old_entry.get("stored_at", ""),
                     "ingestion_id": old_entry.get("ingestion_id", ""),
                     "archived_to": str(self.sources_dir / "archive" / archive_name),
+                    "section_hashes": old_entry.get("section_hashes", {}),
                 })
 
         manifest[doc_slug] = entry
@@ -1632,6 +1719,7 @@ class KnowledgeGraph:
             "is_update": is_update,
             "version": version,
             "ingestion_id": ingestion_id,
+            "section_hashes": section_hashes or {},
         }
 
     def get_source_path(self, doc_id: str) -> Path | None:
@@ -1725,6 +1813,7 @@ class KnowledgeGraph:
                 "archived_to": str(v.get("archived_to", "")),
                 "file_exists": archived.exists(),
                 "is_current": False,
+                "section_hashes": v.get("section_hashes", {}),
             })
 
         # Current version
@@ -1740,9 +1829,124 @@ class KnowledgeGraph:
             "stored_path": str(entry.get("stored_path", "")),
             "file_exists": stored.exists(),
             "is_current": True,
+            "section_hashes": entry.get("section_hashes", {}),
         })
 
         return sorted(versions, key=lambda v: v["version"])
+
+    def diff_document_versions(
+        self, doc_id: str, v1: int, v2: int,
+    ) -> DocumentDiff:
+        """Compare two versions of a document at section level.
+
+        Uses ``section_hashes`` stored in the source manifest to identify
+        which sections were added, removed, modified, or unchanged between
+        two versions.
+
+        Args:
+            doc_id: The document identifier.
+            v1: The older version number.
+            v2: The newer version number.
+
+        Returns:
+            A :class:`DocumentDiff` describing changes between the versions.
+
+        Raises:
+            KeyError: If the document or either version is not found.
+        """
+        versions = self.get_source_versions(doc_id)
+        if not versions:
+            raise KeyError(f"Document '{doc_id}' not found in source manifest")
+
+        v1_entry = None
+        v2_entry = None
+        for v in versions:
+            if v["version"] == v1:
+                v1_entry = v
+            if v["version"] == v2:
+                v2_entry = v
+
+        if v1_entry is None:
+            raise KeyError(f"Version {v1} not found for document '{doc_id}'")
+        if v2_entry is None:
+            raise KeyError(f"Version {v2} not found for document '{doc_id}'")
+
+        hashes_v1: dict[str, str] = v1_entry.get("section_hashes", {})
+        hashes_v2: dict[str, str] = v2_entry.get("section_hashes", {})
+
+        keys_v1 = set(hashes_v1.keys())
+        keys_v2 = set(hashes_v2.keys())
+
+        added = sorted(keys_v2 - keys_v1)
+        removed = sorted(keys_v1 - keys_v2)
+        common = keys_v1 & keys_v2
+        modified = sorted(h for h in common if hashes_v1[h] != hashes_v2[h])
+        unchanged = sorted(h for h in common if hashes_v1[h] == hashes_v2[h])
+
+        return DocumentDiff(
+            doc_id=doc_id,
+            version_from=v1,
+            version_to=v2,
+            added=added,
+            removed=removed,
+            modified=modified,
+            unchanged=unchanged,
+        )
+
+    def get_document_history(self, doc_id: str) -> list[dict[str, Any]]:
+        """Get a rich version timeline for a document.
+
+        Extends :meth:`get_source_versions` with per-version section counts
+        and node/edge counts from the graph.
+
+        Args:
+            doc_id: The document identifier.
+
+        Returns:
+            List of version dicts (oldest first), each augmented with:
+              - ``section_count``: number of sections (from section_hashes)
+              - ``node_count``: number of nodes created during this ingestion
+              - ``edge_count``: number of edges created during this ingestion
+              - ``diff``: if not the first version, a :class:`DocumentDiff`
+                dict showing changes from the previous version
+        """
+        versions = self.get_source_versions(doc_id)
+        if not versions:
+            return []
+
+        result: list[dict[str, Any]] = []
+        prev_version_num: int | None = None
+
+        for v in versions:
+            entry = dict(v)  # shallow copy
+            shashes = v.get("section_hashes", {})
+            entry["section_count"] = len(shashes)
+
+            # Count nodes and edges from this ingestion run
+            iid = v.get("ingestion_id", "")
+            if iid:
+                entry["node_count"] = len(self.get_nodes_by_ingestion(iid))
+                entry["edge_count"] = len(self.get_edges_by_ingestion(iid))
+            else:
+                entry["node_count"] = 0
+                entry["edge_count"] = 0
+
+            # Compute diff from previous version
+            if prev_version_num is not None:
+                try:
+                    diff = self.diff_document_versions(
+                        doc_id, prev_version_num, v["version"],
+                    )
+                    entry["diff"] = diff.to_dict()
+                except KeyError:
+                    entry["diff"] = None
+            else:
+                entry["diff"] = None
+
+            prev_version_num = v["version"]
+            result.append(entry)
+
+        return result
 
     def get_nodes_by_ingestion(self, ingestion_id: str) -> list[tuple[str, dict]]:
         """
@@ -4073,12 +4277,20 @@ TEXT:
             "errors": [],
         }
 
+        # Compute per-section hashes for version tracking
+        section_hashes = compute_section_hashes(
+            text,
+            min_section_chars=min_section_chars,
+            max_section_chars=max_section_chars,
+        )
+
         # Store source file
         ingestion_id = None
         source_content_hash = None
         if preserve_source:
             source_result = self.store_source(
                 text, doc_id, original_path=original_path,
+                section_hashes=section_hashes,
             )
             aggregate_stats["source"] = source_result
             ingestion_id = source_result.get("ingestion_id")
@@ -4090,6 +4302,27 @@ TEXT:
                     "Proceeding with ingestion (may create duplicate nodes).",
                     doc_id, source_result["existing_doc_id"],
                 )
+
+            # Log section-level diffs on re-ingestion
+            if source_result.get("is_update") and progress_fn:
+                prev_version = source_result["version"] - 1
+                try:
+                    diff = self.diff_document_versions(
+                        doc_id, prev_version, source_result["version"],
+                    )
+                    progress_fn({
+                        "event": "version_diff",
+                        "doc_id": doc_id,
+                        "version_from": prev_version,
+                        "version_to": source_result["version"],
+                        "sections_added": diff.added,
+                        "sections_removed": diff.removed,
+                        "sections_modified": diff.modified,
+                        "sections_unchanged": diff.unchanged,
+                        "summary": diff.summary,
+                    })
+                except KeyError:
+                    pass  # no section hashes for previous version
 
             # Add source info to doc properties
             if doc_properties is None:
@@ -7637,6 +7870,8 @@ def main() -> None:
                              "(default: 1, sequential)")
     parser.add_argument("--auto-accept", action="store_true",
                         help="Automatically accept all new relation proposals created during ingestion")
+    parser.add_argument("--doc-history", metavar="DOC_ID",
+                        help="Show version history for a document")
     parser.add_argument("--sources", action="store_true",
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
@@ -7799,6 +8034,35 @@ def main() -> None:
     if args.ingest_md:
         _cmd_ingest_md(args, kg)
 
+    if args.doc_history:
+        history = kg.get_document_history(args.doc_history)
+        if not history:
+            print(f"No history found for document '{args.doc_history}'.")
+        else:
+            print(f"\nVersion history for '{args.doc_history}' "
+                  f"({len(history)} version(s)):\n")
+            for v in history:
+                current = " (current)" if v.get("is_current") else ""
+                print(f"  v{v['version']}{current}  {v.get('stored_at', '')[:10]}")
+                print(f"      hash: {v.get('content_hash', '')}  |  "
+                      f"{v.get('char_count', 0):,} chars  |  "
+                      f"{v.get('section_count', 0)} sections")
+                print(f"      nodes: {v.get('node_count', 0)}  |  "
+                      f"edges: {v.get('edge_count', 0)}")
+                if v.get("diff") and v["diff"].get("has_changes"):
+                    d = v["diff"]
+                    print(f"      diff: {d['summary']}")
+                    if d.get("added"):
+                        for s in d["added"]:
+                            print(f"        + {s}")
+                    if d.get("removed"):
+                        for s in d["removed"]:
+                            print(f"        - {s}")
+                    if d.get("modified"):
+                        for s in d["modified"]:
+                            print(f"        ~ {s}")
+                print()
+
     if args.sources:
         sources = kg.list_sources()
         if not sources:
@@ -7893,12 +8157,13 @@ def main() -> None:
                 args.proposals, args.accept, args.accept_all, args.reject,
                 args.patterns, args.pyvis, args.cytoscape,
                 args.preview_md, args.ingest_md,
+                args.doc_history,
                 args.sources, args.check_sources, args.verify_embeddings,
                 args.validate, args.analytics]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
               f"--accept, --accept-all, --reject, --patterns, --pyvis, --cytoscape, "
-              f"--preview-md, --ingest-md, --sources, --check-sources, "
+              f"--preview-md, --ingest-md, --doc-history, --sources, --check-sources, "
               f"--verify-embeddings, --validate, --analytics for details.")
 
 

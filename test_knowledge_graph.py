@@ -814,6 +814,194 @@ def test_store_source_update(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Document versioning (section hashes, diffs, history)
+# ---------------------------------------------------------------------------
+
+
+def _long_section(heading, body_seed):
+    """Build a markdown section with body text > 80 chars for parse_markdown_sections."""
+    body = f"{body_seed} " * 20  # ~200+ chars
+    return f"# {heading}\n\n{body.strip()}\n"
+
+
+def test_section_hashes_stored_in_manifest(tmp_path):
+    """section_hashes are computed and stored when calling store_source with them."""
+    from knowledge_graph import compute_section_hashes, content_hash
+
+    kg = KnowledgeGraph(tmp_path / "sh.json")
+    md = _long_section("Intro", "intro word") + "\n" + _long_section("Methods", "methods word")
+    hashes = compute_section_hashes(md)
+    result = kg.store_source(md, "doc1", section_hashes=hashes)
+
+    assert "section_hashes" in result
+    assert len(result["section_hashes"]) >= 2  # Intro + Methods (at minimum)
+
+    # Verify manifest has section_hashes
+    info = kg.get_source_info("doc1")
+    assert "section_hashes" in info
+    assert info["section_hashes"] == hashes
+
+
+def test_section_hashes_in_version_history(tmp_path):
+    """Archived versions preserve section_hashes from the old manifest entry."""
+    from knowledge_graph import compute_section_hashes
+
+    kg = KnowledgeGraph(tmp_path / "shv.json")
+
+    md_v1 = _long_section("Alpha", "alpha content") + "\n" + _long_section("Beta", "beta content")
+    hashes_v1 = compute_section_hashes(md_v1)
+    kg.store_source(md_v1, "doc1", section_hashes=hashes_v1)
+
+    md_v2 = _long_section("Alpha", "alpha changed") + "\n" + _long_section("Gamma", "gamma content")
+    hashes_v2 = compute_section_hashes(md_v2)
+    kg.store_source(md_v2, "doc1", section_hashes=hashes_v2)
+
+    versions = kg.get_source_versions("doc1")
+    assert len(versions) == 2
+
+    v1 = versions[0]
+    assert v1["version"] == 1
+    assert v1["section_hashes"] == hashes_v1
+
+    v2 = versions[1]
+    assert v2["version"] == 2
+    assert v2["section_hashes"] == hashes_v2
+
+
+def test_diff_document_versions(tmp_path):
+    """diff_document_versions identifies added/removed/modified/unchanged sections."""
+    from knowledge_graph import compute_section_hashes, DocumentDiff
+
+    kg = KnowledgeGraph(tmp_path / "diff.json")
+
+    md_v1 = (_long_section("Intro", "intro text") + "\n"
+             + _long_section("Methods", "methods text") + "\n"
+             + _long_section("Results", "results text"))
+    hashes_v1 = compute_section_hashes(md_v1)
+    kg.store_source(md_v1, "doc1", section_hashes=hashes_v1)
+
+    # v2: Intro unchanged, Methods modified, Results removed, Discussion added
+    md_v2 = (_long_section("Intro", "intro text") + "\n"
+             + _long_section("Methods", "methods CHANGED") + "\n"
+             + _long_section("Discussion", "discussion new"))
+    hashes_v2 = compute_section_hashes(md_v2)
+    kg.store_source(md_v2, "doc1", section_hashes=hashes_v2)
+
+    diff = kg.diff_document_versions("doc1", 1, 2)
+    assert isinstance(diff, DocumentDiff)
+    assert diff.doc_id == "doc1"
+    assert diff.version_from == 1
+    assert diff.version_to == 2
+    assert "Discussion" in diff.added
+    assert "Results" in diff.removed
+    assert "Methods" in diff.modified
+    assert "Intro" in diff.unchanged
+    assert diff.has_changes is True
+    assert "added" in diff.summary
+
+
+def test_diff_document_versions_no_changes(tmp_path):
+    """Diff shows unchanged + added when structure is extended."""
+    from knowledge_graph import compute_section_hashes
+
+    kg = KnowledgeGraph(tmp_path / "diffnc.json")
+
+    md = _long_section("Intro", "intro text") + "\n" + _long_section("Methods", "methods text")
+    hashes = compute_section_hashes(md)
+    kg.store_source(md, "doc1", section_hashes=hashes)
+
+    md_v2 = (md + "\n" + _long_section("Extra", "extra text"))
+    hashes_v2 = compute_section_hashes(md_v2)
+    kg.store_source(md_v2, "doc1", section_hashes=hashes_v2)
+
+    diff = kg.diff_document_versions("doc1", 1, 2)
+    assert "Intro" in diff.unchanged
+    assert "Methods" in diff.unchanged
+    assert "Extra" in diff.added
+
+
+def test_diff_document_versions_missing_doc(tmp_path):
+    """diff_document_versions raises KeyError for unknown doc."""
+    kg = KnowledgeGraph(tmp_path / "noexist.json")
+    with pytest.raises(KeyError):
+        kg.diff_document_versions("nonexistent", 1, 2)
+
+
+def test_diff_document_versions_missing_version(tmp_path):
+    """diff_document_versions raises KeyError for unknown version number."""
+    from knowledge_graph import compute_section_hashes
+
+    kg = KnowledgeGraph(tmp_path / "nover.json")
+    md = _long_section("Intro", "intro body text")
+    hashes = compute_section_hashes(md)
+    kg.store_source(md, "doc1", section_hashes=hashes)
+
+    with pytest.raises(KeyError):
+        kg.diff_document_versions("doc1", 1, 99)
+
+
+def test_get_document_history(tmp_path):
+    """get_document_history returns enriched version timeline with diffs."""
+    from knowledge_graph import compute_section_hashes
+
+    kg = KnowledgeGraph(tmp_path / "hist.json")
+
+    md_v1 = _long_section("Intro", "intro text") + "\n" + _long_section("Methods", "methods text")
+    hashes_v1 = compute_section_hashes(md_v1)
+    kg.store_source(md_v1, "doc1", section_hashes=hashes_v1)
+
+    md_v2 = (_long_section("Intro", "intro CHANGED") + "\n"
+             + _long_section("Methods", "methods text") + "\n"
+             + _long_section("Results", "results new"))
+    hashes_v2 = compute_section_hashes(md_v2)
+    kg.store_source(md_v2, "doc1", section_hashes=hashes_v2)
+
+    history = kg.get_document_history("doc1")
+    assert len(history) == 2
+
+    # First version has no diff
+    assert history[0]["version"] == 1
+    assert history[0]["diff"] is None
+    assert history[0]["section_count"] == len(hashes_v1)
+
+    # Second version has diff
+    assert history[1]["version"] == 2
+    assert history[1]["diff"] is not None
+    assert history[1]["diff"]["has_changes"] is True
+    assert "Results" in history[1]["diff"]["added"]
+    assert "Intro" in history[1]["diff"]["modified"]
+    assert "Methods" in history[1]["diff"]["unchanged"]
+
+
+def test_get_document_history_empty(tmp_path):
+    """get_document_history returns empty list for unknown doc."""
+    kg = KnowledgeGraph(tmp_path / "empty.json")
+    assert kg.get_document_history("nonexistent") == []
+
+
+def test_document_diff_to_dict(tmp_path):
+    """DocumentDiff.to_dict() returns serializable representation."""
+    from knowledge_graph import DocumentDiff
+
+    diff = DocumentDiff(
+        doc_id="test",
+        version_from=1,
+        version_to=2,
+        added=["New Section"],
+        removed=["Old Section"],
+        modified=["Changed Section"],
+        unchanged=["Same Section"],
+    )
+    d = diff.to_dict()
+    assert d["doc_id"] == "test"
+    assert d["has_changes"] is True
+    assert "added" in d["summary"]
+    assert "removed" in d["summary"]
+    assert "modified" in d["summary"]
+    assert "unchanged" in d["summary"]
+
+
+# ---------------------------------------------------------------------------
 # Proposal lifecycle
 # ---------------------------------------------------------------------------
 

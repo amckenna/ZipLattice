@@ -534,3 +534,40 @@ class TestMergeGraphsTool:
         assert result["num_nodes"] == 2
         # Clean up cache
         _graph_cache.clear()
+
+    def test_document_history(self, tmp_path):
+        """document_history returns version timeline with section info."""
+        from knowledge_graph import compute_section_hashes
+        from mcp_server import document_history, _graph_cache
+
+        kg = KnowledgeGraph(tmp_path / "mcp_hist.json")
+        # Sections must be > 80 chars body for parse_markdown_sections
+        body = "This is a sufficiently long section body. " * 5
+        md = f"# Intro\n\n{body}\n\n# Methods\n\n{body}\n"
+        hashes = compute_section_hashes(md)
+        kg.store_source(md, "mydoc", section_hashes=hashes)
+        kg.save()
+
+        result = json.loads(document_history(
+            graph_path=str(kg.graph_path),
+            doc_id="mydoc",
+        ))
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["version"] == 1
+        assert result[0]["section_count"] >= 2
+        _graph_cache.clear()
+
+    def test_document_history_not_found(self, tmp_path):
+        """document_history returns error for unknown doc."""
+        from mcp_server import document_history, _graph_cache
+
+        kg = KnowledgeGraph(tmp_path / "mcp_nohist.json")
+        kg.save()
+
+        result = json.loads(document_history(
+            graph_path=str(kg.graph_path),
+            doc_id="nonexistent",
+        ))
+        assert "error" in result
+        _graph_cache.clear()

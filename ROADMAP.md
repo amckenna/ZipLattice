@@ -188,15 +188,15 @@ Each item follows the pattern: **core method -> CLI flag -> web endpoint -> temp
 
 ### Checklist
 
-- [ ] **7a.** Extend source manifest with `section_hashes: dict[str, str]` -- maps section heading to SHA-256 of body, computed during ingestion
-- [ ] **7b.** Add `diff_document_versions(doc_id, v1, v2) -> DocumentDiff` -- compares archived versions' section hashes to identify added/removed/modified sections
-- [ ] **7c.** Add `get_document_history(doc_id) -> list[dict]` -- version timeline with dates, hashes, section counts, node/edge counts per version
-- [ ] **7d.** During re-ingestion, compute and log section-level diffs as part of progress events
-- [ ] **7e.** Add `--doc-history <doc_id>` CLI flag
-- [ ] **7f.** Add `GET /graphs/{name}/documents/{doc_id}/history` endpoint
-- [ ] **7g.** Add version history view to `graph_detail.html` sources table -- expandable timeline
-- [ ] **7h.** Add MCP tool `document_history` in `mcp_server.py`
-- [ ] **7i.** Tests: ingest doc v1, modify, re-ingest as v2, verify version history and section diffs
+- [x] **7a.** Extend source manifest with `section_hashes: dict[str, str]` -- maps section heading to SHA-256 of body, computed during ingestion
+- [x] **7b.** Add `diff_document_versions(doc_id, v1, v2) -> DocumentDiff` -- compares archived versions' section hashes to identify added/removed/modified sections
+- [x] **7c.** Add `get_document_history(doc_id) -> list[dict]` -- version timeline with dates, hashes, section counts, node/edge counts per version
+- [x] **7d.** During re-ingestion, compute and log section-level diffs as part of progress events
+- [x] **7e.** Add `--doc-history <doc_id>` CLI flag
+- [x] **7f.** Add `GET /graphs/{name}/documents/{doc_id}/history` endpoint
+- [x] **7g.** Add version history view to `graph_detail.html` sources table -- expandable timeline
+- [x] **7h.** Add MCP tool `document_history` in `mcp_server.py`
+- [x] **7i.** Tests: ingest doc v1, modify, re-ingest as v2, verify version history and section diffs
 
 ### Design Decisions
 

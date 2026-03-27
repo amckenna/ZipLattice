@@ -657,6 +657,29 @@ def merge_graphs(
     return _json(merged.stats())
 
 
+@mcp.tool()
+def document_history(
+    graph_path: str,
+    doc_id: str,
+) -> str:
+    """Get version history for a document with section-level diffs.
+
+    Returns a timeline of all versions including section counts,
+    node/edge counts per ingestion, and diffs between consecutive
+    versions showing which sections were added, removed, or modified.
+
+    Args:
+        graph_path: Path to the graph JSON file.
+        doc_id: The document identifier (slug or original name).
+    """
+    logger.info("document_history: graph=%s doc=%s", graph_path, doc_id)
+    kg = _get_graph(graph_path)
+    history = kg.get_document_history(doc_id)
+    if not history:
+        return _json({"error": f"No history found for document '{doc_id}'"})
+    return _json(history)
+
+
 # =========================================================================
 # Entry point
 # =========================================================================

@@ -1594,6 +1594,21 @@ async def extract_document(name: str, doc_id: str) -> JSONResponse:
     )
 
 
+@app.get("/graphs/{name}/documents/{doc_id}/history")
+async def document_history(name: str, doc_id: str) -> JSONResponse:
+    """Get version history for a document including section diffs."""
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    history = kg.get_document_history(doc_id)
+    if not history:
+        return JSONResponse({"error": f"No history for '{doc_id}'"}, status_code=404)
+    return JSONResponse(
+        json.loads(json.dumps(history, cls=GraphEncoder)),
+    )
+
+
 @app.post("/transplant", response_class=HTMLResponse)
 async def transplant_document(
     request: Request,
