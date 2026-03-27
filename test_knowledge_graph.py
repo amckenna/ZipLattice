@@ -1397,3 +1397,136 @@ def test_validate_report_to_dict(populated_graph):
     assert "summary" in d
     assert d["summary"]["error_count"] == len(d["errors"])
     assert d["summary"]["warning_count"] == len(d["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+
+def test_analytics_empty_graph(tmp_graph):
+    """Analytics on an empty graph should return valid structure with zeros."""
+    a = tmp_graph.analytics()
+    assert 0 <= a["quality_score"] <= 100
+    assert a["confidence_distribution"]["node_counts"] == [0] * 10
+    assert a["confidence_distribution"]["edge_counts"] == [0] * 10
+    assert a["hub_nodes"] == []
+    assert a["orphan_nodes"] == []
+    assert a["embedding_coverage"]["embeddable"] == 0
+    assert a["component_sizes"] == []
+
+
+def test_analytics_populated_graph(populated_graph):
+    """Analytics on a graph with nodes and edges returns expected structure."""
+    a = populated_graph.analytics()
+
+    # Quality score should be between 0 and 100
+    assert 0 <= a["quality_score"] <= 100
+
+    # Confidence distribution should have 10 buckets
+    assert len(a["confidence_distribution"]["buckets"]) == 10
+    assert len(a["confidence_distribution"]["node_counts"]) == 10
+    assert len(a["confidence_distribution"]["edge_counts"]) == 10
+
+    # Should sum to total node/edge counts
+    assert sum(a["confidence_distribution"]["node_counts"]) == populated_graph.num_nodes
+    assert sum(a["confidence_distribution"]["edge_counts"]) == populated_graph.num_edges
+
+    # Mean confidence should be in [0, 1]
+    assert 0 <= a["confidence_distribution"]["node_mean"] <= 1
+    assert 0 <= a["confidence_distribution"]["edge_mean"] <= 1
+
+    # Relation stats
+    assert "is_a" in a["relation_stats"]
+    assert "depends_on" in a["relation_stats"]
+    assert a["relation_stats"]["is_a"]["count"] == 1
+    assert a["relation_stats"]["depends_on"]["count"] == 1
+
+    # Node type stats
+    assert "concept" in a["node_type_stats"]
+    assert "technology" in a["node_type_stats"]
+    assert a["node_type_stats"]["concept"]["count"] == 2  # radar, antenna
+    assert a["node_type_stats"]["technology"]["count"] == 1  # sar
+
+    # Hub nodes
+    assert len(a["hub_nodes"]) > 0
+    assert "node_id" in a["hub_nodes"][0]
+    assert "degree" in a["hub_nodes"][0]
+    assert "in_degree" in a["hub_nodes"][0]
+
+    # Component sizes
+    assert a["component_sizes"] == [3]  # all nodes connected
+
+
+def test_analytics_hub_nodes_sorted_by_degree(tmp_graph):
+    """Hub nodes should be sorted by degree, highest first."""
+    kg = tmp_graph
+    kg.add_node("center", type="concept", label="Center")
+    for i in range(5):
+        nid = f"leaf-{i}"
+        kg.add_node(nid, type="concept", label=f"Leaf {i}")
+        kg.add_edge("center", nid, relation="related_to")
+    a = kg.analytics()
+    assert a["hub_nodes"][0]["node_id"] == "center"
+    assert a["hub_nodes"][0]["degree"] == 5
+
+
+def test_analytics_orphan_detection(tmp_graph):
+    """Orphan nodes should be listed (excluding document/section types)."""
+    kg = tmp_graph
+    kg.add_node("connected-a", type="concept", label="A")
+    kg.add_node("connected-b", type="concept", label="B")
+    kg.add_edge("connected-a", "connected-b", relation="related_to")
+    kg.add_node("orphan-1", type="concept", label="Orphan")
+    kg.add_node("doc-orphan", type="document", label="Doc")
+    a = kg.analytics()
+    orphan_ids = [o["node_id"] for o in a["orphan_nodes"]]
+    assert "orphan-1" in orphan_ids
+    assert "doc-orphan" not in orphan_ids
+
+
+def test_analytics_confidence_distribution(tmp_graph):
+    """Confidence values should land in correct histogram buckets."""
+    kg = tmp_graph
+    kg.add_node("low", type="concept", label="Low", confidence=0.1)
+    kg.add_node("mid", type="concept", label="Mid", confidence=0.5)
+    kg.add_node("high", type="concept", label="High", confidence=0.9)
+    kg.add_edge("low", "mid", relation="related_to", confidence=0.3)
+    kg.add_edge("mid", "high", relation="related_to", confidence=0.8)
+    a = kg.analytics()
+    nc = a["confidence_distribution"]["node_counts"]
+    ec = a["confidence_distribution"]["edge_counts"]
+    # 0.1 -> bucket 1, 0.5 -> bucket 5, 0.9 -> bucket 9
+    assert nc[1] >= 1  # 0.1
+    assert nc[5] >= 1  # 0.5
+    assert nc[9] >= 1  # 0.9
+    # 0.3 -> bucket 3, 0.8 -> bucket 8
+    assert ec[3] >= 1
+    assert ec[8] >= 1
+
+
+def test_analytics_embedding_coverage(tmp_graph):
+    """Embedding coverage should reflect which nodes have embeddings."""
+    kg = tmp_graph
+    kg.add_node("a", type="concept", label="A")
+    kg.add_node("b", type="concept", label="B")
+    kg.add_node("c", type="concept", label="C")
+    kg.set_embedding("a", [0.1, 0.2])
+    a = kg.analytics()
+    ec = a["embedding_coverage"]
+    assert ec["embeddable"] == 3
+    assert ec["embedded"] == 1
+    assert ec["pct"] == pytest.approx(33.3, abs=0.1)
+
+
+def test_analytics_quality_score_improves_with_embeddings(tmp_graph):
+    """Quality score should improve when more nodes have embeddings."""
+    kg = tmp_graph
+    kg.add_node("a", type="concept", label="A")
+    kg.add_node("b", type="concept", label="B")
+    kg.add_edge("a", "b", relation="related_to")
+    score_before = kg.analytics()["quality_score"]
+    kg.set_embedding("a", [0.1, 0.2])
+    kg.set_embedding("b", [0.3, 0.4])
+    score_after = kg.analytics()["quality_score"]
+    assert score_after > score_before

@@ -440,6 +440,21 @@ def graph_stats(graph_path: str) -> str:
 
 
 @mcp.tool()
+def graph_analytics(graph_path: str) -> str:
+    """Get comprehensive quality analytics for a knowledge graph.
+
+    Returns confidence distributions, relation/type stats, hub nodes,
+    orphan nodes, embedding coverage, component sizes, and a composite
+    quality score (0-100).
+
+    Args:
+        graph_path: Path to the knowledge graph JSON file.
+    """
+    kg = _get_graph(graph_path)
+    return _json(kg.analytics())
+
+
+@mcp.tool()
 def validate_graph(graph_path: str) -> str:
     """Run consistency checks on the knowledge graph.
 

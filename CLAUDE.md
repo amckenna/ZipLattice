@@ -19,6 +19,7 @@ templates/               # Jinja2 HTML templates for the web frontend
   graph_detail.html      #   Graph detail — Cytoscape.js visualization
   upload.html            #   File upload form
   query.html             #   Query form (search, context, ask)
+  analytics.html         #   Quality analytics dashboard
   documents.html         #   Cross-graph document browser & transplant
   partials/              #   HTMX partial response fragments
 test_knowledge_graph.py  # Tests for knowledge_graph.py
@@ -74,6 +75,7 @@ knowledge_graph/                  # dedicated graph directory
 - `KnowledgeGraph.import_document_subgraph()` -- Imports a previously extracted document subgraph into this graph with smart-merge semantics (descriptions combined, confidence maximised, edges deduplicated). Records transplant provenance.
 - `KnowledgeGraph.validate()` -- Runs read-only consistency checks on the graph. Returns a `ValidationReport` with errors (dangling edges, taxonomic cycles, sync issues), warnings (contradictory edges, orphan nodes, zero-confidence items), and info (missing embeddings). Available via CLI (`--validate`), web API (`GET /graphs/{name}/validate`), and MCP tool (`validate_graph`).
 - `ValidationReport` -- Dataclass returned by `validate()` with `errors`, `warnings`, `info` lists and helper properties `is_valid` and `total_issues`.
+- `KnowledgeGraph.analytics()` -- Computes comprehensive quality analytics: confidence distributions (10-bucket histograms for nodes/edges), per-relation and per-type stats, hub nodes (top-10 by degree), orphan nodes, source document coverage, embedding coverage, component sizes, and a composite quality score (0-100). Available via CLI (`--analytics`), web page (`GET /graphs/{name}/analytics`), JSON API (`GET /api/graphs/{name}/analytics`), and MCP tool (`graph_analytics`).
 
 ## How to run
 
@@ -91,6 +93,7 @@ python knowledge_graph.py <path-to-graph.json> --neighbors <id> --depth 2
 python knowledge_graph.py <path-to-graph.json> --pyvis output.html
 python knowledge_graph.py <path-to-graph.json> --cytoscape output.html
 python knowledge_graph.py <path-to-graph.json> --validate
+python knowledge_graph.py <path-to-graph.json> --analytics
 python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
 python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b --embed-model qwen3-embedding

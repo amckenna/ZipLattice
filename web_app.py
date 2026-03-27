@@ -557,6 +557,40 @@ async def validate_graph(name: str) -> Response:
     return JSONResponse(report.to_dict())
 
 
+@app.get("/graphs/{name}/analytics", response_class=HTMLResponse)
+async def graph_analytics(request: Request, name: str) -> Response:
+    """Analytics dashboard for a knowledge graph."""
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return RedirectResponse(url="/", status_code=303)
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        logger.error("Failed to load graph '%s' for analytics: %s", name, exc)
+        return RedirectResponse(url="/", status_code=303)
+    a = kg.analytics()
+    return templates.TemplateResponse("analytics.html", {
+        "request": request,
+        "name": name,
+        "analytics": a,
+        "analytics_json": json.dumps(a, cls=GraphEncoder),
+    })
+
+
+@app.get("/api/graphs/{name}/analytics")
+async def graph_analytics_api(name: str) -> Response:
+    """Return raw analytics JSON for a graph."""
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return JSONResponse({"error": "Graph not found"}, status_code=404)
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        logger.error("Failed to load graph '%s' for analytics: %s", name, exc)
+        return JSONResponse({"error": f"Cannot load graph: {exc}"}, status_code=500)
+    return JSONResponse(kg.analytics())
+
+
 @app.get("/api/models")
 async def list_models(url: str = "http://localhost:11434") -> Response:
     """Proxy request to a local inference endpoint to list available models.

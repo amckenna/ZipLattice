@@ -5311,6 +5311,204 @@ TEXT:
             "sources": self.source_stats(),
         }
 
+    def analytics(self) -> dict[str, Any]:
+        """Compute comprehensive quality and structural analytics.
+
+        Returns a dict with sections:
+          - **confidence_distribution**: histogram of node and edge
+            confidences in 10 buckets from [0.0, 0.1) to [0.9, 1.0].
+          - **relation_stats**: per-relation counts, mean/min/max confidence.
+          - **node_type_stats**: per-type counts, mean confidence, embedding
+            coverage.
+          - **hub_nodes**: top-10 nodes by total degree.
+          - **orphan_nodes**: nodes with degree 0 (excluding document/section).
+          - **source_coverage**: per-source-document node and edge counts.
+          - **embedding_coverage**: fraction of embeddable nodes that have
+            embeddings.
+          - **component_sizes**: list of weakly-connected-component sizes.
+          - **quality_score**: composite 0-100 health metric.
+        """
+        nodes = self._data["nodes"]
+        edges = self._data["edges"]
+
+        # -- Confidence distributions ------------------------------------
+        node_buckets = [0] * 10
+        edge_buckets = [0] * 10
+        node_confs: list[float] = []
+        edge_confs: list[float] = []
+
+        for node in nodes.values():
+            c = node.get("confidence", 1.0)
+            node_confs.append(c)
+            idx = min(int(c * 10), 9)
+            node_buckets[idx] += 1
+
+        for edge in edges:
+            c = edge.get("confidence", 1.0)
+            edge_confs.append(c)
+            idx = min(int(c * 10), 9)
+            edge_buckets[idx] += 1
+
+        bucket_labels = [f"{i/10:.1f}-{(i+1)/10:.1f}" for i in range(10)]
+
+        # -- Relation stats -----------------------------------------------
+        rel_data: dict[str, list[float]] = defaultdict(list)
+        for edge in edges:
+            rel = edge.get("relation", "unknown")
+            rel_data[rel].append(edge.get("confidence", 1.0))
+
+        relation_stats = {}
+        for rel, confs in sorted(rel_data.items()):
+            relation_stats[rel] = {
+                "count": len(confs),
+                "mean_confidence": sum(confs) / len(confs),
+                "min_confidence": min(confs),
+                "max_confidence": max(confs),
+            }
+
+        # -- Node type stats -----------------------------------------------
+        type_data: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"count": 0, "confidences": [], "with_embedding": 0}
+        )
+        for nid, node in nodes.items():
+            ntype = node.get("type", "unknown")
+            entry = type_data[ntype]
+            entry["count"] += 1
+            entry["confidences"].append(node.get("confidence", 1.0))
+            if nid in self._embeddings:
+                entry["with_embedding"] += 1
+
+        node_type_stats = {}
+        for ntype, entry in sorted(type_data.items()):
+            confs = entry["confidences"]
+            node_type_stats[ntype] = {
+                "count": entry["count"],
+                "mean_confidence": sum(confs) / len(confs) if confs else 0,
+                "embedding_count": entry["with_embedding"],
+                "embedding_pct": (
+                    entry["with_embedding"] / entry["count"] * 100
+                    if entry["count"] > 0 else 0
+                ),
+            }
+
+        # -- Hub nodes (top 10 by degree) ----------------------------------
+        if self._G.number_of_nodes() > 0:
+            degree_list = sorted(
+                self._G.degree(), key=lambda x: x[1], reverse=True
+            )[:10]
+            hub_nodes = [
+                {
+                    "node_id": nid,
+                    "label": nodes.get(nid, {}).get("label", nid),
+                    "type": nodes.get(nid, {}).get("type", "unknown"),
+                    "degree": deg,
+                    "in_degree": self._G.in_degree(nid),
+                    "out_degree": self._G.out_degree(nid),
+                }
+                for nid, deg in degree_list
+            ]
+        else:
+            hub_nodes = []
+
+        # -- Orphan nodes --------------------------------------------------
+        structural_types = {"document", "section"}
+        orphan_nodes = [
+            {
+                "node_id": nid,
+                "label": nodes[nid].get("label", nid),
+                "type": nodes[nid].get("type", "unknown"),
+            }
+            for nid in nodes
+            if self._G.degree(nid) == 0
+            and nodes[nid].get("type") not in structural_types
+        ]
+
+        # -- Source coverage ------------------------------------------------
+        source_node_counts: dict[str, int] = defaultdict(int)
+        source_edge_counts: dict[str, int] = defaultdict(int)
+        for node in nodes.values():
+            src = node.get("source", "")
+            if src.startswith("doc:"):
+                doc_key = src.split("::")[0].removeprefix("doc:")
+                source_node_counts[doc_key] += 1
+        for edge in edges:
+            src_tag = edge.get("source_tag", "")
+            if src_tag.startswith("doc:"):
+                doc_key = src_tag.split("::")[0].removeprefix("doc:")
+                source_edge_counts[doc_key] += 1
+
+        manifest = self._data["meta"].get("sources", {})
+        source_coverage = []
+        for doc_id, info in sorted(manifest.items()):
+            source_coverage.append({
+                "doc_id": doc_id,
+                "node_count": source_node_counts.get(doc_id, 0),
+                "edge_count": source_edge_counts.get(doc_id, 0),
+                "char_count": info.get("char_count", 0),
+                "version": info.get("version", 1),
+            })
+
+        # -- Embedding coverage ---------------------------------------------
+        embeddable = {
+            nid for nid, node in nodes.items()
+            if node.get("type") not in structural_types
+        }
+        embedded = embeddable & set(self._embeddings.keys())
+        embed_pct = len(embedded) / len(embeddable) * 100 if embeddable else 0
+
+        # -- Component sizes ------------------------------------------------
+        comp_sizes = sorted(
+            [len(c) for c in nx.weakly_connected_components(self._G)],
+            reverse=True,
+        )
+
+        # -- Quality score (0-100) ------------------------------------------
+        # Composite metric:
+        #   40% embedding coverage
+        #   30% average confidence (nodes + edges)
+        #   20% connectivity (1 - orphan_ratio)
+        #   10% source coverage (nodes that trace back to a document)
+        avg_conf = 0.0
+        if node_confs or edge_confs:
+            all_confs = node_confs + edge_confs
+            avg_conf = sum(all_confs) / len(all_confs)
+
+        orphan_ratio = len(orphan_nodes) / len(nodes) if nodes else 0
+        sourced_nodes = sum(
+            1 for n in nodes.values() if n.get("source", "").startswith("doc:")
+        )
+        source_ratio = sourced_nodes / len(nodes) if nodes else 0
+
+        quality_score = round(
+            (embed_pct / 100) * 40
+            + avg_conf * 30
+            + (1 - orphan_ratio) * 20
+            + source_ratio * 10,
+            1,
+        )
+
+        return {
+            "confidence_distribution": {
+                "buckets": bucket_labels,
+                "node_counts": node_buckets,
+                "edge_counts": edge_buckets,
+                "node_mean": sum(node_confs) / len(node_confs) if node_confs else 0,
+                "edge_mean": sum(edge_confs) / len(edge_confs) if edge_confs else 0,
+            },
+            "relation_stats": relation_stats,
+            "node_type_stats": node_type_stats,
+            "hub_nodes": hub_nodes,
+            "orphan_nodes": orphan_nodes,
+            "source_coverage": source_coverage,
+            "embedding_coverage": {
+                "embeddable": len(embeddable),
+                "embedded": len(embedded),
+                "pct": round(embed_pct, 1),
+            },
+            "component_sizes": comp_sizes,
+            "quality_score": quality_score,
+        }
+
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
@@ -7448,6 +7646,9 @@ def main() -> None:
     parser.add_argument("--validate", action="store_true",
                         help="Run consistency checks: dangling edges, taxonomic cycles, "
                              "contradictions, orphan nodes, confidence anomalies")
+    parser.add_argument("--analytics", action="store_true",
+                        help="Show quality analytics: confidence distributions, hub nodes, "
+                             "orphan detection, embedding coverage, quality score")
     parser.add_argument("--list-models", action="store_true",
                         help="List models available on the API server and exit")
     parser.add_argument("--merge", nargs="+", metavar="GRAPH",
@@ -7652,17 +7853,53 @@ def main() -> None:
             print(f"\n  Result: INVALID ({len(report.errors)} error(s), "
                   f"{len(report.warnings)} warning(s))")
 
+    if args.analytics:
+        a = kg.analytics()
+        print(f"\n  Quality Score: {a['quality_score']}/100")
+
+        cd = a["confidence_distribution"]
+        print(f"\n  Confidence Distribution (nodes mean={cd['node_mean']:.2f}, "
+              f"edges mean={cd['edge_mean']:.2f}):")
+        print(f"    {'Bucket':<10} {'Nodes':>6} {'Edges':>6}")
+        for label, nc, ec in zip(cd["buckets"], cd["node_counts"], cd["edge_counts"]):
+            bar_n = "#" * min(nc, 40)
+            print(f"    {label:<10} {nc:>6} {ec:>6}  {bar_n}")
+
+        print(f"\n  Hub Nodes (top {len(a['hub_nodes'])}):")
+        for h in a["hub_nodes"]:
+            print(f"    {h['label']:<30} type={h['type']:<12} "
+                  f"degree={h['degree']} (in={h['in_degree']}, out={h['out_degree']})")
+
+        print(f"\n  Relation Types ({len(a['relation_stats'])}):")
+        for rel, rs in a["relation_stats"].items():
+            print(f"    {rel:<25} count={rs['count']:>4}  "
+                  f"conf={rs['mean_confidence']:.2f} "
+                  f"[{rs['min_confidence']:.2f}-{rs['max_confidence']:.2f}]")
+
+        ec = a["embedding_coverage"]
+        print(f"\n  Embedding Coverage: {ec['embedded']}/{ec['embeddable']} ({ec['pct']:.1f}%)")
+
+        print(f"\n  Components: {len(a['component_sizes'])} "
+              f"(sizes: {a['component_sizes'][:10]}{'...' if len(a['component_sizes']) > 10 else ''})")
+
+        if a["orphan_nodes"]:
+            print(f"\n  Orphan Nodes ({len(a['orphan_nodes'])}):")
+            for o in a["orphan_nodes"][:10]:
+                print(f"    {o['node_id']:<30} type={o['type']}")
+            if len(a["orphan_nodes"]) > 10:
+                print(f"    ... and {len(a['orphan_nodes']) - 10} more")
+
     if not any([args.stats, args.node, args.neighbors, args.split,
                 args.proposals, args.accept, args.accept_all, args.reject,
                 args.patterns, args.pyvis, args.cytoscape,
                 args.preview_md, args.ingest_md,
                 args.sources, args.check_sources, args.verify_embeddings,
-                args.validate]):
+                args.validate, args.analytics]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
               f"--accept, --accept-all, --reject, --patterns, --pyvis, --cytoscape, "
               f"--preview-md, --ingest-md, --sources, --check-sources, "
-              f"--verify-embeddings, --validate for details.")
+              f"--verify-embeddings, --validate, --analytics for details.")
 
 
 if __name__ == "__main__":
