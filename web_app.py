@@ -24,6 +24,8 @@ import re
 import shutil
 import tempfile
 import time
+import urllib.request
+import urllib.error
 import uuid
 import threading
 import zipfile
@@ -421,6 +423,41 @@ async def get_source_text(name: str, doc_id: str):
     if text is None:
         return JSONResponse({"error": "Source not found"}, status_code=404)
     return {"doc_id": doc_id, "text": text}
+
+
+@app.get("/api/models")
+async def list_models(url: str = "http://localhost:11434"):
+    """Proxy request to a local inference endpoint to list available models.
+
+    Tries Ollama ``/api/tags`` first, then the OpenAI-compatible ``/v1/models``
+    endpoint.  Returns ``{"models": ["name", ...]}`` on success.
+    """
+    logger.info("GET /api/models — querying %s for available models", url)
+    base = url.rstrip("/")
+    timeout = 5  # seconds
+
+    # 1) Try Ollama /api/tags
+    try:
+        req = urllib.request.Request(f"{base}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        names = sorted({m.get("name") or m.get("model", "") for m in data.get("models", [])})
+        return {"models": [n for n in names if n]}
+    except Exception:
+        pass
+
+    # 2) Try OpenAI-compatible /v1/models
+    try:
+        req = urllib.request.Request(f"{base}/v1/models", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        names = sorted({m.get("id", "") for m in data.get("data", [])})
+        return {"models": [n for n in names if n]}
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"Could not reach {base}: {exc}"},
+            status_code=502,
+        )
 
 
 @app.get("/upload", response_class=HTMLResponse)
