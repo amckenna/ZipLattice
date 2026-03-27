@@ -235,7 +235,7 @@ def _chat_multi_turn(
                 "anthropic-version": _ANTHROPIC_VERSION,
             },
         )
-        with urllib.request.urlopen(req, timeout=1200) as resp:
+        with urllib.request.urlopen(req, timeout=1800) as resp:
             body = json.loads(resp.read())
         return body["content"][0]["text"]
 
@@ -278,7 +278,7 @@ def _chat_multi_turn(
         endpoint, data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=1200) as resp:
+    with urllib.request.urlopen(req, timeout=1800) as resp:
         body = json.loads(resp.read())
     return body["choices"][0]["message"]["content"]
 

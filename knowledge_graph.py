@@ -71,7 +71,7 @@ def ollama_embed(
     )
     logger.debug("ollama_embed: POST %s  model=%s  texts=%d", endpoint, model, len(texts))
     try:
-        with urllib.request.urlopen(req, timeout=240) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -221,7 +221,7 @@ def local_extract(
     logger.debug("local_extract: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=1200) as resp:
+        with urllib.request.urlopen(req, timeout=1800) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -323,7 +323,7 @@ def _anthropic_request(
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            with urllib.request.urlopen(req, timeout=1200) as resp:
+            with urllib.request.urlopen(req, timeout=1800) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             detail = ""
