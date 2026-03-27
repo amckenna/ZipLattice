@@ -27,6 +27,7 @@ from knowledge_graph import (
     KnowledgeGraph, GraphEncoder, ollama_embed, _strip_thinking,
     claude_chat, _get_anthropic_api_key,
     bedrock_chat, bedrock_embed,
+    read_http_error_detail,
 )
 
 logger = logging.getLogger("query_graph")
@@ -274,11 +275,7 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
         with urllib.request.urlopen(req, timeout=1800) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode(errors="replace").strip()
-        except Exception:
-            logger.debug("Could not read error detail from HTTP %d response", exc.code)
+        detail = read_http_error_detail(exc)
         msg = (
             f"Chat request failed (HTTP {exc.code}): "
             f"POST {endpoint} with model '{model}'."

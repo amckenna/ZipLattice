@@ -32,6 +32,7 @@ import math
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from copy import deepcopy
@@ -44,6 +45,24 @@ from typing import Any, Callable, Optional
 import networkx as nx
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared HTTP error handling
+# ---------------------------------------------------------------------------
+
+
+def read_http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """Safely extract the response body text from an ``HTTPError``.
+
+    Returns the decoded body string (stripped), or ``""`` if the body
+    cannot be read (e.g. the stream was already consumed).
+    """
+    try:
+        return exc.read().decode(errors="replace").strip()
+    except OSError:
+        logger.debug("Could not read error detail from HTTP %d response", exc.code)
+        return ""
 
 
 def ollama_embed(
@@ -74,11 +93,7 @@ def ollama_embed(
         with urllib.request.urlopen(req, timeout=300) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode(errors="replace").strip()
-        except Exception:
-            logger.debug("Could not read error detail from HTTP %d response", exc.code)
+        detail = read_http_error_detail(exc)
         msg = (
             f"Embedding request failed (HTTP {exc.code}): "
             f"POST {endpoint} with model '{model}'."
@@ -224,11 +239,7 @@ def local_extract(
         with urllib.request.urlopen(req, timeout=1800) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode(errors="replace").strip()
-        except Exception:
-            logger.debug("Could not read error detail from HTTP %d response", exc.code)
+        detail = read_http_error_detail(exc)
         logger.error(
             "Extraction request failed (HTTP %d, model=%s): %s",
             exc.code, model, detail or "(no detail)",
@@ -277,12 +288,10 @@ def _rate_limit_wait(detail: str, attempt: int) -> float:
     try:
         err = json.loads(detail) if detail else {}
         msg = err.get("error", {}).get("message", "")
-        # Some APIs include "retry after X seconds" in the message
-        import re as _re
-        m = _re.search(r"retry.after\D*(\d+)", msg, _re.IGNORECASE)
+        m = re.search(r"retry.after\D*(\d+)", msg, re.IGNORECASE)
         if m:
             return float(m.group(1))
-    except Exception:
+    except (json.JSONDecodeError, KeyError, AttributeError):
         pass
     return min(30 * (2 ** attempt), 300)
 
@@ -326,11 +335,7 @@ def _anthropic_request(
             with urllib.request.urlopen(req, timeout=1800) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode(errors="replace").strip()
-            except Exception:
-                logger.debug("Could not read error detail from HTTP %d response", exc.code)
+            detail = read_http_error_detail(exc)
             if exc.code == 429 and attempt < max_retries - 1:
                 wait = _rate_limit_wait(detail, attempt)
                 logger.warning(
@@ -437,7 +442,7 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
 # ---------------------------------------------------------------------------
 
 
-def _get_bedrock_client(region: str | None = None, profile: str | None = None):
+def _get_bedrock_client(region: str | None = None, profile: str | None = None) -> Any:
     """Return a ``boto3`` Bedrock Runtime client.
 
     Relies on standard AWS credential resolution (env vars, shared
@@ -3727,7 +3732,7 @@ TEXT:
         current_body_lines: list[str] = []
         heading_stack: list[tuple[int, str]] = []  # (level, heading)
 
-        def _flush_section():
+        def _flush_section() -> None:
             body = "\n".join(current_body_lines).strip()
             if not body and not current_heading:
                 return
@@ -6673,7 +6678,466 @@ def _salvage_truncated_json(raw: str) -> list[dict[str, Any]] | None:
 # CLI for quick inspection
 # ---------------------------------------------------------------------------
 
-def main():
+def _cmd_preview_md(args: Any, kg: "KnowledgeGraph") -> None:
+    """Handle --preview-md: show section breakdown of a markdown file."""
+    from pathlib import Path as _P
+
+    md_path = _P(args.preview_md)
+    if not md_path.exists():
+        print(f"File not found: {md_path}")
+        return
+
+    text = md_path.read_text(encoding="utf-8")
+    sections = KnowledgeGraph.parse_markdown_sections(text)
+    print(f"\nMarkdown: {md_path.name}")
+    print(f"  Total characters: {len(text):,}")
+    print(f"  Sections parsed: {len(sections)}")
+    print()
+    for i, sec in enumerate(sections):
+        prefix = "  " * sec["level"] if sec["level"] > 0 else ""
+        heading = sec["heading"] or "(preamble)"
+        flags = []
+        if sec["has_code"]:
+            flags.append("code")
+        if sec["has_table"]:
+            flags.append("table")
+        if sec["has_list"]:
+            flags.append("list")
+        if sec["links"]:
+            flags.append(f"{len(sec['links'])} links")
+        flag_str = f"  [{', '.join(flags)}]" if flags else ""
+        print(f"  {prefix}{'#' * sec['level']} {heading}  "
+              f"({sec['char_count']:,} chars){flag_str}")
+        if args.sections:
+            preview = sec["body"][:200].replace("\n", " ")
+            if len(sec["body"]) > 200:
+                preview += "..."
+            print(f"  {prefix}  → {preview}")
+    print(f"\n  To ingest, run: --ingest-md {args.preview_md}")
+
+
+def _make_progress_callback(
+    *, quiet: bool, verbose: bool,
+) -> Callable[[dict[str, Any]], None]:
+    """Build the CLI progress callback for ingestion and embedding events."""
+
+    def _progress(event: dict[str, Any]) -> None:
+        if quiet:
+            return
+        ev = event["event"]
+        idx = event.get("index", 0)
+        total = event.get("total", 0)
+        heading = event.get("heading", "?")
+        chars = event.get("char_count", 0)
+        tag = f"[{idx + 1}/{total}]"
+
+        if ev == "doc_start":
+            doc = event.get("doc_id", "?")
+            secs = event.get("total_sections", 0)
+            ccount = event.get("char_count", 0)
+            print(f"  Document: \"{doc}\" ({ccount:,} chars, {secs} sections)")
+        elif ev == "section_skip":
+            print(f"  {tag} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
+        elif ev == "section_start":
+            print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars)...", end="", flush=True)
+        elif ev == "extraction_done":
+            n = event.get("triples_returned", 0)
+            if verbose:
+                print(f" {n} triples returned, processing...", end="", flush=True)
+        elif ev == "triple_done":
+            if verbose:
+                ti = event.get("index", 0)
+                tt = event.get("total", 0)
+                if tt > 5 and (ti + 1) % 5 == 0:
+                    print(".", end="", flush=True)
+        elif ev == "section_done":
+            elapsed = event.get("elapsed_seconds", 0)
+            triples = event.get("triples", 0)
+            nodes_added = event.get("nodes_added", 0)
+            nodes_updated = event.get("nodes_updated", 0)
+            edges_added = event.get("edges_added", 0)
+            edges_updated = event.get("edges_updated", 0)
+            errors = event.get("errors", [])
+            parts = []
+            if nodes_added:
+                parts.append(f"{nodes_added} new")
+            if nodes_updated:
+                parts.append(f"{nodes_updated} updated")
+            node_summary = "+".join(parts) + " nodes" if parts else "0 nodes"
+            edge_parts = []
+            if edges_added:
+                edge_parts.append(f"{edges_added} new")
+            if edges_updated:
+                edge_parts.append(f"{edges_updated} updated")
+            edge_summary = ("+".join(edge_parts) + " edges") if edge_parts else ""
+            result_str = node_summary
+            if edge_summary:
+                result_str += f", {edge_summary}"
+            if errors:
+                print(f" {triples} triples → {result_str} ({len(errors)} errors, {elapsed}s)")
+                if verbose:
+                    for err in errors[:5]:
+                        print(f"         {err}")
+                    if len(errors) > 5:
+                        print(f"         ... and {len(errors) - 5} more")
+            else:
+                print(f" {triples} triples → {result_str} ({elapsed}s)")
+        elif ev == "doc_done":
+            if verbose:
+                secs = event.get("total_sections", 0)
+                triples = event.get("total_triples", 0)
+                na = event.get("total_nodes_added", 0)
+                ea = event.get("total_edges_added", 0)
+                print(f"  Document complete: {secs} sections, {triples} triples, {na} nodes, {ea} edges")
+        elif ev == "embed_start":
+            tn = event.get("total_nodes", 0)
+            sk = event.get("nodes_skipped", 0)
+            print(f"  Embedding {tn} nodes ({sk} skipped)...", end="", flush=True)
+        elif ev == "embed_batch_done":
+            b = event.get("batch", 0)
+            tb = event.get("total_batches", 0)
+            ne = event.get("nodes_embedded", 0)
+            tn = event.get("total_nodes", 0)
+            if verbose:
+                print(f" batch {b}/{tb} ({ne}/{tn})", end="", flush=True)
+        elif ev == "embed_done":
+            ne = event.get("nodes_embedded", 0)
+            nb = event.get("batches", 0)
+            print(f" {ne} nodes embedded in {nb} batches")
+
+    return _progress
+
+
+def _print_file_summary(
+    stats: dict[str, Any],
+    md_path: "Path",
+    elapsed: float,
+    kg: "KnowledgeGraph",
+    embed_stats: dict[str, Any] | None,
+    *,
+    verbose: bool,
+    auto_accept: bool,
+) -> None:
+    """Print the per-file ingestion summary."""
+    graph_stats = kg.stats()
+    print(f"\nIngested: {md_path.name}")
+    print(f"  Document ID: {stats['doc_id']}")
+    print(f"  Sections: {stats['total_sections']}")
+    print(f"  Triples extracted: {stats['total_triples']}")
+    _n_added = stats["total_nodes_added"]
+    _n_updated = stats["total_nodes_updated"]
+    _e_added = stats["total_edges_added"]
+    _e_updated = stats["total_edges_updated"]
+    node_str = f"{_n_added} added"
+    if _n_updated:
+        node_str += f", {_n_updated} updated"
+    edge_str = f"{_e_added} added"
+    if _e_updated:
+        edge_str += f", {_e_updated} updated"
+    print(f"  Nodes: {node_str}")
+    print(f"  Edges: {edge_str}")
+    print(f"  Total time: {elapsed:.1f}s")
+    print(f"  Graph totals: {graph_stats['num_nodes']} nodes, "
+          f"{graph_stats['num_edges']} edges")
+    if embed_stats and embed_stats["nodes_embedded"]:
+        print(f"  Nodes embedded: {embed_stats['nodes_embedded']} "
+              f"(skipped {embed_stats['nodes_skipped']})")
+    if stats.get("total_proposals_created"):
+        print(f"  New relation proposals: {stats['total_proposals_created']}")
+        if auto_accept:
+            print(f"  Auto-accepted {stats['total_proposals_created']} proposal(s)")
+    if stats.get("source"):
+        src = stats["source"]
+        if src.get("is_duplicate"):
+            print(f"  Warning: duplicate content (matches '{src['existing_doc_id']}')")
+        elif src.get("is_update"):
+            print(f"  Source updated: v{src['version']} ({src['stored_path']})")
+        else:
+            ver = src.get("version", 1)
+            if ver > 1:
+                print(f"  Source unchanged: v{ver} ({src['stored_path']})")
+            else:
+                print(f"  Source stored: v{ver} ({src['stored_path']})")
+
+    if verbose:
+        print("\n  Section details:")
+        for sec_stat in stats.get("sections", []):
+            _heading = sec_stat.get("heading", "?")
+            sec_elapsed = sec_stat.get("elapsed_seconds", "")
+            elapsed_str = f", {sec_elapsed}s" if sec_elapsed else ""
+            if sec_stat.get("skipped"):
+                print(f"    [skip] {_heading} ({sec_stat.get('reason', '')})")
+            else:
+                triples_info = ""
+                n_triples = sec_stat.get("triples_processed", 0)
+                n_nodes = sec_stat.get("nodes_added", 0)
+                n_nodes_upd = sec_stat.get("nodes_updated", 0)
+                n_edges = sec_stat.get("edges_added", 0)
+                n_edges_upd = sec_stat.get("edges_updated", 0)
+                n_errors = len(sec_stat.get("errors", []))
+                if n_triples:
+                    triples_info = f", {n_triples} triples"
+                if n_nodes:
+                    triples_info += f", {n_nodes} new nodes"
+                if n_nodes_upd:
+                    triples_info += f", {n_nodes_upd} updated nodes"
+                if n_edges:
+                    triples_info += f", {n_edges} new edges"
+                if n_edges_upd:
+                    triples_info += f", {n_edges_upd} updated edges"
+                if n_triples and n_nodes == 0 and n_nodes_upd == 0 and n_errors:
+                    sec_tag = "WARN"
+                    triples_info += f", {n_errors} errors"
+                else:
+                    sec_tag = "ok"
+                print(f"    [{sec_tag}]   {_heading} "
+                      f"({sec_stat.get('char_count', 0):,} chars{triples_info}{elapsed_str})")
+
+    if stats["errors"]:
+        print(f"\n  Errors ({len(stats['errors'])}):")
+        for err in stats["errors"]:
+            print(f"    - {err}")
+
+
+def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
+    """Handle --ingest-md: ingest markdown files into the graph."""
+    from pathlib import Path as _P
+
+    _quiet = args.quiet
+    _verbose = args.verbose
+
+    # Resolve which model to use for extraction
+    _has_model = args.query_model or args.extract_model
+    if _has_model:
+        _extract_model = args.extract_model or args.query_model
+        _provider = args.provider
+
+        if _provider == "anthropic":
+            _api_key = _get_anthropic_api_key()
+            extract_fn: Callable[[str], list[dict[str, Any]]] = (
+                lambda prompt: claude_extract(prompt, model=_extract_model, api_key=_api_key)
+            )
+            print(f"  Using model: {_extract_model} (provider: anthropic)")
+        elif _provider == "bedrock":
+            _bedrock_region = args.bedrock_region
+            _bedrock_profile = args.bedrock_profile
+            extract_fn = (
+                lambda prompt: bedrock_extract(prompt, model=_extract_model, region=_bedrock_region, profile=_bedrock_profile)
+            )
+            print(f"  Using model: {_extract_model} (provider: bedrock, "
+                  f"region: {_bedrock_region or 'default'}, profile: {_bedrock_profile or 'default'})")
+        else:
+            _extract_url = args.ollama_url.rstrip("/")
+            extract_fn = (
+                lambda prompt: local_extract(prompt, model=_extract_model, url=_extract_url)
+            )
+            print(f"  Using model: {_extract_model} at {_extract_url}")
+    else:
+        extract_fn = lambda _text: []
+
+    if args.parallel > 1 and not _quiet:
+        print(f"  Parallel extractions: {args.parallel} threads")
+
+    _progress = _make_progress_callback(quiet=_quiet, verbose=_verbose)
+
+    # Resolve embed model once (shared across all files)
+    _embed_model = None
+    _embed_url = None
+    if _has_model:
+        if args.embed_model is not None:
+            _embed_model = args.embed_model
+        elif kg.embed_model:
+            _embed_model = kg.embed_model
+            if not _quiet:
+                print(f"  Using embed model '{_embed_model}' from graph metadata")
+        else:
+            _embed_model = "qwen3-embedding"
+        _embed_url = args.embed_url.rstrip("/")
+
+    _all_stats: list[dict[str, Any]] = []
+    _batch_t0 = time.monotonic()
+
+    for md_file_arg in args.ingest_md:
+        md_path = _P(md_file_arg)
+        if not md_path.exists():
+            print(f"File not found: {md_path}")
+            continue
+
+        text = md_path.read_text(encoding="utf-8")
+        doc_id = md_path.stem
+        file_path = md_path.resolve()
+
+        if not _quiet and len(args.ingest_md) > 1:
+            print(f"\n{'='*60}")
+            print(f"  File: {md_path.name}")
+            print(f"{'='*60}")
+
+        _ingest_t0 = time.monotonic()
+
+        stats = kg.ingest_markdown(
+            text,
+            doc_id=doc_id,
+            llm_extract_fn=extract_fn,
+            original_path=file_path,
+            doc_properties={
+                "file_path": str(md_path),
+                "file_size": md_path.stat().st_size,
+            },
+            progress_fn=_progress,
+            parallel_extractions=args.parallel,
+        )
+        _total_elapsed = time.monotonic() - _ingest_t0
+
+        # Embed nodes if an embedding model is configured
+        _embed_stats = None
+        if _embed_model:
+            if args.provider == "bedrock" and args.embed_model is not None:
+                _br = args.bedrock_region
+                _bp = args.bedrock_profile
+                def _embed_fn(batch: list[str]) -> list[list[float]]:
+                    return bedrock_embed(batch, model=_embed_model, region=_br, profile=_bp)
+                if not _quiet:
+                    print(f"  Embed config: model='{_embed_model}' (bedrock, "
+                          f"region={_br or 'default'}, profile={_bp or 'default'})")
+            else:
+                def _embed_fn(batch: list[str]) -> list[list[float]]:
+                    return ollama_embed(batch, model=_embed_model, url=_embed_url)
+                if not _quiet:
+                    print(f"  Embed config: model='{_embed_model}' url='{_embed_url}'")
+
+            _embed_t0 = time.monotonic()
+            _embed_stats = kg.embed_nodes(
+                _embed_fn, skip_existing=True, model_name=_embed_model,
+                progress_fn=_progress,
+            )
+            _embed_elapsed = time.monotonic() - _embed_t0
+
+        kg.save_all()
+
+        # Auto-accept proposals after each file
+        if stats.get("total_proposals_created") and args.auto_accept:
+            pending = kg.get_proposals()
+            for p in pending:
+                kg.accept_proposal(p.name)
+            if pending:
+                kg.save()
+
+        _all_stats.append({
+            "stats": stats,
+            "embed_stats": _embed_stats,
+            "elapsed": _total_elapsed,
+            "md_path": md_path,
+        })
+
+        _print_file_summary(
+            stats, md_path, _total_elapsed, kg, _embed_stats,
+            verbose=_verbose, auto_accept=args.auto_accept,
+        )
+
+    # Batch summary for multi-file ingestion
+    if len(_all_stats) > 1:
+        _batch_elapsed = time.monotonic() - _batch_t0
+        total_triples = sum(s["stats"]["total_triples"] for s in _all_stats)
+        total_nodes_added = sum(s["stats"]["total_nodes_added"] for s in _all_stats)
+        total_nodes_updated = sum(s["stats"]["total_nodes_updated"] for s in _all_stats)
+        total_edges_added = sum(s["stats"]["total_edges_added"] for s in _all_stats)
+        total_edges_updated = sum(s["stats"]["total_edges_updated"] for s in _all_stats)
+        graph_stats = kg.stats()
+        print(f"\n{'='*60}")
+        print(f"  Batch complete: {len(_all_stats)} files ingested")
+        print(f"  Total triples: {total_triples}")
+        _bn = f"{total_nodes_added} added"
+        if total_nodes_updated:
+            _bn += f", {total_nodes_updated} updated"
+        _be = f"{total_edges_added} added"
+        if total_edges_updated:
+            _be += f", {total_edges_updated} updated"
+        print(f"  Total nodes: {_bn}")
+        print(f"  Total edges: {_be}")
+        print(f"  Graph totals: {graph_stats['num_nodes']} nodes, "
+              f"{graph_stats['num_edges']} edges")
+        print(f"  Total time: {_batch_elapsed:.1f}s")
+        print(f"{'='*60}")
+
+    if _all_stats:
+        print(f"\n  Graph saved to {kg.graph_path}")
+
+        # Auto-export visualizations (once at the end)
+        if not args.no_viz:
+            graph_dir = kg.graph_path.parent
+            base_name = kg.graph_path.stem
+
+            cyto_path = graph_dir / f"{base_name}_cytoscape.html"
+            try:
+                kg.export_cytoscape(cyto_path)
+                print(f"  Cytoscape visualization: {cyto_path}")
+            except (OSError, ValueError) as e:
+                logger.error("Cytoscape export failed: %s", e)
+
+            try:
+                pyvis_path = graph_dir / f"{base_name}_pyvis.html"
+                kg.export_pyvis(pyvis_path)
+                print(f"  Pyvis visualization: {pyvis_path}")
+            except (ImportError, OSError, ValueError) as e:
+                logger.error("Pyvis export skipped: %s", e)
+
+
+def _cmd_verify_embeddings(kg: "KnowledgeGraph") -> None:
+    """Handle --verify-embeddings: check embedding integrity."""
+    emb_count = len(kg._embeddings)
+    if emb_count == 0:
+        print("No embeddings found.")
+        return
+
+    model = kg.embed_model or "(unknown)"
+    dim = kg.embed_dim
+    missing = kg.nodes_without_embeddings()
+
+    zero_vectors: list[str] = []
+    dim_mismatches: list[tuple[str, int]] = []
+    first_dim: int | None = None
+    for nid, vec in kg._embeddings.items():
+        if first_dim is None:
+            first_dim = len(vec)
+        if all(v == 0.0 for v in vec):
+            zero_vectors.append(nid)
+        if len(vec) != first_dim:
+            dim_mismatches.append((nid, len(vec)))
+
+    print(f"  Embeddings: {emb_count}")
+    print(f"  Model: {model}")
+    print(f"  Dimension: {dim or first_dim}")
+    print(f"  Nodes without embeddings: {len(missing)}")
+    if missing and len(missing) <= 10:
+        for nid in missing:
+            print(f"    - {nid}")
+    elif missing:
+        for nid in missing[:5]:
+            print(f"    - {nid}")
+        print(f"    ... and {len(missing) - 5} more")
+
+    if zero_vectors:
+        print(f"  WARNING: {len(zero_vectors)} zero vector(s) detected "
+              "(embedding may have failed):")
+        for nid in zero_vectors[:5]:
+            print(f"    - {nid}")
+        if len(zero_vectors) > 5:
+            print(f"    ... and {len(zero_vectors) - 5} more")
+
+    if dim_mismatches:
+        print(f"  WARNING: {len(dim_mismatches)} dimension mismatch(es):")
+        for nid, d in dim_mismatches[:5]:
+            print(f"    - {nid}: {d} (expected {first_dim})")
+
+    if not zero_vectors and not dim_mismatches:
+        sample_nid = next(iter(kg._embeddings))
+        sample_vec = kg._embeddings[sample_nid]
+        preview = ", ".join(f"{v:.4f}" for v in sample_vec[:5])
+        print(f"  Sample ({sample_nid}): [{preview}, ...] (len={len(sample_vec)})")
+        print("  OK — all embeddings look valid.")
+
+
+def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Knowledge Graph Inspector")
@@ -6884,380 +7348,10 @@ def main():
         print(f"Cytoscape visualization: {path}")
 
     if args.preview_md:
-        from pathlib import Path as _P
-        md_path = _P(args.preview_md)
-        if not md_path.exists():
-            print(f"File not found: {md_path}")
-        else:
-            text = md_path.read_text(encoding="utf-8")
-            sections = KnowledgeGraph.parse_markdown_sections(text)
-            print(f"\nMarkdown: {md_path.name}")
-            print(f"  Total characters: {len(text):,}")
-            print(f"  Sections parsed: {len(sections)}")
-            print()
-            for i, sec in enumerate(sections):
-                prefix = "  " * sec["level"] if sec["level"] > 0 else ""
-                heading = sec["heading"] or "(preamble)"
-                flags = []
-                if sec["has_code"]:
-                    flags.append("code")
-                if sec["has_table"]:
-                    flags.append("table")
-                if sec["has_list"]:
-                    flags.append("list")
-                if sec["links"]:
-                    flags.append(f"{len(sec['links'])} links")
-                flag_str = f"  [{', '.join(flags)}]" if flags else ""
-                print(f"  {prefix}{'#' * sec['level']} {heading}  "
-                      f"({sec['char_count']:,} chars){flag_str}")
-                if args.sections:
-                    # Show first 200 chars of body
-                    preview = sec["body"][:200].replace("\n", " ")
-                    if len(sec["body"]) > 200:
-                        preview += "..."
-                    print(f"  {prefix}  → {preview}")
-            print(f"\n  To ingest, run: --ingest-md {args.preview_md}")
+        _cmd_preview_md(args, kg)
 
     if args.ingest_md:
-        from pathlib import Path as _P
-
-        # Build the LLM extraction function (shared across all files)
-        _quiet = args.quiet
-        _verbose = args.verbose
-
-        # Resolve which model to use for extraction
-        _has_model = args.query_model or args.extract_model
-        if _has_model:
-            _extract_model = args.extract_model or args.query_model
-            _provider = args.provider
-
-            if _provider == "anthropic":
-                _api_key = _get_anthropic_api_key()
-                extract_fn: Callable[[str], list[dict[str, Any]]] = (
-                    lambda prompt: claude_extract(prompt, model=_extract_model, api_key=_api_key)
-                )
-                print(f"  Using model: {_extract_model} (provider: anthropic)")
-            elif _provider == "bedrock":
-                _bedrock_region = args.bedrock_region
-                _bedrock_profile = args.bedrock_profile
-                extract_fn = (
-                    lambda prompt: bedrock_extract(prompt, model=_extract_model, region=_bedrock_region, profile=_bedrock_profile)
-                )
-                print(f"  Using model: {_extract_model} (provider: bedrock, region: {_bedrock_region or 'default'}, profile: {_bedrock_profile or 'default'})")
-            else:
-                _extract_url = args.ollama_url.rstrip("/")
-                extract_fn = (
-                    lambda prompt: local_extract(prompt, model=_extract_model, url=_extract_url)
-                )
-                print(f"  Using model: {_extract_model} at {_extract_url}")
-        else:
-            # Structure-only ingestion: no LLM, build document/section
-            # nodes and store the source. Entity extraction is skipped.
-            extract_fn = lambda _text: []
-
-        if args.parallel > 1 and not _quiet:
-            print(f"  Parallel extractions: {args.parallel} threads")
-
-        def _progress(event: dict[str, Any]) -> None:
-            if _quiet:
-                return
-            ev = event["event"]
-            idx = event.get("index", 0)
-            total = event.get("total", 0)
-            heading = event.get("heading", "?")
-            chars = event.get("char_count", 0)
-            tag = f"[{idx + 1}/{total}]"
-
-            if ev == "doc_start":
-                doc = event.get("doc_id", "?")
-                secs = event.get("total_sections", 0)
-                ccount = event.get("char_count", 0)
-                print(f"  Document: \"{doc}\" ({ccount:,} chars, {secs} sections)")
-            elif ev == "section_skip":
-                print(f"  {tag} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
-            elif ev == "section_start":
-                print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars)...", end="", flush=True)
-            elif ev == "extraction_done":
-                n = event.get("triples_returned", 0)
-                if _verbose:
-                    print(f" {n} triples returned, processing...", end="", flush=True)
-            elif ev == "triple_done":
-                if _verbose:
-                    ti = event.get("index", 0)
-                    tt = event.get("total", 0)
-                    # Print a dot every 5 triples to show progress
-                    if tt > 5 and (ti + 1) % 5 == 0:
-                        print(".", end="", flush=True)
-            elif ev == "section_done":
-                elapsed = event.get("elapsed_seconds", 0)
-                triples = event.get("triples", 0)
-                nodes_added = event.get("nodes_added", 0)
-                nodes_updated = event.get("nodes_updated", 0)
-                edges_added = event.get("edges_added", 0)
-                edges_updated = event.get("edges_updated", 0)
-                errors = event.get("errors", [])
-                # Build concise node/edge summary
-                parts = []
-                if nodes_added:
-                    parts.append(f"{nodes_added} new")
-                if nodes_updated:
-                    parts.append(f"{nodes_updated} updated")
-                node_summary = "+".join(parts) + " nodes" if parts else "0 nodes"
-                edge_parts = []
-                if edges_added:
-                    edge_parts.append(f"{edges_added} new")
-                if edges_updated:
-                    edge_parts.append(f"{edges_updated} updated")
-                edge_summary = ("+".join(edge_parts) + " edges") if edge_parts else ""
-
-                result_str = node_summary
-                if edge_summary:
-                    result_str += f", {edge_summary}"
-
-                if errors:
-                    print(f" {triples} triples → {result_str} ({len(errors)} errors, {elapsed}s)")
-                    if _verbose:
-                        for err in errors[:5]:
-                            print(f"         {err}")
-                        if len(errors) > 5:
-                            print(f"         ... and {len(errors) - 5} more")
-                else:
-                    print(f" {triples} triples → {result_str} ({elapsed}s)")
-            elif ev == "doc_done":
-                if _verbose:
-                    secs = event.get("total_sections", 0)
-                    triples = event.get("total_triples", 0)
-                    na = event.get("total_nodes_added", 0)
-                    ea = event.get("total_edges_added", 0)
-                    print(f"  Document complete: {secs} sections, {triples} triples, {na} nodes, {ea} edges")
-            elif ev == "embed_start":
-                tn = event.get("total_nodes", 0)
-                sk = event.get("nodes_skipped", 0)
-                print(f"  Embedding {tn} nodes ({sk} skipped)...", end="", flush=True)
-            elif ev == "embed_batch_done":
-                b = event.get("batch", 0)
-                tb = event.get("total_batches", 0)
-                ne = event.get("nodes_embedded", 0)
-                tn = event.get("total_nodes", 0)
-                if _verbose:
-                    print(f" batch {b}/{tb} ({ne}/{tn})", end="", flush=True)
-            elif ev == "embed_done":
-                ne = event.get("nodes_embedded", 0)
-                nb = event.get("batches", 0)
-                print(f" {ne} nodes embedded in {nb} batches")
-
-        # Resolve embed model once (shared across all files)
-        _embed_model = None
-        _embed_url = None
-        if _has_model:
-            if args.embed_model is not None:
-                _embed_model = args.embed_model
-            elif kg.embed_model:
-                _embed_model = kg.embed_model
-                if not _quiet:
-                    print(f"  Using embed model '{_embed_model}' from graph metadata")
-            else:
-                _embed_model = "qwen3-embedding"
-            _embed_url = args.embed_url.rstrip("/")
-
-        _all_stats: list[dict[str, Any]] = []
-        _batch_t0 = time.monotonic()
-
-        for md_file_arg in args.ingest_md:
-            md_path = _P(md_file_arg)
-            if not md_path.exists():
-                print(f"File not found: {md_path}")
-                continue
-
-            text = md_path.read_text(encoding="utf-8")
-            doc_id = md_path.stem
-            file_path = md_path.resolve()
-
-            if not _quiet and len(args.ingest_md) > 1:
-                print(f"\n{'='*60}")
-                print(f"  File: {md_path.name}")
-                print(f"{'='*60}")
-
-            _ingest_t0 = time.monotonic()
-
-            stats = kg.ingest_markdown(
-                text,
-                doc_id=doc_id,
-                llm_extract_fn=extract_fn,
-                original_path=file_path,
-                doc_properties={
-                    "file_path": str(md_path),
-                    "file_size": md_path.stat().st_size,
-                },
-                progress_fn=_progress,
-                parallel_extractions=args.parallel,
-            )
-            _total_elapsed = time.monotonic() - _ingest_t0
-
-            # Embed nodes if an embedding model is configured
-            _embed_stats = None
-            if _embed_model:
-                if args.provider == "bedrock" and args.embed_model is not None:
-                    _br = args.bedrock_region
-                    _bp = args.bedrock_profile
-                    def _embed_fn(batch: list[str]) -> list[list[float]]:
-                        return bedrock_embed(batch, model=_embed_model, region=_br, profile=_bp)
-                    if not _quiet:
-                        print(f"  Embed config: model='{_embed_model}' (bedrock, region={_br or 'default'}, profile={_bp or 'default'})")
-                else:
-                    def _embed_fn(batch: list[str]) -> list[list[float]]:
-                        return ollama_embed(batch, model=_embed_model, url=_embed_url)
-                    if not _quiet:
-                        print(f"  Embed config: model='{_embed_model}' url='{_embed_url}'")
-
-                _embed_t0 = time.monotonic()
-                _embed_stats = kg.embed_nodes(
-                    _embed_fn, skip_existing=True, model_name=_embed_model,
-                    progress_fn=_progress,
-                )
-                _embed_elapsed = time.monotonic() - _embed_t0
-
-            kg.save_all()
-
-            # Auto-accept proposals after each file
-            if stats.get("total_proposals_created") and args.auto_accept:
-                pending = kg.get_proposals()
-                for p in pending:
-                    kg.accept_proposal(p.name)
-                if pending:
-                    kg.save()
-
-            _all_stats.append({
-                "stats": stats,
-                "embed_stats": _embed_stats,
-                "elapsed": _total_elapsed,
-                "md_path": md_path,
-            })
-
-            # Print per-file summary
-            graph_stats = kg.stats()
-            print(f"\nIngested: {md_path.name}")
-            print(f"  Document ID: {stats['doc_id']}")
-            print(f"  Sections: {stats['total_sections']}")
-            print(f"  Triples extracted: {stats['total_triples']}")
-            _n_added = stats['total_nodes_added']
-            _n_updated = stats['total_nodes_updated']
-            _e_added = stats['total_edges_added']
-            _e_updated = stats['total_edges_updated']
-            node_str = f"{_n_added} added"
-            if _n_updated:
-                node_str += f", {_n_updated} updated"
-            edge_str = f"{_e_added} added"
-            if _e_updated:
-                edge_str += f", {_e_updated} updated"
-            print(f"  Nodes: {node_str}")
-            print(f"  Edges: {edge_str}")
-            print(f"  Total time: {_total_elapsed:.1f}s")
-            print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
-            if _embed_stats and _embed_stats["nodes_embedded"]:
-                print(f"  Nodes embedded: {_embed_stats['nodes_embedded']} "
-                      f"(skipped {_embed_stats['nodes_skipped']})")
-            if stats.get("total_proposals_created"):
-                print(f"  New relation proposals: {stats['total_proposals_created']}")
-                if args.auto_accept:
-                    print(f"  Auto-accepted {stats['total_proposals_created']} proposal(s)")
-            if stats.get("source"):
-                src = stats["source"]
-                if src.get("is_duplicate"):
-                    print(f"  Warning: duplicate content (matches '{src['existing_doc_id']}')")
-                elif src.get("is_update"):
-                    print(f"  Source updated: v{src['version']} ({src['stored_path']})")
-                else:
-                    ver = src.get("version", 1)
-                    if ver > 1:
-                        print(f"  Source unchanged: v{ver} ({src['stored_path']})")
-                    else:
-                        print(f"  Source stored: v{ver} ({src['stored_path']})")
-
-            # Show section breakdown (verbose only)
-            if _verbose:
-                print("\n  Section details:")
-                for sec_stat in stats.get("sections", []):
-                    heading = sec_stat.get("heading", "?")
-                    elapsed = sec_stat.get("elapsed_seconds", "")
-                    elapsed_str = f", {elapsed}s" if elapsed else ""
-                    if sec_stat.get("skipped"):
-                        print(f"    [skip] {heading} ({sec_stat.get('reason', '')})")
-                    else:
-                        triples_info = ""
-                        n_triples = sec_stat.get("triples_processed", 0)
-                        n_nodes = sec_stat.get("nodes_added", 0)
-                        n_nodes_upd = sec_stat.get("nodes_updated", 0)
-                        n_edges = sec_stat.get("edges_added", 0)
-                        n_edges_upd = sec_stat.get("edges_updated", 0)
-                        n_errors = len(sec_stat.get("errors", []))
-                        if n_triples:
-                            triples_info = f", {n_triples} triples"
-                        if n_nodes:
-                            triples_info += f", {n_nodes} new nodes"
-                        if n_nodes_upd:
-                            triples_info += f", {n_nodes_upd} updated nodes"
-                        if n_edges:
-                            triples_info += f", {n_edges} new edges"
-                        if n_edges_upd:
-                            triples_info += f", {n_edges_upd} updated edges"
-                        if n_triples and n_nodes == 0 and n_nodes_upd == 0 and n_errors:
-                            tag = "WARN"
-                            triples_info += f", {n_errors} errors"
-                        else:
-                            tag = "ok"
-                        print(f"    [{tag}]   {heading} ({sec_stat.get('char_count', 0):,} chars{triples_info}{elapsed_str})")
-
-            if stats["errors"]:
-                print(f"\n  Errors ({len(stats['errors'])}):")
-                for err in stats["errors"]:
-                    print(f"    - {err}")
-
-        # Batch summary for multi-file ingestion
-        if len(_all_stats) > 1:
-            _batch_elapsed = time.monotonic() - _batch_t0
-            total_triples = sum(s["stats"]["total_triples"] for s in _all_stats)
-            total_nodes_added = sum(s["stats"]["total_nodes_added"] for s in _all_stats)
-            total_nodes_updated = sum(s["stats"]["total_nodes_updated"] for s in _all_stats)
-            total_edges_added = sum(s["stats"]["total_edges_added"] for s in _all_stats)
-            total_edges_updated = sum(s["stats"]["total_edges_updated"] for s in _all_stats)
-            graph_stats = kg.stats()
-            print(f"\n{'='*60}")
-            print(f"  Batch complete: {len(_all_stats)} files ingested")
-            print(f"  Total triples: {total_triples}")
-            _bn = f"{total_nodes_added} added"
-            if total_nodes_updated:
-                _bn += f", {total_nodes_updated} updated"
-            _be = f"{total_edges_added} added"
-            if total_edges_updated:
-                _be += f", {total_edges_updated} updated"
-            print(f"  Total nodes: {_bn}"  )
-            print(f"  Total edges: {_be}")
-            print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
-            print(f"  Total time: {_batch_elapsed:.1f}s")
-            print(f"{'='*60}")
-
-        if _all_stats:
-            print(f"\n  Graph saved to {kg.graph_path}")
-
-            # Auto-export visualizations (once at the end)
-            if not args.no_viz:
-                graph_dir = kg.graph_path.parent
-                base_name = kg.graph_path.stem
-
-                cyto_path = graph_dir / f"{base_name}_cytoscape.html"
-                try:
-                    kg.export_cytoscape(cyto_path)
-                    print(f"  Cytoscape visualization: {cyto_path}")
-                except Exception as e:
-                    logger.error("Cytoscape export failed: %s", e)
-
-                try:
-                    pyvis_path = graph_dir / f"{base_name}_pyvis.html"
-                    kg.export_pyvis(pyvis_path)
-                    print(f"  Pyvis visualization: {pyvis_path}")
-                except Exception as e:
-                    logger.error("Pyvis export skipped: %s", e)
+        _cmd_ingest_md(args, kg)
 
     if args.sources:
         sources = kg.list_sources()
@@ -7291,56 +7385,7 @@ def main():
                         print(f"    {k}: {v}")
 
     if args.verify_embeddings:
-        emb_count = len(kg._embeddings)
-        if emb_count == 0:
-            print("No embeddings found.")
-        else:
-            model = kg.embed_model or "(unknown)"
-            dim = kg.embed_dim
-            missing = kg.nodes_without_embeddings()
-            # Check for issues
-            zero_vectors = []
-            dim_mismatches = []
-            first_dim = None
-            for nid, vec in kg._embeddings.items():
-                if first_dim is None:
-                    first_dim = len(vec)
-                if all(v == 0.0 for v in vec):
-                    zero_vectors.append(nid)
-                if len(vec) != first_dim:
-                    dim_mismatches.append((nid, len(vec)))
-
-            print(f"  Embeddings: {emb_count}")
-            print(f"  Model: {model}")
-            print(f"  Dimension: {dim or first_dim}")
-            print(f"  Nodes without embeddings: {len(missing)}")
-            if missing and len(missing) <= 10:
-                for nid in missing:
-                    print(f"    - {nid}")
-            elif missing:
-                for nid in missing[:5]:
-                    print(f"    - {nid}")
-                print(f"    ... and {len(missing) - 5} more")
-
-            if zero_vectors:
-                print(f"  WARNING: {len(zero_vectors)} zero vector(s) detected (embedding may have failed):")
-                for nid in zero_vectors[:5]:
-                    print(f"    - {nid}")
-                if len(zero_vectors) > 5:
-                    print(f"    ... and {len(zero_vectors) - 5} more")
-
-            if dim_mismatches:
-                print(f"  WARNING: {len(dim_mismatches)} dimension mismatch(es):")
-                for nid, d in dim_mismatches[:5]:
-                    print(f"    - {nid}: {d} (expected {first_dim})")
-
-            if not zero_vectors and not dim_mismatches:
-                # Show a sample embedding to confirm non-trivial values
-                sample_nid = next(iter(kg._embeddings))
-                sample_vec = kg._embeddings[sample_nid]
-                preview = ", ".join(f"{v:.4f}" for v in sample_vec[:5])
-                print(f"  Sample ({sample_nid}): [{preview}, ...] (len={len(sample_vec)})")
-                print("  OK — all embeddings look valid.")
+        _cmd_verify_embeddings(kg)
 
     if not any([args.stats, args.node, args.neighbors, args.split,
                 args.proposals, args.accept, args.accept_all, args.reject,

@@ -70,7 +70,7 @@ def _get_graph(graph_path: str) -> KnowledgeGraph:
         logger.info("Loading graph: %s", graph_path)
         try:
             _graph_cache[graph_path] = KnowledgeGraph(graph_path)
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.error("Failed to load graph '%s': %s", graph_path, exc)
             raise
     return _graph_cache[graph_path]

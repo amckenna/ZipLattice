@@ -55,19 +55,20 @@ knowledge_graph/                  # dedicated graph directory
 - **Optional (for Bedrock provider):** `boto3`
 - Cytoscape.js is loaded from CDN in exported HTML files and does not need a local install
 
-## Key classes
+## Key classes and functions
 
-- `KnowledgeGraph` (line ~611) -- Primary class. Manages nodes, edges, embeddings, relation proposals, persistence, search, and visualization.
-- `CoreRelation` (line ~401) -- Enum of 25+ built-in relation types (taxonomic, dependency, associative, documentation, functional, contextual).
-- `RelationProposal` (line ~566) -- Dataclass tracking proposed new relation types with examples and confidence scores.
-- `ProposalStatus` (line ~559) -- Enum: PENDING, ACCEPTED, REJECTED.
-- `GraphEncoder` (line ~521) -- Custom JSON encoder for datetime, set, Enum, and Path objects.
-- `ollama_embed()` (module-level) -- Calls OpenAI-compatible `/v1/embeddings` endpoint. Works with Ollama, llama.cpp, vLLM, LocalAI, etc. Used during ingestion and by `query_graph.py` at query time.
-- `claude_chat()` (module-level) -- Calls the Anthropic Messages API for chat/query. Used when `--provider anthropic` is set.
-- `claude_extract()` (module-level) -- Calls the Anthropic Messages API for JSON entity/relation extraction during ingestion. Same three-tier JSON recovery as the local path.
-- `bedrock_chat()` (module-level) -- Calls the AWS Bedrock Converse API for chat/query. Used when `--provider bedrock` is set.
-- `bedrock_extract()` (module-level) -- Calls the AWS Bedrock Converse API for JSON entity/relation extraction. Same three-tier JSON recovery as the local path.
-- `bedrock_embed()` (module-level) -- Calls AWS Bedrock for embeddings. Supports Titan (`invoke_model`) and Cohere (batched) embedding models.
+- `KnowledgeGraph` -- Primary class. Manages nodes, edges, embeddings, relation proposals, persistence, search, and visualization.
+- `CoreRelation` -- Enum of 25+ built-in relation types (taxonomic, dependency, associative, documentation, functional, contextual).
+- `RelationProposal` -- Dataclass tracking proposed new relation types with examples and confidence scores.
+- `ProposalStatus` -- Enum: PENDING, ACCEPTED, REJECTED.
+- `GraphEncoder` -- Custom JSON encoder for datetime, set, Enum, and Path objects.
+- `ollama_embed()` -- Calls OpenAI-compatible `/v1/embeddings` endpoint. Works with Ollama, llama.cpp, vLLM, LocalAI, etc. Used during ingestion and by `query_graph.py` at query time.
+- `claude_chat()` -- Calls the Anthropic Messages API for chat/query. Used when `--provider anthropic` is set.
+- `claude_extract()` -- Calls the Anthropic Messages API for JSON entity/relation extraction during ingestion. Same three-tier JSON recovery as the local path.
+- `bedrock_chat()` -- Calls the AWS Bedrock Converse API for chat/query. Used when `--provider bedrock` is set.
+- `bedrock_extract()` -- Calls the AWS Bedrock Converse API for JSON entity/relation extraction. Same three-tier JSON recovery as the local path.
+- `bedrock_embed()` -- Calls AWS Bedrock for embeddings. Supports Titan (`invoke_model`) and Cohere (batched) embedding models.
+- `read_http_error_detail()` -- Shared utility for safely extracting response body text from `urllib.error.HTTPError` exceptions.
 - `KnowledgeGraph.ingest_triples()` -- Public method that accepts pre-extracted triples directly (no LLM call). Enables the orchestrator-as-extractor pattern used by the MCP server.
 - `KnowledgeGraph.extract_document_subgraph()` -- Extracts a document and all its associated nodes, edges, source text, embeddings, and proposals into a portable dict. Used for transplanting documents between graphs.
 - `KnowledgeGraph.import_document_subgraph()` -- Imports a previously extracted document subgraph into this graph with smart-merge semantics (descriptions combined, confidence maximised, edges deduplicated). Records transplant provenance.
