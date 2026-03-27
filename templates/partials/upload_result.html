@@ -18,7 +18,7 @@
         {% for f in files %}
         <tr class="border-b border-gray-800">
           <td class="py-1">{{ f.name }}</td>
-          <td class="py-1 text-right text-gray-400">{{ "{:,}".format(f.tokens) }}</td>
+          <td class="py-1 text-right text-gray-400">~{{ "{:,}".format(f.tokens) }}</td>
           <td class="py-1 text-right">
             {% if f.error %}
             <span class="text-red-400">{{ f.error }}</span>
