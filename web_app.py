@@ -759,9 +759,11 @@ async def ingest_documents(
     bedrock_profile: str = Form(""),
     verbose: str = Form(""),
     parallel: str = Form("1"),
+    incremental: str = Form(""),
 ) -> Response:
     """Run LLM ingestion with streaming progress log."""
     _verbose = verbose.strip() == "1"
+    _incremental = incremental.strip() == "1"
     try:
         _parallel = max(1, int(parallel.strip() or "1"))
     except (ValueError, TypeError):
@@ -868,6 +870,7 @@ async def ingest_documents(
                             original_path=doc.get("filename"),
                             progress_fn=_capture_progress,
                             parallel_extractions=_parallel,
+                            incremental=_incremental,
                         )
                         ingest_result.update(stats)
                     except Exception as exc:

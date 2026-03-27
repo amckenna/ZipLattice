@@ -1718,3 +1718,201 @@ def test_analytics_quality_score_improves_with_embeddings(tmp_graph):
     kg.set_embedding("b", [0.3, 0.4])
     score_after = kg.analytics()["quality_score"]
     assert score_after > score_before
+
+
+# ── Incremental ingestion tests ──────────────────────────────
+
+
+def test_incremental_skips_unchanged_sections(tmp_path):
+    """Incremental ingestion skips LLM extraction for sections unchanged since last version."""
+    kg = KnowledgeGraph(tmp_path / "inc.json")
+
+    # Track which sections the LLM was called on
+    extracted_prompts = []
+
+    def mock_extract(prompt):
+        extracted_prompts.append(prompt)
+        return [{"source": "EntityA", "target": "EntityB", "relation": "related_to"}]
+
+    md_v1 = (_long_section("Intro", "introduction content here") + "\n"
+             + _long_section("Methods", "methods description here") + "\n"
+             + _long_section("Results", "results findings here"))
+
+    # First ingestion: all sections should be extracted
+    stats_v1 = kg.ingest_markdown(
+        md_v1, "doc1", llm_extract_fn=mock_extract, incremental=True,
+    )
+    assert stats_v1["sections_skipped_incremental"] == 0
+    calls_v1 = len(extracted_prompts)
+    assert calls_v1 == 3  # All three sections extracted
+
+    kg.save()
+    extracted_prompts.clear()
+
+    # v2: Intro unchanged, Methods changed, Results unchanged, Discussion added
+    md_v2 = (_long_section("Intro", "introduction content here") + "\n"
+             + _long_section("Methods", "methods COMPLETELY REWRITTEN") + "\n"
+             + _long_section("Results", "results findings here") + "\n"
+             + _long_section("Discussion", "discussion text added"))
+
+    stats_v2 = kg.ingest_markdown(
+        md_v2, "doc1", llm_extract_fn=mock_extract, incremental=True,
+    )
+
+    # Intro and Results are unchanged → should be skipped
+    assert stats_v2["sections_skipped_incremental"] == 2
+    # Methods (changed) + Discussion (new) → 2 LLM calls
+    assert len(extracted_prompts) == 2
+
+
+def test_incremental_false_extracts_all_sections(tmp_path):
+    """When incremental=False (default), all sections are re-extracted on re-ingestion."""
+    kg = KnowledgeGraph(tmp_path / "noinc.json")
+
+    extracted_prompts = []
+
+    def mock_extract(prompt):
+        extracted_prompts.append(prompt)
+        return [{"source": "X", "target": "Y", "relation": "related_to"}]
+
+    md_v1 = (_long_section("Intro", "intro text words") + "\n"
+             + _long_section("Methods", "methods description"))
+
+    kg.ingest_markdown(md_v1, "doc1", llm_extract_fn=mock_extract)
+    kg.save()
+    extracted_prompts.clear()
+
+    # Same doc, just add a section
+    md_v2 = (md_v1 + "\n" + _long_section("Extra", "extra content"))
+
+    stats_v2 = kg.ingest_markdown(
+        md_v2, "doc1", llm_extract_fn=mock_extract, incremental=False,
+    )
+
+    # Without incremental, all 3 sections should be extracted
+    assert stats_v2["sections_skipped_incremental"] == 0
+    assert len(extracted_prompts) == 3
+
+
+def test_incremental_first_ingestion_extracts_everything(tmp_path):
+    """First-time ingestion with incremental=True still extracts everything."""
+    kg = KnowledgeGraph(tmp_path / "first.json")
+
+    call_count = [0]
+
+    def mock_extract(prompt):
+        call_count[0] += 1
+        return [{"source": "A", "target": "B", "relation": "related_to"}]
+
+    md = (_long_section("Alpha", "alpha body text") + "\n"
+          + _long_section("Beta", "beta body text"))
+
+    stats = kg.ingest_markdown(
+        md, "doc1", llm_extract_fn=mock_extract, incremental=True,
+    )
+    assert stats["sections_skipped_incremental"] == 0
+    assert call_count[0] == 2
+
+
+def test_incremental_without_preserve_source_extracts_all(tmp_path):
+    """Incremental requires preserve_source=True; without it, everything is extracted."""
+    kg = KnowledgeGraph(tmp_path / "nops.json")
+
+    call_count = [0]
+
+    def mock_extract(prompt):
+        call_count[0] += 1
+        return []
+
+    md = _long_section("Only", "only section content")
+
+    # First pass with preserve_source
+    kg.ingest_markdown(md, "doc1", llm_extract_fn=mock_extract, preserve_source=True)
+    kg.save()
+    call_count[0] = 0
+
+    # Re-ingest with incremental=True but preserve_source=False
+    kg.ingest_markdown(
+        md, "doc1", llm_extract_fn=mock_extract,
+        incremental=True, preserve_source=False,
+    )
+    # Without preserve_source, incremental can't compare → extracts everything
+    assert call_count[0] == 1
+
+
+def test_incremental_progress_events(tmp_path):
+    """Incremental ingestion fires 'section_skip' with reason='unchanged' and 'incremental_skip_plan'."""
+    kg = KnowledgeGraph(tmp_path / "prog.json")
+
+    def mock_extract(prompt):
+        return [{"source": "A", "target": "B", "relation": "related_to"}]
+
+    events = []
+
+    def capture_progress(event):
+        events.append(event)
+
+    md_v1 = (_long_section("Stable", "stable content here") + "\n"
+             + _long_section("Changing", "changing content"))
+
+    kg.ingest_markdown(md_v1, "doc1", llm_extract_fn=mock_extract,
+                       progress_fn=capture_progress, incremental=True)
+    kg.save()
+    events.clear()
+
+    md_v2 = (_long_section("Stable", "stable content here") + "\n"
+             + _long_section("Changing", "completely different now"))
+
+    kg.ingest_markdown(md_v2, "doc1", llm_extract_fn=mock_extract,
+                       progress_fn=capture_progress, incremental=True)
+
+    # Should have an incremental_skip_plan event
+    skip_plan_events = [e for e in events if e["event"] == "incremental_skip_plan"]
+    assert len(skip_plan_events) == 1
+    assert "Stable" in skip_plan_events[0]["unchanged_sections"]
+
+    # Should have a section_skip event with reason "unchanged"
+    skip_events = [e for e in events if e.get("event") == "section_skip"
+                   and e.get("reason") == "unchanged"]
+    assert len(skip_events) == 1
+    assert skip_events[0]["heading"] == "Stable"
+
+
+def test_incremental_structural_nodes_still_updated(tmp_path):
+    """Even when sections are skipped for extraction, structural nodes/edges are created."""
+    kg = KnowledgeGraph(tmp_path / "struct.json")
+
+    call_count = [0]
+
+    def mock_extract(prompt):
+        call_count[0] += 1
+        return [{"source": "Entity1", "target": "Entity2", "relation": "related_to"}]
+
+    md_v1 = (_long_section("Alpha", "alpha body content") + "\n"
+             + _long_section("Beta", "beta body content"))
+
+    kg.ingest_markdown(md_v1, "doc1", llm_extract_fn=mock_extract, incremental=True)
+    kg.save()
+
+    # Verify section nodes exist
+    alpha_slug = "doc1-alpha"
+    beta_slug = "doc1-beta"
+    assert kg.get_node(alpha_slug) is not None
+    assert kg.get_node(beta_slug) is not None
+
+    call_count[0] = 0
+
+    # v2: Alpha unchanged, Beta unchanged, Gamma added (triggers is_update)
+    md_v2 = (md_v1 + "\n" + _long_section("Gamma", "gamma new content"))
+    stats = kg.ingest_markdown(md_v2, "doc1", llm_extract_fn=mock_extract, incremental=True)
+    # Alpha and Beta unchanged → skipped for extraction
+    assert stats["sections_skipped_incremental"] == 2
+    # Only Gamma extracted
+    assert call_count[0] == 1
+
+    # All section nodes still present (including the unchanged ones)
+    assert kg.get_node(alpha_slug) is not None
+    assert kg.get_node(beta_slug) is not None
+    assert kg.get_node("doc1-gamma") is not None
+    # Document node still present
+    assert kg.get_node("doc1") is not None

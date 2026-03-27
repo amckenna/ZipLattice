@@ -4211,6 +4211,7 @@ TEXT:
         doc_properties: dict[str, Any] | None = None,
         progress_fn: Callable[[dict[str, Any]], None] | None = None,
         parallel_extractions: int = 1,
+        incremental: bool = False,
     ) -> dict[str, Any]:
         """
         Ingest a markdown document with structure-aware chunking.
@@ -4258,6 +4259,14 @@ TEXT:
                                   When > 1, LLM calls run concurrently in a
                                   thread pool while graph writes remain serial.
                                   Defaults to 1 (sequential extraction).
+            incremental: When True and the document has a previous version
+                         with section hashes, skip LLM extraction for sections
+                         whose content has not changed.  Structural nodes and
+                         edges are always created/updated regardless.  This can
+                         dramatically reduce LLM calls when re-ingesting a
+                         document where only a few sections changed.  Requires
+                         ``preserve_source=True`` so that section hashes are
+                         available for comparison.
 
         Returns:
             Aggregate stats dict with per-section breakdown.
@@ -4272,6 +4281,7 @@ TEXT:
             "total_edges_updated": 0,
             "total_proposals_created": 0,
             "total_proposals_augmented": 0,
+            "sections_skipped_incremental": 0,
             "source": None,
             "sections": [],
             "errors": [],
@@ -4346,6 +4356,38 @@ TEXT:
 
         aggregate_stats["ingestion_id"] = ingestion_id
         aggregate_stats["content_hash"] = source_content_hash
+
+        # ── Incremental ingestion: determine unchanged sections ───
+        # When incremental=True and we have a previous version with section
+        # hashes, build a set of section headings whose content has not
+        # changed so we can skip their (expensive) LLM extraction.
+        _unchanged_headings: set[str] = set()
+        if incremental and preserve_source and source_result is not None:
+            prev_version = source_result.get("version", 1) - 1
+            if source_result.get("is_update") and prev_version >= 1:
+                try:
+                    diff = self.diff_document_versions(
+                        doc_id, prev_version, source_result["version"],
+                    )
+                    _unchanged_headings = set(diff.unchanged)
+                    if _unchanged_headings:
+                        logger.info(
+                            "[%s] Incremental mode: %d unchanged sections will "
+                            "skip LLM extraction",
+                            doc_id, len(_unchanged_headings),
+                        )
+                        if progress_fn:
+                            progress_fn({
+                                "event": "incremental_skip_plan",
+                                "doc_id": doc_id,
+                                "unchanged_sections": sorted(_unchanged_headings),
+                                "changed_sections": sorted(
+                                    set(diff.added) | set(diff.modified)
+                                ),
+                                "removed_sections": diff.removed,
+                            })
+                except KeyError:
+                    pass  # no section hashes for previous version
 
         # Parse into sections
         sections = self.parse_markdown_sections(
@@ -4488,6 +4530,31 @@ TEXT:
                         "reason": "too_short",
                         "char_count": section["char_count"],
                     })
+                continue
+
+            # Incremental mode: skip LLM extraction for unchanged sections
+            _section_hash_key = heading if heading != f"Section {i + 1}" else "__preamble__"
+            if _unchanged_headings and _section_hash_key in _unchanged_headings:
+                aggregate_stats["sections_skipped_incremental"] += 1
+                skip_info = {
+                    "heading": heading,
+                    "skipped": True,
+                    "reason": "unchanged",
+                }
+                aggregate_stats["sections"].append(skip_info)
+                if progress_fn:
+                    progress_fn({
+                        "event": "section_skip",
+                        "index": i,
+                        "total": len(sections),
+                        "heading": heading,
+                        "reason": "unchanged",
+                        "char_count": section["char_count"],
+                    })
+                logger.info(
+                    "[%s] [%d/%d] Skipping '%s' (unchanged)",
+                    doc_id, i + 1, len(sections), heading,
+                )
                 continue
 
             section_text = context_prefix + body
@@ -4717,16 +4784,30 @@ TEXT:
                     {"text": text, "url": url} for url, text in unique_urls.items()
                 ]
 
-        logger.info(
-            "Markdown ingest '%s': %d sections, %d triples → "
-            "%d nodes added (%d updated), %d edges added (%d updated)",
-            doc_id, aggregate_stats["total_sections"],
-            aggregate_stats["total_triples"],
-            aggregate_stats["total_nodes_added"],
-            aggregate_stats["total_nodes_updated"],
-            aggregate_stats["total_edges_added"],
-            aggregate_stats["total_edges_updated"],
-        )
+        _skipped_inc = aggregate_stats["sections_skipped_incremental"]
+        if _skipped_inc:
+            logger.info(
+                "Markdown ingest '%s': %d sections (%d skipped, incremental), "
+                "%d triples → %d nodes added (%d updated), "
+                "%d edges added (%d updated)",
+                doc_id, aggregate_stats["total_sections"], _skipped_inc,
+                aggregate_stats["total_triples"],
+                aggregate_stats["total_nodes_added"],
+                aggregate_stats["total_nodes_updated"],
+                aggregate_stats["total_edges_added"],
+                aggregate_stats["total_edges_updated"],
+            )
+        else:
+            logger.info(
+                "Markdown ingest '%s': %d sections, %d triples → "
+                "%d nodes added (%d updated), %d edges added (%d updated)",
+                doc_id, aggregate_stats["total_sections"],
+                aggregate_stats["total_triples"],
+                aggregate_stats["total_nodes_added"],
+                aggregate_stats["total_nodes_updated"],
+                aggregate_stats["total_edges_added"],
+                aggregate_stats["total_edges_updated"],
+            )
 
         # Notify progress callback of document ingestion completion
         if progress_fn:
@@ -4734,6 +4815,7 @@ TEXT:
                 "event": "doc_done",
                 "doc_id": doc_id,
                 "total_sections": aggregate_stats["total_sections"],
+                "sections_skipped_incremental": _skipped_inc,
                 "total_triples": aggregate_stats["total_triples"],
                 "total_nodes_added": aggregate_stats["total_nodes_added"],
                 "total_nodes_updated": aggregate_stats["total_nodes_updated"],
@@ -7455,13 +7537,31 @@ def _make_progress_callback(
                         print(f"         ... and {len(errors) - 5} more")
             else:
                 print(f" {triples} triples → {result_str} ({elapsed}s)")
+        elif ev == "incremental_skip_plan":
+            unchanged = event.get("unchanged_sections", [])
+            changed = event.get("changed_sections", [])
+            removed = event.get("removed_sections", [])
+            print(f"  Incremental: {len(unchanged)} unchanged, "
+                  f"{len(changed)} changed, {len(removed)} removed")
+            if verbose:
+                for s in unchanged[:10]:
+                    print(f"    skip: {s}")
+                if len(unchanged) > 10:
+                    print(f"    ... and {len(unchanged) - 10} more")
+        elif ev == "version_diff":
+            summary = event.get("summary", "")
+            if verbose:
+                print(f"  Version diff (v{event.get('version_from')}→v{event.get('version_to')}): {summary}")
         elif ev == "doc_done":
             if verbose:
                 secs = event.get("total_sections", 0)
                 triples = event.get("total_triples", 0)
                 na = event.get("total_nodes_added", 0)
                 ea = event.get("total_edges_added", 0)
-                print(f"  Document complete: {secs} sections, {triples} triples, {na} nodes, {ea} edges")
+                skipped_inc = event.get("sections_skipped_incremental", 0)
+                inc_note = f", {skipped_inc} skipped (unchanged)" if skipped_inc else ""
+                print(f"  Document complete: {secs} sections{inc_note}, "
+                      f"{triples} triples, {na} nodes, {ea} edges")
         elif ev == "embed_start":
             tn = event.get("total_nodes", 0)
             sk = event.get("nodes_skipped", 0)
@@ -7495,7 +7595,11 @@ def _print_file_summary(
     graph_stats = kg.stats()
     print(f"\nIngested: {md_path.name}")
     print(f"  Document ID: {stats['doc_id']}")
-    print(f"  Sections: {stats['total_sections']}")
+    _skipped_inc = stats.get("sections_skipped_incremental", 0)
+    if _skipped_inc:
+        print(f"  Sections: {stats['total_sections']} ({_skipped_inc} skipped, unchanged)")
+    else:
+        print(f"  Sections: {stats['total_sections']}")
     print(f"  Triples extracted: {stats['total_triples']}")
     _n_added = stats["total_nodes_added"]
     _n_updated = stats["total_nodes_updated"]
@@ -7610,6 +7714,8 @@ def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
 
     if args.parallel > 1 and not _quiet:
         print(f"  Parallel extractions: {args.parallel} threads")
+    if args.incremental and not _quiet:
+        print("  Incremental mode: unchanged sections will skip LLM extraction")
 
     _progress = _make_progress_callback(quiet=_quiet, verbose=_verbose)
 
@@ -7658,6 +7764,7 @@ def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
             },
             progress_fn=_progress,
             parallel_extractions=args.parallel,
+            incremental=args.incremental,
         )
         _total_elapsed = time.monotonic() - _ingest_t0
 
@@ -7868,6 +7975,11 @@ def main() -> None:
                         help="Number of parallel LLM extraction threads during ingestion. "
                              "LLM calls run concurrently while graph writes remain serial. "
                              "(default: 1, sequential)")
+    parser.add_argument("--incremental", action="store_true",
+                        help="Skip LLM extraction for sections unchanged since the last "
+                             "ingestion. Uses section-level content hashes to detect changes. "
+                             "Structural nodes/edges are always updated. Dramatically reduces "
+                             "LLM calls when re-ingesting documents with minor edits.")
     parser.add_argument("--auto-accept", action="store_true",
                         help="Automatically accept all new relation proposals created during ingestion")
     parser.add_argument("--doc-history", metavar="DOC_ID",
