@@ -4183,6 +4183,12 @@ TEXT:
                     })
                 continue
 
+            logger.info(
+                "[%s] [%d/%d] Extracting '%s' (~%s chars)...",
+                doc_id, i + 1, len(sections), heading,
+                f"{section['char_count']:,}",
+            )
+
             # Notify progress callback before LLM extraction
             if progress_fn:
                 progress_fn({
@@ -4258,6 +4264,16 @@ TEXT:
             aggregate_stats["sections"].append(section_record)
             if section_stats["errors"]:
                 aggregate_stats["errors"].extend(section_stats["errors"])
+
+            logger.info(
+                "[%s] [%d/%d] Done '%s': %d triples → "
+                "%d nodes, %d edges (%.1fs)",
+                doc_id, i + 1, len(sections), heading,
+                section_stats["triples_processed"],
+                section_stats["nodes_added"],
+                section_stats["edges_added"],
+                elapsed,
+            )
 
             # Notify progress callback after extraction
             if progress_fn:
