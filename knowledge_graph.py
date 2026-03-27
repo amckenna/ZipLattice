@@ -218,7 +218,7 @@ def local_extract(
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    logger.debug("local_extract: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
+    logger.debug("local_extract: POST %s  model=%s  prompt=~%d tokens", endpoint, model, len(prompt) // 4)
     t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=1800) as resp:
@@ -241,7 +241,7 @@ def local_extract(
     elapsed = time.monotonic() - t0
     # OpenAI format: choices[0].message.content
     raw = body["choices"][0]["message"]["content"].strip()
-    logger.debug("local_extract: response=%d chars (%.1fs)", len(raw), elapsed)
+    logger.debug("local_extract: response=~%d tokens (%.1fs)", len(raw) // 4, elapsed)
     return _parse_extraction_response(raw, model=model, label="LLM")
 
 
