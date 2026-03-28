@@ -1216,6 +1216,20 @@ async def run_query(
                 "answer": answer,
                 "chat_session_id": chat_session_id,
             })
+        elif mode == "pattern":
+            from knowledge_graph import QueryParseError
+            try:
+                paths = kg.graph_query(query, limit=50)
+            except QueryParseError as qe:
+                return templates.TemplateResponse("partials/query_result.html", {
+                    "request": request,
+                    "error": f"Pattern query parse error: {qe}",
+                })
+            return templates.TemplateResponse("partials/query_result.html", {
+                "request": request,
+                "mode": "pattern",
+                "paths": paths,
+            })
         else:
             return templates.TemplateResponse("partials/query_result.html", {
                 "request": request,

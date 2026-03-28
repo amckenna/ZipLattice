@@ -712,3 +712,26 @@ class TestMergeGraphsTool:
         assert result["target"] == "monitors"
         assert result["examples"] >= 2
         _graph_cache.clear()
+
+    def test_pattern_query_tool(self, tmp_path):
+        """pattern_query MCP tool works."""
+        from mcp_server import pattern_query, _graph_cache
+
+        graph_path = str(tmp_path / "pq.json")
+        _graph_cache.clear()
+
+        kg = KnowledgeGraph(graph_path)
+        kg.add_node("python", type="technology", label="Python")
+        kg.add_node("fastapi", type="library", label="FastAPI")
+        kg.add_edge("fastapi", "python", relation="depends_on")
+        kg.save()
+        _graph_cache.clear()
+
+        result = json.loads(pattern_query(
+            graph_path=graph_path,
+            pattern='(type:library) -[depends_on]-> (type:technology)',
+        ))
+        assert len(result) >= 1
+        assert result[0][0]["node_id"] == "fastapi"
+        assert result[0][2]["node_id"] == "python"
+        _graph_cache.clear()

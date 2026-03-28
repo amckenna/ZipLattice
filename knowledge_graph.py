@@ -1210,6 +1210,294 @@ class RelationProposal:
 
 
 # ---------------------------------------------------------------------------
+# Structured Graph Query Language
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NodeFilter:
+    """Filter criteria for matching nodes in a pattern query."""
+    type: str | None = None        # type:X
+    label: str | None = None       # label:X (exact match)
+    label_glob: str | None = None  # label:~"pattern" (glob/fnmatch)
+    node_id: str | None = None     # id:X
+    wildcard: bool = False         # * (matches any)
+
+    def matches(self, node_id: str, node_data: dict[str, Any]) -> bool:
+        """Test whether a node matches this filter."""
+        if self.wildcard:
+            return True
+        if self.node_id is not None:
+            return node_id == self.node_id
+        if self.type is not None and node_data.get("type", "concept") != self.type:
+            return False
+        if self.label is not None:
+            node_label = node_data.get("label", node_id)
+            if node_label.lower() != self.label.lower():
+                return False
+        if self.label_glob is not None:
+            import fnmatch
+            node_label = node_data.get("label", node_id)
+            if not fnmatch.fnmatchcase(node_label.lower(), self.label_glob.lower()):
+                return False
+        return True
+
+
+@dataclass
+class EdgeFilter:
+    """Filter criteria for matching edges in a pattern query."""
+    relations: list[str] | None = None  # [rel] or [rel1|rel2]
+    wildcard: bool = False              # [*] (matches any relation)
+
+    def matches(self, relation: str) -> bool:
+        """Test whether an edge relation matches this filter."""
+        if self.wildcard:
+            return True
+        if self.relations is not None:
+            return relation in self.relations
+        return True
+
+
+@dataclass
+class QueryStep:
+    """One step (node + edge transition) in a graph pattern query."""
+    node_filter: NodeFilter
+    edge_filter: EdgeFilter | None = None   # None for the last node in the pattern
+    direction: str = "out"                  # "out" (->), "in" (<-), "any" (--)
+
+
+class QueryParseError(ValueError):
+    """Raised when a graph query string cannot be parsed."""
+    def __init__(self, message: str, position: int = -1):
+        self.position = position
+        if position >= 0:
+            message = f"at position {position}: {message}"
+        super().__init__(message)
+
+
+def _parse_graph_query(query_str: str) -> tuple[list[QueryStep], float | None, int | None]:
+    """
+    Parse a graph pattern query string into a list of QuerySteps
+    plus optional WHERE confidence and DEPTH modifiers.
+
+    Syntax::
+
+        (type:technology) -[depends_on]-> (*) -[is_a]-> (label:"database")
+        (label:~"SAR*") -[*]-> (*) WHERE confidence > 0.7
+        (*) -[is_a]-> (id:"python") DEPTH 2
+
+    Returns:
+        (steps, min_confidence, depth)
+        - steps: list of QueryStep
+        - min_confidence: float from WHERE clause or None
+        - depth: int from DEPTH clause or None
+    """
+    raw = query_str.strip()
+    if not raw:
+        raise QueryParseError("empty query", 0)
+
+    # Extract WHERE and DEPTH clauses from the end
+    min_confidence: float | None = None
+    depth: int | None = None
+
+    import re as _re
+
+    # Extract DEPTH N
+    depth_match = _re.search(r'\bDEPTH\s+(\d+)\s*$', raw, _re.IGNORECASE)
+    if depth_match:
+        depth = int(depth_match.group(1))
+        raw = raw[:depth_match.start()].strip()
+
+    # Extract WHERE confidence > N
+    where_match = _re.search(
+        r'\bWHERE\s+confidence\s*>\s*([\d.]+)\s*$', raw, _re.IGNORECASE
+    )
+    if where_match:
+        min_confidence = float(where_match.group(1))
+        raw = raw[:where_match.start()].strip()
+
+    # Tokenize into node specs and edge specs
+    # Pattern: (node_spec) followed by optional -[edge_spec]-> or <-[edge_spec]- or --[edge_spec]--
+    # We'll parse by scanning for balanced parens and bracket groups
+
+    steps: list[QueryStep] = []
+    pos = 0
+
+    while pos < len(raw):
+        # Skip whitespace
+        while pos < len(raw) and raw[pos] in ' \t':
+            pos += 1
+        if pos >= len(raw):
+            break
+
+        # Expect a node: (...)
+        if raw[pos] != '(':
+            raise QueryParseError(f"expected '(' for node filter, got '{raw[pos]}'", pos)
+        node_start = pos
+        paren_depth = 1
+        pos += 1
+        while pos < len(raw) and paren_depth > 0:
+            if raw[pos] == '(':
+                paren_depth += 1
+            elif raw[pos] == ')':
+                paren_depth -= 1
+            pos += 1
+        if paren_depth != 0:
+            raise QueryParseError("unmatched '('", node_start)
+        node_spec = raw[node_start + 1:pos - 1].strip()
+        node_filter = _parse_node_filter(node_spec, node_start + 1)
+
+        # Skip whitespace
+        while pos < len(raw) and raw[pos] in ' \t':
+            pos += 1
+
+        # Check for edge transition
+        if pos >= len(raw):
+            # Last node in pattern, no edge
+            steps.append(QueryStep(node_filter=node_filter))
+            break
+
+        # Parse edge: -[...]-> or <-[...]- or --[...]--
+        edge_filter, direction, pos = _parse_edge_transition(raw, pos)
+        steps.append(QueryStep(
+            node_filter=node_filter,
+            edge_filter=edge_filter,
+            direction=direction,
+        ))
+
+    if not steps:
+        raise QueryParseError("no node patterns found", 0)
+
+    return steps, min_confidence, depth
+
+
+def _parse_node_filter(spec: str, base_pos: int) -> NodeFilter:
+    """Parse the content inside (...) into a NodeFilter."""
+    spec = spec.strip()
+    if spec == '*':
+        return NodeFilter(wildcard=True)
+
+    nf = NodeFilter()
+    # Parse key:value pairs separated by commas or spaces
+    # Supported: type:X, label:X, label:~"pattern", id:X
+    import re as _re
+
+    # Handle multiple filters (comma-separated)
+    parts = [p.strip() for p in spec.split(',') if p.strip()]
+    if not parts:
+        parts = [spec]
+
+    for part in parts:
+        part = part.strip()
+        if part == '*':
+            nf.wildcard = True
+            continue
+
+        # type:value
+        m = _re.match(r'^type:\s*"?([^"]+?)"?\s*$', part)
+        if m:
+            nf.type = m.group(1).strip()
+            continue
+
+        # label:~"pattern" (glob)
+        m = _re.match(r'^label:\s*~\s*"([^"]+)"$', part)
+        if m:
+            nf.label_glob = m.group(1)
+            continue
+
+        # label:"value" or label:value
+        m = _re.match(r'^label:\s*"([^"]+)"$', part)
+        if m:
+            nf.label = m.group(1)
+            continue
+        m = _re.match(r'^label:\s*(\S+)$', part)
+        if m:
+            nf.label = m.group(1)
+            continue
+
+        # id:"value" or id:value
+        m = _re.match(r'^id:\s*"?([^"]+?)"?\s*$', part)
+        if m:
+            nf.node_id = slugify(m.group(1).strip())
+            continue
+
+        raise QueryParseError(f"unknown node filter: '{part}'", base_pos)
+
+    return nf
+
+
+def _parse_edge_transition(raw: str, pos: int) -> tuple[EdgeFilter, str, int]:
+    """
+    Parse an edge transition at position pos in the raw query string.
+
+    Supported forms:
+        -[rel]->       forward
+        <-[rel]-       backward
+        --[rel]--      undirected
+        -[*]->         wildcard forward
+        -[rel1|rel2]-> alternatives
+
+    Returns (EdgeFilter, direction, new_pos).
+    """
+    start = pos
+    direction = "out"
+
+    # Detect direction prefix
+    if raw[pos:pos + 2] == '<-':
+        direction = "in"
+        pos += 2
+    elif raw[pos:pos + 2] == '--':
+        direction = "any"
+        pos += 2
+    elif raw[pos] == '-':
+        pos += 1
+    else:
+        raise QueryParseError(
+            f"expected edge transition ('-', '<-', or '--'), got '{raw[pos]}'", pos
+        )
+
+    # Expect [...]
+    if pos >= len(raw) or raw[pos] != '[':
+        raise QueryParseError("expected '[' for edge filter", pos)
+    bracket_start = pos
+    pos += 1
+    bracket_end = raw.find(']', pos)
+    if bracket_end < 0:
+        raise QueryParseError("unmatched '['", bracket_start)
+    edge_spec = raw[pos:bracket_end].strip()
+    pos = bracket_end + 1
+
+    # Detect direction suffix
+    if direction == "in":
+        # <-[rel]-  (expect trailing -)
+        if pos < len(raw) and raw[pos] == '-':
+            pos += 1
+    elif direction == "any":
+        # --[rel]--  (expect trailing --)
+        if raw[pos:pos + 2] == '--':
+            pos += 2
+        elif pos < len(raw) and raw[pos] == '-':
+            pos += 1
+    else:
+        # -[rel]->  (expect trailing ->)
+        if raw[pos:pos + 2] == '->':
+            pos += 2
+        elif pos < len(raw) and raw[pos] == '-':
+            pos += 1
+
+    # Parse edge filter
+    if edge_spec == '*':
+        edge_filter = EdgeFilter(wildcard=True)
+    else:
+        relations = [r.strip() for r in edge_spec.split('|') if r.strip()]
+        if not relations:
+            raise QueryParseError("empty edge filter", bracket_start)
+        edge_filter = EdgeFilter(relations=relations)
+
+    return edge_filter, direction, pos
+
+
+# ---------------------------------------------------------------------------
 # Graph Validation
 # ---------------------------------------------------------------------------
 
@@ -3999,6 +4287,299 @@ class KnowledgeGraph:
         if removed:
             self._dirty = True
         return removed
+
+    # ------------------------------------------------------------------
+    # Structured Graph Query Language
+    # ------------------------------------------------------------------
+
+    def graph_query(
+        self,
+        query_str: str,
+        *,
+        limit: int = 50,
+    ) -> list[list[dict[str, Any]]]:
+        """
+        Execute a pattern-matching query against the graph.
+
+        The query language supports multi-hop traversal patterns::
+
+            (type:technology) -[depends_on]-> (*) -[is_a]-> (label:"database")
+            (label:~"SAR*") -[*]-> (*) WHERE confidence > 0.7
+            (*) -[is_a]-> (id:"python") DEPTH 2
+
+        Args:
+            query_str: Pattern query string.
+            limit: Maximum number of matching paths to return.
+
+        Returns:
+            List of matching paths.  Each path is a list of alternating
+            node-dicts and edge-dicts::
+
+                [node_dict, edge_dict, node_dict, ...]
+
+        Raises:
+            QueryParseError: If the query string is malformed.
+        """
+        steps, min_confidence, depth = _parse_graph_query(query_str)
+
+        if len(steps) < 2:
+            # Single node query — find matching nodes
+            return self._query_single_node(steps[0], limit, min_confidence)
+
+        if depth is not None:
+            return self._query_variable_depth(steps, depth, limit, min_confidence)
+
+        return self._query_fixed_path(steps, limit, min_confidence)
+
+    def _node_dict(self, nid: str) -> dict[str, Any]:
+        """Return a serialisable dict for a node."""
+        node = self._data["nodes"].get(nid, {})
+        return {
+            "node_id": nid,
+            "label": node.get("label", nid),
+            "type": node.get("type", "concept"),
+            "confidence": node.get("confidence", 1.0),
+        }
+
+    def _edge_dict(self, src: str, tgt: str, relation: str) -> dict[str, Any]:
+        """Return a serialisable dict for an edge."""
+        for edge in self._data["edges"]:
+            if edge["source"] == src and edge["target"] == tgt and edge.get("relation") == relation:
+                return {
+                    "source": src,
+                    "target": tgt,
+                    "relation": relation,
+                    "confidence": edge.get("confidence", 1.0),
+                }
+        return {"source": src, "target": tgt, "relation": relation, "confidence": 1.0}
+
+    def _query_single_node(
+        self,
+        step: "QueryStep",
+        limit: int,
+        min_confidence: float | None,
+    ) -> list[list[dict[str, Any]]]:
+        """Match a single-node pattern (no edges)."""
+        results: list[list[dict[str, Any]]] = []
+        for nid, node in self._data["nodes"].items():
+            if step.node_filter.matches(nid, node):
+                if min_confidence is not None and node.get("confidence", 1.0) <= min_confidence:
+                    continue
+                results.append([self._node_dict(nid)])
+                if len(results) >= limit:
+                    break
+        return results
+
+    def _get_transitions(
+        self,
+        nid: str,
+        edge_filter: "EdgeFilter",
+        direction: str,
+    ) -> list[tuple[str, str, str]]:
+        """
+        Get valid transitions from a node given edge filter and direction.
+
+        Returns list of (neighbor_id, relation, actual_direction) tuples
+        where actual_direction is used to build the edge dict correctly.
+        """
+        transitions: list[tuple[str, str, str]] = []
+
+        if direction in ("out", "any"):
+            for _, tgt, key in self._G.out_edges(nid, keys=True):
+                if edge_filter.matches(key):
+                    transitions.append((tgt, key, "out"))
+
+        if direction in ("in", "any"):
+            for src, _, key in self._G.in_edges(nid, keys=True):
+                if edge_filter.matches(key):
+                    # Avoid duplicates for undirected if already found in out
+                    if direction == "any" and (src, key, "out") in transitions:
+                        continue
+                    transitions.append((src, key, "in"))
+
+        return transitions
+
+    def _query_fixed_path(
+        self,
+        steps: list["QueryStep"],
+        limit: int,
+        min_confidence: float | None,
+    ) -> list[list[dict[str, Any]]]:
+        """Execute a fixed-length multi-hop pattern query via DFS."""
+        results: list[list[dict[str, Any]]] = []
+
+        # Collect seed nodes matching the first step
+        seeds: list[str] = []
+        for nid, node in self._data["nodes"].items():
+            if steps[0].node_filter.matches(nid, node):
+                seeds.append(nid)
+
+        for seed in seeds:
+            if len(results) >= limit:
+                break
+            # DFS through the pattern steps
+            self._dfs_match(
+                steps, 0, seed, [], set(), results, limit, min_confidence
+            )
+
+        return results
+
+    def _dfs_match(
+        self,
+        steps: list["QueryStep"],
+        step_idx: int,
+        current_node: str,
+        current_path: list[dict[str, Any]],
+        visited: set[str],
+        results: list[list[dict[str, Any]]],
+        limit: int,
+        min_confidence: float | None,
+    ) -> None:
+        """Recursive DFS path matching."""
+        if len(results) >= limit:
+            return
+
+        node_data = self._data["nodes"].get(current_node, {})
+        step = steps[step_idx]
+
+        # Check node matches current step
+        if not step.node_filter.matches(current_node, node_data):
+            return
+
+        node_dict = self._node_dict(current_node)
+        path = current_path + [node_dict]
+
+        # If this is the last step, we have a complete match
+        if step_idx == len(steps) - 1:
+            # Apply WHERE confidence filter to the whole path
+            if min_confidence is not None:
+                for item in path:
+                    if item.get("confidence", 1.0) <= min_confidence:
+                        return
+            results.append(path)
+            return
+
+        # Follow edges matching the edge filter
+        edge_filter = step.edge_filter
+        if edge_filter is None:
+            return
+
+        new_visited = visited | {current_node}
+
+        for neighbor, relation, actual_dir in self._get_transitions(
+            current_node, edge_filter, step.direction
+        ):
+            if neighbor in new_visited:
+                continue
+            if actual_dir == "out":
+                edge_d = self._edge_dict(current_node, neighbor, relation)
+            else:
+                edge_d = self._edge_dict(neighbor, current_node, relation)
+
+            self._dfs_match(
+                steps,
+                step_idx + 1,
+                neighbor,
+                path + [edge_d],
+                new_visited,
+                results,
+                limit,
+                min_confidence,
+            )
+
+    def _query_variable_depth(
+        self,
+        steps: list["QueryStep"],
+        max_depth: int,
+        limit: int,
+        min_confidence: float | None,
+    ) -> list[list[dict[str, Any]]]:
+        """
+        Execute a variable-depth pattern query.
+
+        When DEPTH N is specified, the edge transition in the pattern is
+        repeated up to N times. This only applies to 2-step patterns
+        (source -> target) where the edge can be traversed multiple hops.
+        """
+        if len(steps) != 2:
+            # For multi-step patterns with DEPTH, just treat depth as max
+            # path length for the middle segment
+            return self._query_fixed_path(steps, limit, min_confidence)
+
+        source_step = steps[0]
+        target_step = steps[1]
+        edge_filter = source_step.edge_filter or EdgeFilter(wildcard=True)
+        direction = source_step.direction
+
+        # Collect seed and target nodes
+        seeds: list[str] = []
+        targets: set[str] = set()
+        for nid, node in self._data["nodes"].items():
+            if source_step.node_filter.matches(nid, node):
+                seeds.append(nid)
+            if target_step.node_filter.matches(nid, node):
+                targets.add(nid)
+
+        results: list[list[dict[str, Any]]] = []
+
+        for seed in seeds:
+            if len(results) >= limit:
+                break
+
+            # BFS up to max_depth
+            self._bfs_paths(
+                seed, targets, edge_filter, direction,
+                max_depth, results, limit, min_confidence,
+            )
+
+        return results
+
+    def _bfs_paths(
+        self,
+        start: str,
+        targets: set[str],
+        edge_filter: "EdgeFilter",
+        direction: str,
+        max_depth: int,
+        results: list[list[dict[str, Any]]],
+        limit: int,
+        min_confidence: float | None,
+    ) -> None:
+        """BFS path search with depth limit."""
+        from collections import deque
+
+        # queue entries: (current_node, path_so_far, visited_set)
+        queue: deque[tuple[str, list[dict[str, Any]], set[str]]] = deque()
+        queue.append((start, [self._node_dict(start)], {start}))
+
+        while queue and len(results) < limit:
+            current, path, visited = queue.popleft()
+            current_depth = len(path) // 2  # path = [node, edge, node, edge, ...]
+
+            if current_depth > 0 and current in targets:
+                # Apply WHERE filter
+                if min_confidence is not None:
+                    if any(item.get("confidence", 1.0) <= min_confidence for item in path):
+                        continue
+                results.append(list(path))
+                if len(results) >= limit:
+                    return
+
+            if current_depth >= max_depth:
+                continue
+
+            for neighbor, relation, actual_dir in self._get_transitions(
+                current, edge_filter, direction
+            ):
+                if neighbor in visited:
+                    continue
+                if actual_dir == "out":
+                    edge_d = self._edge_dict(current, neighbor, relation)
+                else:
+                    edge_d = self._edge_dict(neighbor, current, relation)
+
+                new_path = path + [edge_d, self._node_dict(neighbor)]
+                queue.append((neighbor, new_path, visited | {neighbor}))
 
     # ------------------------------------------------------------------
     # LLM relation extraction & document ingestion
@@ -8716,6 +9297,10 @@ def main() -> None:
                              "orphan detection, embedding coverage, quality score")
     parser.add_argument("--diff", metavar="OTHER_GRAPH",
                         help="Diff this graph against another graph file and show changes")
+    parser.add_argument("--query", metavar="PATTERN",
+                        help="Run a pattern query: "
+                             '\'(type:concept) -[is_a]-> (*)\' or '
+                             '\'(*) -[*]-> (*) WHERE confidence > 0.7\'')
     parser.add_argument("--list-models", action="store_true",
                         help="List models available on the API server and exit")
     parser.add_argument("--merge", nargs="+", metavar="GRAPH",
@@ -9050,18 +9635,33 @@ def main() -> None:
                         print(f"    ~ {p.get('name', '?')}: "
                               f"{p.get('old_status', '?')} -> {p.get('new_status', '?')}")
 
+    if args.query:
+        paths = kg.graph_query(args.query)
+        if not paths:
+            print("No matching paths found.")
+        else:
+            print(f"\n  {len(paths)} matching path(s):\n")
+            for i, path in enumerate(paths, 1):
+                parts: list[str] = []
+                for item in path:
+                    if "node_id" in item:
+                        parts.append(f"({item['label']})")
+                    elif "relation" in item:
+                        parts.append(f"-[{item['relation']}]->")
+                print(f"  {i}. {' '.join(parts)}")
+
     if not any([args.stats, args.node, args.neighbors, args.split,
                 args.proposals, args.accept, args.accept_all, args.reject,
                 args.patterns, args.pyvis, args.cytoscape,
                 args.preview_md, args.ingest_md,
                 args.doc_history,
                 args.sources, args.check_sources, args.verify_embeddings,
-                args.validate, args.analytics, args.diff]):
+                args.validate, args.analytics, args.diff, args.query]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
               f"--accept, --accept-all, --reject, --patterns, --pyvis, --cytoscape, "
               f"--preview-md, --ingest-md, --doc-history, --sources, --check-sources, "
-              f"--verify-embeddings, --validate, --analytics, --diff for details.")
+              f"--verify-embeddings, --validate, --analytics, --diff, --query for details.")
 
 
 if __name__ == "__main__":

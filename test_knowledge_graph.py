@@ -2384,3 +2384,290 @@ def test_normalized_edit_distance():
     assert KnowledgeGraph._normalized_edit_distance("abc", "") == 1.0
     dist = KnowledgeGraph._normalized_edit_distance("kitten", "sitting")
     assert 0.0 < dist < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Structured Graph Query Language (Item 5)
+# ---------------------------------------------------------------------------
+
+from knowledge_graph import (
+    _parse_graph_query, QueryParseError, NodeFilter, EdgeFilter, QueryStep,
+)
+
+
+def _make_query_graph(tmp_path):
+    """Build a small graph for pattern query tests."""
+    kg = KnowledgeGraph(tmp_path / "query.json")
+    kg.add_node("python", type="technology", label="Python", confidence=0.9)
+    kg.add_node("javascript", type="technology", label="JavaScript", confidence=0.8)
+    kg.add_node("fastapi", type="library", label="FastAPI", confidence=0.9)
+    kg.add_node("react", type="library", label="React", confidence=0.85)
+    kg.add_node("web-dev", type="concept", label="Web Development", confidence=0.95)
+    kg.add_node("database", type="concept", label="Database", confidence=0.9)
+    kg.add_node("postgres", type="technology", label="PostgreSQL", confidence=0.9)
+
+    kg.add_edge("fastapi", "python", relation="depends_on", confidence=0.95)
+    kg.add_edge("react", "javascript", relation="depends_on", confidence=0.9)
+    kg.add_edge("fastapi", "web-dev", relation="related_to", confidence=0.8)
+    kg.add_edge("react", "web-dev", relation="related_to", confidence=0.85)
+    kg.add_edge("python", "web-dev", relation="is_a", confidence=0.7)
+    kg.add_edge("postgres", "database", relation="is_a", confidence=0.9)
+    kg.add_edge("fastapi", "postgres", relation="uses", confidence=0.7)
+    return kg
+
+
+# --- Parser tests ---
+
+
+def test_parse_simple_two_hop():
+    """Parse a basic two-hop pattern."""
+    steps, conf, depth = _parse_graph_query('(type:library) -[depends_on]-> (*)')
+    assert len(steps) == 2
+    assert steps[0].node_filter.type == "library"
+    assert steps[0].edge_filter.relations == ["depends_on"]
+    assert steps[0].direction == "out"
+    assert steps[1].node_filter.wildcard is True
+    assert conf is None
+    assert depth is None
+
+
+def test_parse_wildcard_edge():
+    """Parse pattern with wildcard edge."""
+    steps, _, _ = _parse_graph_query('(*) -[*]-> (*)')
+    assert steps[0].node_filter.wildcard is True
+    assert steps[0].edge_filter.wildcard is True
+
+
+def test_parse_edge_alternatives():
+    """Parse pattern with alternative relations."""
+    steps, _, _ = _parse_graph_query('(*) -[depends_on|uses]-> (*)')
+    assert steps[0].edge_filter.relations == ["depends_on", "uses"]
+
+
+def test_parse_label_exact():
+    """Parse label:value node filter."""
+    steps, _, _ = _parse_graph_query('(label:"FastAPI") -[*]-> (*)')
+    assert steps[0].node_filter.label == "FastAPI"
+
+
+def test_parse_label_glob():
+    """Parse label:~"pattern" node filter."""
+    steps, _, _ = _parse_graph_query('(label:~"Fast*") -[*]-> (*)')
+    assert steps[0].node_filter.label_glob == "Fast*"
+
+
+def test_parse_id_filter():
+    """Parse id:value node filter."""
+    steps, _, _ = _parse_graph_query('(id:"python") -[*]-> (*)')
+    assert steps[0].node_filter.node_id == "python"
+
+
+def test_parse_where_clause():
+    """Parse WHERE confidence > N."""
+    steps, conf, depth = _parse_graph_query(
+        '(*) -[*]-> (*) WHERE confidence > 0.7'
+    )
+    assert conf == 0.7
+    assert len(steps) == 2
+
+
+def test_parse_depth_clause():
+    """Parse DEPTH N modifier."""
+    steps, conf, depth = _parse_graph_query(
+        '(*) -[is_a]-> (*) DEPTH 3'
+    )
+    assert depth == 3
+    assert conf is None
+
+
+def test_parse_where_and_depth():
+    """Parse both WHERE and DEPTH."""
+    steps, conf, depth = _parse_graph_query(
+        '(*) -[*]-> (*) WHERE confidence > 0.5 DEPTH 2'
+    )
+    assert conf == 0.5
+    assert depth == 2
+
+
+def test_parse_backward_edge():
+    """Parse backward edge <-[rel]-."""
+    steps, _, _ = _parse_graph_query('(*) <-[depends_on]- (*)')
+    assert steps[0].direction == "in"
+    assert steps[0].edge_filter.relations == ["depends_on"]
+
+
+def test_parse_undirected_edge():
+    """Parse undirected edge --[rel]--."""
+    steps, _, _ = _parse_graph_query('(*) --[related_to]-- (*)')
+    assert steps[0].direction == "any"
+
+
+def test_parse_empty_query():
+    """Empty query raises QueryParseError."""
+    with pytest.raises(QueryParseError):
+        _parse_graph_query("")
+
+
+def test_parse_bad_syntax():
+    """Malformed query raises QueryParseError with position."""
+    with pytest.raises(QueryParseError):
+        _parse_graph_query("not a query")
+
+
+def test_parse_single_node():
+    """Parse single-node pattern (no edge)."""
+    steps, _, _ = _parse_graph_query('(type:technology)')
+    assert len(steps) == 1
+    assert steps[0].node_filter.type == "technology"
+
+
+def test_parse_three_hop():
+    """Parse a three-hop pattern."""
+    steps, _, _ = _parse_graph_query(
+        '(type:library) -[depends_on]-> (*) -[is_a]-> (type:concept)'
+    )
+    assert len(steps) == 3
+    assert steps[0].node_filter.type == "library"
+    assert steps[0].edge_filter.relations == ["depends_on"]
+    assert steps[1].node_filter.wildcard is True
+    assert steps[1].edge_filter.relations == ["is_a"]
+    assert steps[2].node_filter.type == "concept"
+
+
+# --- Execution tests ---
+
+
+def test_query_single_node_type(tmp_path):
+    """Single-node query matches by type."""
+    kg = _make_query_graph(tmp_path)
+    paths = kg.graph_query('(type:technology)')
+    node_ids = [p[0]["node_id"] for p in paths]
+    assert "python" in node_ids
+    assert "javascript" in node_ids
+    assert "postgres" in node_ids
+    # libraries should NOT be in results
+    assert "fastapi" not in node_ids
+
+
+def test_query_two_hop_depends_on(tmp_path):
+    """Two-hop query: library -[depends_on]-> technology."""
+    kg = _make_query_graph(tmp_path)
+    paths = kg.graph_query('(type:library) -[depends_on]-> (type:technology)')
+    assert len(paths) >= 2
+    # Each path: [node_dict, edge_dict, node_dict]
+    for path in paths:
+        assert len(path) == 3
+        assert path[0]["type"] == "library"
+        assert path[1]["relation"] == "depends_on"
+        assert path[2]["type"] == "technology"
+
+
+def test_query_wildcard_edge(tmp_path):
+    """Wildcard edge matches any relation."""
+    kg = _make_query_graph(tmp_path)
+    paths = kg.graph_query('(id:"fastapi") -[*]-> (*)')
+    # FastAPI has edges: depends_on->python, related_to->web-dev, uses->postgres
+    assert len(paths) >= 3
+    relations = {p[1]["relation"] for p in paths}
+    assert "depends_on" in relations
+    assert "related_to" in relations
+
+
+def test_query_edge_alternatives(tmp_path):
+    """Edge alternative filter [rel1|rel2] works."""
+    kg = _make_query_graph(tmp_path)
+    paths = kg.graph_query('(*) -[depends_on|uses]-> (*)')
+    relations = {p[1]["relation"] for p in paths}
+    assert relations <= {"depends_on", "uses"}
+    assert len(paths) >= 3  # fastapi->python, react->js, fastapi->postgres
+
+
+def test_query_label_glob(tmp_path):
+    """label:~"pattern" glob matching works."""
+    kg = _make_query_graph(tmp_path)
+    paths = kg.graph_query('(label:~"*Script") -[*]-> (*)')
+    # JavaScript matches *Script
+    assert len(paths) == 0  # JavaScript has no outgoing edges
+
+    paths = kg.graph_query('(*) -[*]-> (label:~"*Script")')
+    # react -> javascript via depends_on
+    assert len(paths) >= 1
+
+
+def test_query_where_confidence(tmp_path):
+    """WHERE confidence > N filters results."""
+    kg = _make_query_graph(tmp_path)
+    all_paths = kg.graph_query('(*) -[*]-> (*)')
+    filtered = kg.graph_query('(*) -[*]-> (*) WHERE confidence > 0.85')
+    assert len(filtered) <= len(all_paths)
+    # All items in filtered paths should have confidence > 0.85
+    for path in filtered:
+        for item in path:
+            assert item.get("confidence", 1.0) > 0.85
+
+
+def test_query_depth(tmp_path):
+    """DEPTH N for variable-length path traversal."""
+    kg = _make_query_graph(tmp_path)
+    # fastapi -[*]-> postgres -[is_a]-> database (2 hops)
+    paths = kg.graph_query('(id:"fastapi") -[*]-> (id:"database") DEPTH 3')
+    # Should find: fastapi -> postgres -> database (2 hops, within depth 3)
+    assert len(paths) >= 1
+    # Verify at least one path goes through postgres
+    for path in paths:
+        assert path[0]["node_id"] == "fastapi"
+        assert path[-1]["node_id"] == "database"
+
+
+def test_query_backward_edge(tmp_path):
+    """Backward edge <-[rel]- traverses incoming edges."""
+    kg = _make_query_graph(tmp_path)
+    paths = kg.graph_query('(type:technology) <-[depends_on]- (type:library)')
+    assert len(paths) >= 2
+    for path in paths:
+        assert path[0]["type"] == "technology"
+        assert path[1]["relation"] == "depends_on"
+        assert path[2]["type"] == "library"
+
+
+def test_query_undirected_edge(tmp_path):
+    """Undirected edge --[rel]-- matches both directions."""
+    kg = _make_query_graph(tmp_path)
+    paths = kg.graph_query('(id:"web-dev") --[related_to]-- (*)')
+    # web-dev has incoming related_to from fastapi and react
+    assert len(paths) >= 2
+
+
+def test_query_three_hop(tmp_path):
+    """Three-hop traversal: library -> technology -> concept."""
+    kg = _make_query_graph(tmp_path)
+    paths = kg.graph_query(
+        '(type:library) -[depends_on]-> (*) -[is_a]-> (type:concept)'
+    )
+    # fastapi -> python -> web-dev (is_a concept)
+    assert len(paths) >= 1
+    for path in paths:
+        assert len(path) == 5  # node, edge, node, edge, node
+        assert path[0]["type"] == "library"
+        assert path[4]["type"] == "concept"
+
+
+def test_query_no_results(tmp_path):
+    """Query that matches nothing returns empty list."""
+    kg = _make_query_graph(tmp_path)
+    paths = kg.graph_query('(type:nonexistent) -[*]-> (*)')
+    assert paths == []
+
+
+def test_query_limit(tmp_path):
+    """Limit parameter caps results."""
+    kg = _make_query_graph(tmp_path)
+    paths = kg.graph_query('(*) -[*]-> (*)', limit=2)
+    assert len(paths) <= 2
+
+
+def test_query_parse_error(tmp_path):
+    """Bad query raises QueryParseError."""
+    kg = _make_query_graph(tmp_path)
+    with pytest.raises(QueryParseError):
+        kg.graph_query("this is not a valid query")

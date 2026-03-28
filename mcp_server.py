@@ -708,6 +708,40 @@ def semantic_search(
 
 
 @mcp.tool()
+def pattern_query(
+    graph_path: str,
+    pattern: str,
+    limit: int = 50,
+) -> str:
+    """Execute a structural pattern query against the knowledge graph.
+
+    Finds paths matching a graph pattern using node type/label filters,
+    edge relation filters, and optional WHERE and DEPTH modifiers.
+
+    Syntax examples::
+
+        (type:technology) -[depends_on]-> (*)
+        (label:~"SAR*") -[*]-> (*) WHERE confidence > 0.7
+        (*) -[is_a]-> (id:"python") DEPTH 2
+        (*) -[depends_on|uses]-> (type:library)
+
+    Node filters: ``type:X``, ``label:X``, ``label:~"glob"``, ``id:X``, ``*``
+    Edge filters: ``[relation]``, ``[rel1|rel2]``, ``[*]``
+    Arrows: ``->`` (forward), ``<-`` (backward), ``--`` (any direction)
+
+    Args:
+        graph_path: Path to the knowledge graph JSON file.
+        pattern: Pattern query string.
+        limit: Maximum number of matching paths to return.
+    """
+    kg = _get_graph(graph_path)
+    logger.info("pattern_query: pattern=%r limit=%d", pattern[:80], limit)
+    paths = kg.graph_query(pattern, limit=limit)
+    logger.info("pattern_query: returned %d paths", len(paths))
+    return _json(paths)
+
+
+@mcp.tool()
 def merge_graphs(
     graph_paths: list[str],
     output_path: str,

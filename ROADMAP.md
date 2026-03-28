@@ -152,23 +152,23 @@ Each item follows the pattern: **core method -> CLI flag -> web endpoint -> temp
 
 ### Checklist
 
-- [ ] **5a.** Design query syntax:
+- [x] **5a.** Design query syntax:
   ```
   (type:technology) -[depends_on]-> (*) -[is_a]-> (label:"database")
   (label:~"SAR*") -[*]-> (*) WHERE confidence > 0.7
   (*) -[is_a]-> (id:"python") DEPTH 2
   ```
-- [ ] **5b.** Implement `_parse_graph_query(query_str) -> list[QueryStep]` -- tokenizer + parser. `QueryStep` dataclass with `node_filter`, `edge_filter`, `direction`
-- [ ] **5c.** Implement `graph_query(query_str, limit=50) -> list[list[dict]]` -- execute parsed query against `_G`, return matching paths
-- [ ] **5d.** Node filters: `type:X`, `label:X`, `label:~"pattern"` (glob), `id:X`, `*` (any)
-- [ ] **5e.** Edge filters: `[relation_name]`, `[*]` (any), `[rel1|rel2]` (alternatives)
-- [ ] **5f.** `WHERE` clause for confidence filtering on final result set
-- [ ] **5g.** `DEPTH N` modifier for variable-length paths
-- [ ] **5h.** Add `--query "pattern"` CLI flag
-- [ ] **5i.** Add "Pattern Query" tab/mode to `query.html` with syntax help tooltip
-- [ ] **5j.** Add `POST /pattern-query` endpoint in `web_app.py`
-- [ ] **5k.** Add MCP tool `pattern_query` in `mcp_server.py`
-- [ ] **5l.** Tests: multi-hop queries, wildcard edges, type filters, WHERE clauses, DEPTH modifier
+- [x] **5b.** Implement `_parse_graph_query(query_str) -> list[QueryStep]` -- tokenizer + parser. `QueryStep` dataclass with `node_filter`, `edge_filter`, `direction`
+- [x] **5c.** Implement `graph_query(query_str, limit=50) -> list[list[dict]]` -- execute parsed query against `_G`, return matching paths
+- [x] **5d.** Node filters: `type:X`, `label:X`, `label:~"pattern"` (glob), `id:X`, `*` (any)
+- [x] **5e.** Edge filters: `[relation_name]`, `[*]` (any), `[rel1|rel2]` (alternatives)
+- [x] **5f.** `WHERE` clause for confidence filtering on final result set
+- [x] **5g.** `DEPTH N` modifier for variable-length paths
+- [x] **5h.** Add `--query "pattern"` CLI flag
+- [x] **5i.** Add "Pattern Query" tab/mode to `query.html` with syntax help tooltip
+- [x] **5j.** Add `POST /pattern-query` endpoint in `web_app.py`
+- [x] **5k.** Add MCP tool `pattern_query` in `mcp_server.py`
+- [x] **5l.** Tests: multi-hop queries, wildcard edges, type filters, WHERE clauses, DEPTH modifier
 
 ### Design Decisions
 

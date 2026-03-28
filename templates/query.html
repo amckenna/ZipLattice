@@ -63,6 +63,9 @@
         <label class="flex items-center gap-2 text-sm cursor-pointer">
           <input type="radio" name="mode" value="ask" checked class="accent-white" onchange="updateModeHint(this.value)"> Ask
         </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="mode" value="pattern" class="accent-white" onchange="updateModeHint(this.value)"> Pattern
+        </label>
       </div>
       <p id="mode-hint" class="text-xs text-gray-400"></p>
     </div>
@@ -295,7 +298,8 @@ updateSearchModeHint('semantic');
 var modeHints = {
   search: "Semantic similarity search — returns the most relevant nodes ranked by how closely they match your query.",
   context: "Builds a RAG context block — searches for relevant nodes, expands their neighborhoods, and formats everything as structured text you can paste into an LLM prompt.",
-  ask: "Asks a question — builds context from the graph and sends it along with your question to an LLM for a full natural-language answer. Requires a running model."
+  ask: "Asks a question — builds context from the graph and sends it along with your question to an LLM for a full natural-language answer. Requires a running model.",
+  pattern: 'Structural pattern query — finds paths matching a graph pattern. Example: (type:concept) -[is_a]-> (*) or (*) -[*]-> (*) WHERE confidence > 0.7 or (*) -[is_a]-> (id:"python") DEPTH 2'
 };
 var responseHints = {
   single: "Get a single answer and stop. Good for one-off questions.",
@@ -304,11 +308,16 @@ var responseHints = {
 function updateModeHint(mode) {
   document.getElementById('mode-hint').textContent = modeHints[mode] || '';
   var rms = document.getElementById('response-mode-section');
-  if (mode === 'ask') {
-    rms.style.display = '';
-  } else {
-    rms.style.display = 'none';
-  }
+  rms.style.display = mode === 'ask' ? '' : 'none';
+  // Hide search mode and model config for pattern queries (they don't use embeddings/LLMs)
+  var searchSection = document.querySelector('[class*="space-y-2"]:has(input[name="search_mode"])');
+  // Fallback: find by label text
+  document.querySelectorAll('.space-y-2').forEach(function(el) {
+    var lbl = el.querySelector('label.block');
+    if (lbl && lbl.textContent.trim() === 'Search Mode') {
+      el.style.display = mode === 'pattern' ? 'none' : '';
+    }
+  });
 }
 function updateResponseHint(val) {
   document.getElementById('response-hint').textContent = responseHints[val] || '';
