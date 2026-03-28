@@ -1355,3 +1355,50 @@ def test_ask_with_bedrock_llm_fn(kg):
 
     answer = ask(kg, "What is radar?", fake_embed, mock_bedrock_llm, max_nodes=5)
     assert answer == "Bedrock says: Radar uses radio waves."
+
+
+# ---------------------------------------------------------------------------
+# BM25 / Hybrid search mode tests
+# ---------------------------------------------------------------------------
+
+
+def test_search_nodes_bm25_mode(kg):
+    """search_nodes with search_mode='bm25' returns keyword results."""
+    results = search_nodes(
+        kg, "radio detection ranging", fake_embed,
+        top_k=5, expand_depth=0, search_mode="bm25",
+    )
+    assert len(results) > 0
+    # "radar" has "Radio detection and ranging" in description
+    assert results[0]["node_id"] == "radar"
+
+
+def test_search_nodes_hybrid_mode(kg):
+    """search_nodes with search_mode='hybrid' blends BM25 and semantic."""
+    results = search_nodes(
+        kg, "radar", fake_embed,
+        top_k=5, expand_depth=0, search_mode="hybrid", alpha=0.5,
+    )
+    assert len(results) > 0
+    # "radar" should be top result in both modes
+    assert results[0]["node_id"] == "radar"
+
+
+def test_build_context_bm25_mode(kg):
+    """build_context works with search_mode='bm25'."""
+    ctx = build_context(kg, "radio detection", fake_embed, search_mode="bm25")
+    assert isinstance(ctx, str)
+    # Should find radar-related content
+    assert "Radar" in ctx or "radar" in ctx
+
+
+def test_ask_bm25_mode(kg):
+    """ask() works with search_mode='bm25'."""
+    def mock_llm(prompt: str) -> str:
+        return "Answer about radar."
+
+    answer = ask(
+        kg, "What is radar?", fake_embed, mock_llm,
+        max_nodes=5, search_mode="bm25",
+    )
+    assert "Answer about radar" in answer

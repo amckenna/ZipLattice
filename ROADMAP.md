@@ -58,15 +58,15 @@ Each item follows the pattern: **core method -> CLI flag -> web endpoint -> temp
 
 ### Checklist
 
-- [ ] **2a.** Implement `_build_bm25_index()` -- in-memory inverted index from node labels, properties, body text. Standard BM25 formula (k1=1.2, b=0.75). Lazily built, invalidated when `_dirty=True`
-- [ ] **2b.** Implement `bm25_search(query, top_k) -> list[tuple[str, float]]` -- tokenize query, score indexed nodes, return ranked results
-- [ ] **2c.** Add `hybrid_search()` combining BM25 + cosine similarity with configurable alpha weight (0=pure BM25, 1=pure semantic, default 0.7)
-- [ ] **2d.** Update `search()` to accept `mode: Literal["semantic", "bm25", "hybrid"]` parameter
-- [ ] **2e.** Update `search_nodes()` and `build_context()` in `query_graph.py` to pass through search mode
-- [ ] **2f.** Add `--search-mode` CLI flag to `query_graph.py`
-- [ ] **2g.** Add search mode dropdown to `query.html` (semantic / keyword / hybrid)
-- [ ] **2h.** Add MCP tool parameter for search mode in `mcp_server.py`
-- [ ] **2i.** Tests: verify BM25 finds exact keyword matches that semantic search misses; verify hybrid ranking
+- [x] **2a.** Implement `_build_bm25_index()` -- in-memory inverted index from node labels, properties, body text. Standard BM25 formula (k1=1.2, b=0.75). Lazily built, invalidated when `_dirty=True`
+- [x] **2b.** Implement `bm25_search(query, top_k) -> list[tuple[str, float]]` -- tokenize query, score indexed nodes, return ranked results
+- [x] **2c.** Add `hybrid_search()` combining BM25 + cosine similarity with configurable alpha weight (0=pure BM25, 1=pure semantic, default 0.7)
+- [x] **2d.** Update `search()` to accept `mode: Literal["semantic", "bm25", "hybrid"]` parameter
+- [x] **2e.** Update `search_nodes()` and `build_context()` in `query_graph.py` to pass through search mode
+- [x] **2f.** Add `--search-mode` CLI flag to `query_graph.py`
+- [x] **2g.** Add search mode dropdown to `query.html` (semantic / keyword / hybrid)
+- [x] **2h.** Add MCP tool parameter for search mode in `mcp_server.py`
+- [x] **2i.** Tests: verify BM25 finds exact keyword matches that semantic search misses; verify hybrid ranking
 
 ### Design Decisions
 

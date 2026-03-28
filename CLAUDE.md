@@ -80,6 +80,10 @@ knowledge_graph/                  # dedicated graph directory
 - `KnowledgeGraph.diff_document_versions()` -- Compares two versions of a document at section level using stored `section_hashes`. Returns a `DocumentDiff` identifying added/removed/modified/unchanged sections.
 - `KnowledgeGraph.get_document_history()` -- Returns a rich version timeline for a document: version metadata, section counts, node/edge counts per ingestion, and diffs between consecutive versions. Available via CLI (`--doc-history`), web API (`GET /graphs/{name}/documents/{doc_id}/history`), and MCP tool (`document_history`).
 - `KnowledgeGraph.analytics()` -- Computes comprehensive quality analytics: confidence distributions (10-bucket histograms for nodes/edges), per-relation and per-type stats, hub nodes (top-10 by degree), orphan nodes, source document coverage, embedding coverage, component sizes, and a composite quality score (0-100). Available via CLI (`--analytics`), web page (`GET /graphs/{name}/analytics`), JSON API (`GET /api/graphs/{name}/analytics`), and MCP tool (`graph_analytics`).
+- `KnowledgeGraph._build_bm25_index()` -- Builds an in-memory BM25 inverted index from node labels, descriptions, body text, and properties. Uses standard BM25 parameters (k1=1.2, b=0.75). Lazily built, auto-invalidated when graph is dirty.
+- `KnowledgeGraph.bm25_search()` -- Pure Python BM25 keyword search over node text. Tokenises query (lowercase, stopword removal), scores against inverted index, returns ranked `(node_id, score)` tuples.
+- `KnowledgeGraph.hybrid_search()` -- Blends BM25 and semantic similarity with configurable alpha weight (0=pure BM25, 1=pure semantic, default 0.7). Normalises both score sets to [0,1] before combining.
+- `KnowledgeGraph.search()` -- Now accepts `mode` parameter: `"semantic"` (default, embedding similarity), `"bm25"` (keyword), or `"hybrid"` (blended). Also accepts `alpha` for hybrid blending weight. Available via CLI (`--search-mode`), web UI (search mode radio buttons), and MCP tool (`semantic_search` with `search_mode` parameter).
 - `GraphDiff` -- Dataclass returned by `diff()` with `nodes_added`, `nodes_removed`, `nodes_modified`, `edges_added`, `edges_removed`, `edges_modified`, `proposals_added`, `proposals_changed` lists and `has_changes`/`summary`/`to_dict()` helpers. Includes `counts` dict in serialized form.
 - `KnowledgeGraph.snapshot()` -- Deep-copies the current graph state (data + proposals) for later comparison via `diff_from_snapshot()`.
 - `KnowledgeGraph.diff(other)` -- Compares this graph (older) against another graph (newer) and returns a `GraphDiff` with field-level node/edge changes and proposal tracking.
@@ -126,7 +130,10 @@ python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider bed
 
 # Query graph CLI
 python query_graph.py <path-to-graph.json> search "synthetic aperture radar"
+python query_graph.py <path-to-graph.json> search "radar detection" --search-mode bm25
+python query_graph.py <path-to-graph.json> search "radar detection" --search-mode hybrid --alpha 0.5
 python query_graph.py <path-to-graph.json> context "how does SAR work?"
+python query_graph.py <path-to-graph.json> context "how does SAR work?" --search-mode hybrid
 python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-model qwen3-coder:30b
 python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-model qwen3-coder:30b --api-url http://exo:11434
 

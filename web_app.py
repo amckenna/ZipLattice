@@ -1123,6 +1123,8 @@ async def run_query(
     query: str = Form(...),
     mode: str = Form("search"),
     response_mode: str = Form("single"),
+    search_mode: str = Form("semantic"),
+    alpha: float = Form(0.7),
     api_url: str = Form("http://localhost:11434"),
     query_model: str = Form("qwen3-coder:30b"),
     embed_url: str = Form(""),
@@ -1156,7 +1158,8 @@ async def run_query(
 
     try:
         if mode == "search":
-            results = search_nodes(kg, query, embed_fn, top_k=10)
+            results = search_nodes(kg, query, embed_fn, top_k=10,
+                                   search_mode=search_mode, alpha=alpha)
             return templates.TemplateResponse("partials/query_result.html", {
                 "request": request,
                 "mode": "search",
@@ -1164,7 +1167,8 @@ async def run_query(
                 "graph_name": graph_name,
             })
         elif mode == "context":
-            ctx = build_context(kg, query, embed_fn)
+            ctx = build_context(kg, query, embed_fn,
+                                search_mode=search_mode, alpha=alpha)
             return templates.TemplateResponse("partials/query_result.html", {
                 "request": request,
                 "mode": "context",
@@ -1174,14 +1178,16 @@ async def run_query(
             llm_fn = _build_llm_fn(provider, query_model, api_url,
                                    bedrock_region=bedrock_region,
                                    bedrock_profile=bedrock_profile)
-            answer = ask(kg, query, embed_fn, llm_fn)
+            answer = ask(kg, query, embed_fn, llm_fn,
+                         search_mode=search_mode, alpha=alpha)
 
             # If chat mode, create a session so the user can follow up
             chat_session_id = None
             if response_mode == "chat":
                 _evict_stale_chat_sessions()
                 # Build the RAG context that was used for this answer
-                rag_context = build_context(kg, query, embed_fn)
+                rag_context = build_context(kg, query, embed_fn,
+                                            search_mode=search_mode, alpha=alpha)
                 chat_session_id = uuid.uuid4().hex[:12]
                 _chat_sessions[chat_session_id] = {
                     "messages": [

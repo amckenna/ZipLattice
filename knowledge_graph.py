@@ -3273,6 +3273,230 @@ class KnowledgeGraph:
         result = embed_fn([query])
         return result[0]
 
+    # ------------------------------------------------------------------
+    # BM25 text search
+    # ------------------------------------------------------------------
+
+    # Small English stopword set for BM25 tokenisation — no dependencies.
+    _BM25_STOPWORDS: set[str] = {
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to",
+        "for", "of", "with", "by", "from", "is", "are", "was", "were",
+        "be", "been", "being", "have", "has", "had", "do", "does", "did",
+        "will", "would", "could", "should", "may", "might", "shall",
+        "can", "not", "no", "nor", "so", "if", "then", "than", "too",
+        "very", "just", "about", "into", "over", "after", "before",
+        "between", "under", "above", "up", "down", "out", "off",
+        "it", "its", "this", "that", "these", "those", "i", "we",
+        "you", "he", "she", "they", "me", "him", "her", "us", "them",
+        "my", "your", "his", "our", "their", "what", "which", "who",
+        "whom", "how", "when", "where", "why", "all", "each", "every",
+        "both", "few", "more", "most", "other", "some", "such", "only",
+        "own", "same", "as",
+    }
+
+    @staticmethod
+    def _bm25_tokenize(text: str) -> list[str]:
+        """Lowercase, split on non-alphanumeric, remove stopwords."""
+        import re
+        tokens = re.findall(r"[a-z0-9]+", text.lower())
+        return [t for t in tokens if t not in KnowledgeGraph._BM25_STOPWORDS and len(t) > 1]
+
+    def _build_bm25_index(self) -> None:
+        """Build an in-memory BM25 inverted index from node text.
+
+        Indexes node labels, descriptions, body text, and property values.
+        Uses standard BM25 parameters (k1=1.2, b=0.75).  The index is
+        stored in ``_bm25_*`` attributes and lazily rebuilt when the graph
+        is dirty.
+        """
+        docs: dict[str, list[str]] = {}  # node_id → token list
+        for nid, node in self._data["nodes"].items():
+            parts: list[str] = []
+            label = node.get("label", "")
+            if label:
+                # Boost label by repeating it
+                parts.extend(self._bm25_tokenize(label) * 2)
+            props = node.get("properties", {})
+            desc = props.get("description", "")
+            if desc:
+                parts.extend(self._bm25_tokenize(desc))
+            body = props.get("body_text", "")
+            if body:
+                parts.extend(self._bm25_tokenize(body[:2000]))
+            # Index other string properties
+            for k, v in props.items():
+                if k not in ("description", "body_text") and isinstance(v, str):
+                    parts.extend(self._bm25_tokenize(v))
+            if parts:
+                docs[nid] = parts
+
+        # Compute document frequencies
+        df: dict[str, int] = {}
+        for tokens in docs.values():
+            for term in set(tokens):
+                df[term] = df.get(term, 0) + 1
+
+        # Compute average document length
+        total_tokens = sum(len(t) for t in docs.values())
+        avg_dl = total_tokens / len(docs) if docs else 1.0
+
+        self._bm25_docs = docs
+        self._bm25_df = df
+        self._bm25_avg_dl = avg_dl
+        self._bm25_n_docs = len(docs)
+        self._bm25_dirty = False
+        logger.debug(
+            "BM25 index built: %d documents, %d terms, avg_dl=%.1f",
+            len(docs), len(df), avg_dl,
+        )
+
+    def _ensure_bm25_index(self) -> None:
+        """Rebuild the BM25 index if it's stale or missing."""
+        if not hasattr(self, "_bm25_docs") or self._bm25_dirty or self._dirty:
+            self._build_bm25_index()
+
+    def bm25_search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        node_types: list[str] | None = None,
+        min_confidence: float = 0.0,
+    ) -> list[tuple[str, float]]:
+        """BM25 full-text search over node text.
+
+        Args:
+            query: Natural-language query string.
+            top_k: Number of results to return.
+            node_types: Filter results to these node types.
+            min_confidence: Minimum node confidence.
+
+        Returns:
+            List of ``(node_id, bm25_score)`` tuples, descending by score.
+        """
+        import math as _math
+
+        self._ensure_bm25_index()
+
+        query_tokens = self._bm25_tokenize(query)
+        if not query_tokens:
+            return []
+
+        k1 = 1.2
+        b = 0.75
+        n = self._bm25_n_docs
+
+        scores: list[tuple[str, float]] = []
+        for nid, doc_tokens in self._bm25_docs.items():
+            # Apply filters before scoring
+            node = self._data["nodes"].get(nid)
+            if not node:
+                continue
+            if node_types and node.get("type") not in node_types:
+                continue
+            if node.get("confidence", 1.0) < min_confidence:
+                continue
+
+            dl = len(doc_tokens)
+            # Count term frequencies in this document
+            tf_map: dict[str, int] = {}
+            for t in doc_tokens:
+                tf_map[t] = tf_map.get(t, 0) + 1
+
+            score = 0.0
+            for qt in query_tokens:
+                if qt not in self._bm25_df:
+                    continue
+                tf = tf_map.get(qt, 0)
+                if tf == 0:
+                    continue
+                df_val = self._bm25_df[qt]
+                # IDF with floor to avoid negative values
+                idf = _math.log(max((n - df_val + 0.5) / (df_val + 0.5), 0.1) + 1.0)
+                # BM25 TF saturation
+                tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / self._bm25_avg_dl))
+                score += idf * tf_norm
+
+            if score > 0:
+                scores.append((nid, score))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:top_k]
+
+    def hybrid_search(
+        self,
+        query: str,
+        embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
+        *,
+        top_k: int = 5,
+        alpha: float = 0.7,
+        node_types: list[str] | None = None,
+        min_confidence: float = 0.0,
+    ) -> list[tuple[str, float]]:
+        """Hybrid search combining BM25 and semantic similarity.
+
+        Scores are normalised to [0, 1] and blended:
+        ``hybrid = alpha * semantic + (1 - alpha) * bm25``
+
+        Args:
+            query: Natural-language query string.
+            embed_fn: Embedding function (required for the semantic component).
+            top_k: Number of results to return.
+            alpha: Blending weight (0 = pure BM25, 1 = pure semantic,
+                   default 0.7).
+            node_types: Filter results to these node types.
+            min_confidence: Minimum node confidence.
+
+        Returns:
+            List of ``(node_id, hybrid_score)`` tuples, descending.
+        """
+        # BM25 scores (always available)
+        bm25_results = self.bm25_search(
+            query, top_k=top_k * 3,
+            node_types=node_types, min_confidence=min_confidence,
+        )
+
+        # Semantic scores (requires embeddings + embed_fn)
+        semantic_results: list[tuple[str, float]] = []
+        if embed_fn and self._embeddings:
+            query_vec = self.embed_query(query, embed_fn)
+            semantic_results = self.find_similar(query_vec, top_k=top_k * 3)
+
+        # Normalise scores to [0, 1]
+        def _normalise(pairs: list[tuple[str, float]]) -> dict[str, float]:
+            if not pairs:
+                return {}
+            max_score = max(s for _, s in pairs)
+            min_score = min(s for _, s in pairs)
+            rng = max_score - min_score
+            if rng == 0:
+                return {nid: 1.0 for nid, _ in pairs}
+            return {nid: (s - min_score) / rng for nid, s in pairs}
+
+        bm25_norm = _normalise(bm25_results)
+        sem_norm = _normalise(semantic_results)
+
+        # Combine scores
+        all_ids = set(bm25_norm) | set(sem_norm)
+        combined: list[tuple[str, float]] = []
+        for nid in all_ids:
+            # Apply filters (for semantic results that bypass BM25 filtering)
+            node = self._data["nodes"].get(nid)
+            if not node:
+                continue
+            if node_types and node.get("type") not in node_types:
+                continue
+            if node.get("confidence", 1.0) < min_confidence:
+                continue
+
+            sem_score = sem_norm.get(nid, 0.0)
+            bm25_score = bm25_norm.get(nid, 0.0)
+            hybrid = alpha * sem_score + (1 - alpha) * bm25_score
+            combined.append((nid, round(hybrid, 4)))
+
+        combined.sort(key=lambda x: x[1], reverse=True)
+        return combined[:top_k]
+
     def search(
         self,
         query: str | list[float],
@@ -3282,22 +3506,32 @@ class KnowledgeGraph:
         node_types: list[str] | None = None,
         min_confidence: float = 0.0,
         expand_depth: int = 0,
+        mode: str = "semantic",
+        alpha: float = 0.7,
     ) -> list[dict[str, Any]]:
         """
-        Semantic search over the knowledge graph.
+        Search over the knowledge graph.
 
-        Combines embedding similarity with optional graph expansion for
-        graph-RAG workflows.
+        Supports three modes:
+
+        * ``"semantic"`` — embedding similarity (default, original behaviour).
+        * ``"bm25"`` — BM25 full-text keyword search (no embeddings needed).
+        * ``"hybrid"`` — blended BM25 + semantic (``alpha`` controls weight:
+          0 = pure BM25, 1 = pure semantic, default 0.7).
 
         Args:
-            query: Either a text string (requires embed_fn) or a
-                   pre-computed embedding vector.
-            embed_fn: Embedding function, required if query is a string.
+            query: Either a text string (requires embed_fn for semantic/hybrid)
+                   or a pre-computed embedding vector (semantic only).
+            embed_fn: Embedding function, required when *query* is a string
+                      and *mode* is ``"semantic"`` or ``"hybrid"``.
             top_k: Number of top results to return.
             node_types: Filter results to these node types.
             min_confidence: Minimum node confidence.
             expand_depth: If > 0, expand each result's neighborhood to
                           this depth and include connected nodes.
+            mode: Search mode — ``"semantic"``, ``"bm25"``, or ``"hybrid"``.
+            alpha: Hybrid blending weight (only used when mode is
+                   ``"hybrid"``).
 
         Returns:
             List of result dicts, each with:
@@ -3305,18 +3539,32 @@ class KnowledgeGraph:
               - neighbors (if expand_depth > 0)
               - context (subgraph data if expand_depth > 0)
         """
-        # Get query embedding
-        if isinstance(query, str):
-            if embed_fn is None:
-                raise ValueError(
-                    "embed_fn is required when query is a string."
-                )
-            query_vec = self.embed_query(query, embed_fn)
+        # Route to the appropriate scoring backend
+        if mode == "bm25":
+            if not isinstance(query, str):
+                raise ValueError("BM25 search requires a text query string.")
+            candidates = self.bm25_search(
+                query, top_k=top_k * 3,
+                node_types=node_types, min_confidence=min_confidence,
+            )
+        elif mode == "hybrid":
+            if not isinstance(query, str):
+                raise ValueError("Hybrid search requires a text query string.")
+            candidates = self.hybrid_search(
+                query, embed_fn, top_k=top_k * 3, alpha=alpha,
+                node_types=node_types, min_confidence=min_confidence,
+            )
         else:
-            query_vec = query
-
-        # Find similar nodes
-        candidates = self.find_similar(query_vec, top_k=top_k * 3)  # over-fetch for filtering
+            # Default: semantic search
+            if isinstance(query, str):
+                if embed_fn is None:
+                    raise ValueError(
+                        "embed_fn is required when query is a string."
+                    )
+                query_vec = self.embed_query(query, embed_fn)
+            else:
+                query_vec = query
+            candidates = self.find_similar(query_vec, top_k=top_k * 3)
 
         results: list[dict[str, Any]] = []
         for nid, similarity in candidates:
@@ -3327,11 +3575,12 @@ class KnowledgeGraph:
             if not node:
                 continue
 
-            # Apply filters
-            if node_types and node.get("type") not in node_types:
-                continue
-            if node.get("confidence", 1.0) < min_confidence:
-                continue
+            # Apply filters (BM25/hybrid already filter; semantic still needs this)
+            if mode == "semantic":
+                if node_types and node.get("type") not in node_types:
+                    continue
+                if node.get("confidence", 1.0) < min_confidence:
+                    continue
 
             result: dict[str, Any] = {
                 "node_id": nid,

@@ -597,23 +597,29 @@ def semantic_search(
     top_k: int = 10,
     node_types: list[str] | None = None,
     expand_depth: int = 1,
+    search_mode: str = "semantic",
+    alpha: float = 0.7,
 ) -> str:
-    """Semantic search over the knowledge graph using embeddings.
+    """Search over the knowledge graph.
 
-    Requires pre-computed embeddings (see embed_nodes) and a running
-    embedding server for the query vector.
+    Supports three modes: ``semantic`` (embedding similarity, requires
+    pre-computed embeddings and a running embedding server), ``bm25``
+    (keyword search, no embeddings needed), and ``hybrid`` (blended).
 
     Args:
         graph_path: Path to the knowledge graph JSON file.
         query: Natural-language search query.
-        embed_model: Embedding model name.
+        embed_model: Embedding model name (for semantic/hybrid modes).
         api_url: Base URL of the embedding server.
         top_k: Number of results.
         node_types: Filter by node types.
         expand_depth: Neighborhood expansion depth.
+        search_mode: ``"semantic"``, ``"bm25"``, or ``"hybrid"``.
+        alpha: Hybrid blending weight (0 = pure BM25, 1 = pure semantic).
     """
     kg = _get_graph(graph_path)
-    logger.info("semantic_search: query=%r model=%s top_k=%d", query[:80], embed_model, top_k)
+    logger.info("semantic_search: query=%r mode=%s model=%s top_k=%d",
+                query[:80], search_mode, embed_model, top_k)
 
     def embed_fn(texts: list[str]) -> list[list[float]]:
         return ollama_embed(texts, model=embed_model, url=api_url)
@@ -621,6 +627,7 @@ def semantic_search(
     results = kg.search(
         query, embed_fn, top_k=top_k,
         node_types=node_types, expand_depth=expand_depth,
+        mode=search_mode, alpha=alpha,
     )
     logger.info("semantic_search: returned %d results", len(results))
     return _json(results)

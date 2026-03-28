@@ -67,6 +67,29 @@
       <p id="mode-hint" class="text-xs text-gray-400"></p>
     </div>
 
+    <!-- Search mode -->
+    <div class="space-y-2">
+      <label class="block text-sm text-gray-400">Search Mode</label>
+      <div class="flex gap-4 items-center">
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="search_mode" value="semantic" checked class="accent-white" onchange="updateSearchModeHint(this.value)"> Semantic
+        </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="search_mode" value="bm25" class="accent-white" onchange="updateSearchModeHint(this.value)"> Keyword (BM25)
+        </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="search_mode" value="hybrid" class="accent-white" onchange="updateSearchModeHint(this.value)"> Hybrid
+        </label>
+        <div id="alpha-control" class="hidden flex items-center gap-2 ml-4">
+          <label class="text-xs text-gray-400">Alpha:</label>
+          <input type="range" name="alpha" min="0" max="1" step="0.1" value="0.7"
+                 class="w-20 accent-white" oninput="document.getElementById('alpha-val').textContent=this.value">
+          <span id="alpha-val" class="text-xs text-gray-400">0.7</span>
+        </div>
+      </div>
+      <p id="search-mode-hint" class="text-xs text-gray-400"></p>
+    </div>
+
     <!-- Response mode (only relevant for Ask) -->
     <div id="response-mode-section" class="space-y-2">
       <label class="block text-sm text-gray-400">Response Mode</label>
@@ -257,6 +280,17 @@ function toggleQueryBedrockEmbed() {
     localSection.querySelectorAll('input').forEach(function(el) { el.disabled = false; });
   }
 }
+
+var searchModeHints = {
+  semantic: "Embedding similarity — finds nodes by meaning, even when exact keywords differ. Requires pre-computed embeddings.",
+  bm25: "Keyword search — finds nodes by exact term matching using BM25 scoring. No embeddings needed.",
+  hybrid: "Blended search — combines semantic similarity and keyword matching. Alpha controls the blend (0 = pure keyword, 1 = pure semantic)."
+};
+function updateSearchModeHint(mode) {
+  document.getElementById('search-mode-hint').textContent = searchModeHints[mode] || '';
+  document.getElementById('alpha-control').classList.toggle('hidden', mode !== 'hybrid');
+}
+updateSearchModeHint('semantic');
 
 var modeHints = {
   search: "Semantic similarity search — returns the most relevant nodes ranked by how closely they match your query.",

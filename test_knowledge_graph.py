@@ -2093,3 +2093,148 @@ def test_ingest_markdown_includes_diff(tmp_path):
     diff = stats["diff"]
     assert diff["has_changes"] is True
     assert diff["counts"]["nodes_added"] > 0
+
+
+# ---------------------------------------------------------------------------
+# BM25 & Hybrid search
+# ---------------------------------------------------------------------------
+
+
+def _make_search_graph(tmp_path):
+    """Create a graph with varied text for BM25 testing."""
+    kg = KnowledgeGraph(tmp_path / "search.json")
+    kg.add_node("radar", type="concept", label="Radar",
+                properties={"description": "Radio detection and ranging system"})
+    kg.add_node("lidar", type="concept", label="LiDAR",
+                properties={"description": "Light detection and ranging using laser pulses"})
+    kg.add_node("sonar", type="concept", label="Sonar",
+                properties={"description": "Sound navigation and ranging underwater"})
+    kg.add_node("antenna", type="component", label="Antenna",
+                properties={"description": "Electromagnetic transducer for radio waves"})
+    kg.add_node("signal", type="concept", label="Signal Processing",
+                properties={"description": "Mathematical analysis and transformation of signals"})
+    return kg
+
+
+def test_bm25_search_basic(tmp_path):
+    """BM25 search finds nodes by keyword match."""
+    kg = _make_search_graph(tmp_path)
+    results = kg.bm25_search("radio detection ranging", top_k=5)
+    assert len(results) > 0
+    # "radar" should rank highest — its label and description contain all terms
+    assert results[0][0] == "radar"
+    # Score should be positive
+    assert results[0][1] > 0
+
+
+def test_bm25_search_exact_keyword(tmp_path):
+    """BM25 finds exact keyword matches that semantic search might miss."""
+    kg = _make_search_graph(tmp_path)
+    results = kg.bm25_search("laser pulses", top_k=5)
+    assert len(results) > 0
+    assert results[0][0] == "lidar"
+
+
+def test_bm25_search_type_filter(tmp_path):
+    """BM25 respects node type filter."""
+    kg = _make_search_graph(tmp_path)
+    results = kg.bm25_search("radio waves", top_k=10, node_types=["component"])
+    for nid, _ in results:
+        assert kg.get_node(nid)["type"] == "component"
+
+
+def test_bm25_search_confidence_filter(tmp_path):
+    """BM25 respects min confidence filter."""
+    kg = KnowledgeGraph(tmp_path / "conf.json")
+    kg.add_node("low", label="Low confidence radar", confidence=0.2,
+                properties={"description": "radar system"})
+    kg.add_node("high", label="High confidence radar", confidence=0.9,
+                properties={"description": "radar system"})
+    results = kg.bm25_search("radar system", top_k=10, min_confidence=0.5)
+    result_ids = {nid for nid, _ in results}
+    assert "high" in result_ids
+    assert "low" not in result_ids
+
+
+def test_bm25_search_empty_query(tmp_path):
+    """BM25 with stopwords-only query returns empty."""
+    kg = _make_search_graph(tmp_path)
+    results = kg.bm25_search("the and or", top_k=5)
+    assert results == []
+
+
+def test_bm25_search_no_match(tmp_path):
+    """BM25 with unmatched terms returns empty."""
+    kg = _make_search_graph(tmp_path)
+    results = kg.bm25_search("quantum entanglement photon", top_k=5)
+    assert results == []
+
+
+def test_bm25_index_rebuild(tmp_path):
+    """BM25 index auto-rebuilds when graph is dirty."""
+    kg = _make_search_graph(tmp_path)
+    # First search builds index
+    results1 = kg.bm25_search("underwater", top_k=1)
+    assert results1[0][0] == "sonar"
+
+    # Add a node with "underwater" — makes graph dirty
+    kg.add_node("submarine", label="Submarine",
+                properties={"description": "Underwater vessel for naval operations"})
+    # Search should find the new node
+    results2 = kg.bm25_search("underwater", top_k=5)
+    result_ids = {nid for nid, _ in results2}
+    assert "submarine" in result_ids
+
+
+def test_search_bm25_mode(tmp_path):
+    """search() with mode='bm25' uses BM25 scoring."""
+    kg = _make_search_graph(tmp_path)
+    results = kg.search("laser pulses", mode="bm25", top_k=3)
+    assert len(results) > 0
+    assert results[0]["node_id"] == "lidar"
+    assert "similarity" in results[0]
+
+
+def test_search_hybrid_mode(tmp_path):
+    """search() with mode='hybrid' blends BM25 and semantic scores."""
+    import math
+    kg = _make_search_graph(tmp_path)
+
+    # Set up simple embeddings for hybrid search
+    def _unit(vec):
+        norm = math.sqrt(sum(x * x for x in vec))
+        return [x / norm for x in vec] if norm else vec
+
+    kg.set_embedding("radar", _unit([1.0, 0.0, 0.0, 0.0]))
+    kg.set_embedding("lidar", _unit([0.8, 0.6, 0.0, 0.0]))
+    kg.set_embedding("sonar", _unit([0.5, 0.5, 0.5, 0.0]))
+    kg.set_embedding("antenna", _unit([0.3, 0.3, 0.3, 0.7]))
+    kg.set_embedding("signal", _unit([0.0, 0.0, 0.5, 0.8]))
+
+    query_vec = _unit([0.95, 0.1, 0.0, 0.0])
+
+    def fake_embed(texts):
+        return [query_vec for _ in texts]
+
+    results = kg.search("radio detection", fake_embed, mode="hybrid", top_k=5, alpha=0.5)
+    assert len(results) > 0
+    # Should get results from both BM25 (keyword match) and semantic (embedding similarity)
+    result_ids = {r["node_id"] for r in results}
+    assert "radar" in result_ids  # should be top — matches both BM25 and semantic
+
+
+def test_search_hybrid_alpha_zero_is_pure_bm25(tmp_path):
+    """Hybrid search with alpha=0 produces same ranking as pure BM25."""
+    kg = _make_search_graph(tmp_path)
+    bm25_results = kg.search("laser pulses", mode="bm25", top_k=5)
+    hybrid_results = kg.search("laser pulses", mode="hybrid", top_k=5, alpha=0.0)
+    # Same top result
+    if bm25_results and hybrid_results:
+        assert bm25_results[0]["node_id"] == hybrid_results[0]["node_id"]
+
+
+def test_search_bm25_requires_string(tmp_path):
+    """BM25 mode raises ValueError when given a vector."""
+    kg = _make_search_graph(tmp_path)
+    with pytest.raises(ValueError, match="text query"):
+        kg.search([1.0, 0.0], mode="bm25")
