@@ -80,6 +80,11 @@ knowledge_graph/                  # dedicated graph directory
 - `KnowledgeGraph.diff_document_versions()` -- Compares two versions of a document at section level using stored `section_hashes`. Returns a `DocumentDiff` identifying added/removed/modified/unchanged sections.
 - `KnowledgeGraph.get_document_history()` -- Returns a rich version timeline for a document: version metadata, section counts, node/edge counts per ingestion, and diffs between consecutive versions. Available via CLI (`--doc-history`), web API (`GET /graphs/{name}/documents/{doc_id}/history`), and MCP tool (`document_history`).
 - `KnowledgeGraph.analytics()` -- Computes comprehensive quality analytics: confidence distributions (10-bucket histograms for nodes/edges), per-relation and per-type stats, hub nodes (top-10 by degree), orphan nodes, source document coverage, embedding coverage, component sizes, and a composite quality score (0-100). Available via CLI (`--analytics`), web page (`GET /graphs/{name}/analytics`), JSON API (`GET /api/graphs/{name}/analytics`), and MCP tool (`graph_analytics`).
+- `GraphDiff` -- Dataclass returned by `diff()` with `nodes_added`, `nodes_removed`, `nodes_modified`, `edges_added`, `edges_removed`, `edges_modified`, `proposals_added`, `proposals_changed` lists and `has_changes`/`summary`/`to_dict()` helpers. Includes `counts` dict in serialized form.
+- `KnowledgeGraph.snapshot()` -- Deep-copies the current graph state (data + proposals) for later comparison via `diff_from_snapshot()`.
+- `KnowledgeGraph.diff(other)` -- Compares this graph (older) against another graph (newer) and returns a `GraphDiff` with field-level node/edge changes and proposal tracking.
+- `KnowledgeGraph.diff_from_snapshot(snap)` -- Compares a previously captured snapshot against the current state. Used internally by `ingest_markdown()` to attach a diff summary to aggregate stats.
+- `KnowledgeGraph.diff_from_file(path)` -- Loads a graph from a file and diffs it against the current state. Available via CLI (`--diff`), web API (`GET /graphs/{name}/diff?against={other}` and `GET /api/graphs/{name}/diff?against={other}`), and MCP tool (`diff_graphs`).
 
 ## How to run
 
@@ -97,6 +102,7 @@ python knowledge_graph.py <path-to-graph.json> --neighbors <id> --depth 2
 python knowledge_graph.py <path-to-graph.json> --pyvis output.html
 python knowledge_graph.py <path-to-graph.json> --cytoscape output.html
 python knowledge_graph.py <path-to-graph.json> --validate
+python knowledge_graph.py <path-to-graph.json> --diff <other-graph.json>
 python knowledge_graph.py <path-to-graph.json> --analytics
 python knowledge_graph.py <path-to-graph.json> --doc-history <doc-id>
 python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections

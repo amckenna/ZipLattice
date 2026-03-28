@@ -571,3 +571,49 @@ class TestMergeGraphsTool:
         ))
         assert "error" in result
         _graph_cache.clear()
+
+    def test_diff_graphs_tool(self, tmp_path):
+        """diff_graphs MCP tool returns structured diff between two graphs."""
+        from mcp_server import diff_graphs, _graph_cache
+        _graph_cache.clear()
+
+        # Create two graphs with some overlap
+        kg1 = KnowledgeGraph(tmp_path / "base.json")
+        kg1.add_node("radar", label="Radar", type="concept")
+        kg1.add_node("antenna", label="Antenna", type="concept")
+        kg1.add_edge("radar", "antenna", relation="depends_on")
+        kg1.save()
+
+        kg2 = KnowledgeGraph(tmp_path / "newer.json")
+        kg2.add_node("radar", label="Radar System", type="concept")
+        kg2.add_node("sar", label="SAR", type="technology")
+        kg2.add_edge("sar", "radar", relation="is_a")
+        kg2.save()
+
+        result = json.loads(diff_graphs(
+            graph_path=str(kg1.graph_path),
+            other_graph_path=str(kg2.graph_path),
+        ))
+        assert result["has_changes"] is True
+        # antenna was removed, sar was added
+        assert result["counts"]["nodes_added"] >= 1
+        assert result["counts"]["nodes_removed"] >= 1
+        # radar was modified (label change)
+        assert result["counts"]["nodes_modified"] >= 1
+        _graph_cache.clear()
+
+    def test_diff_graphs_no_changes(self, tmp_path):
+        """diff_graphs with identical graphs shows no changes."""
+        from mcp_server import diff_graphs, _graph_cache
+        _graph_cache.clear()
+
+        kg = KnowledgeGraph(tmp_path / "same.json")
+        kg.add_node("x", label="X")
+        kg.save()
+
+        result = json.loads(diff_graphs(
+            graph_path=str(kg.graph_path),
+            other_graph_path=str(kg.graph_path),
+        ))
+        assert result["has_changes"] is False
+        _graph_cache.clear()

@@ -846,3 +846,61 @@ def test_transplant_missing_doc():
     })
     assert resp.status_code == 200
     assert "Error" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Graph diff endpoints
+# ---------------------------------------------------------------------------
+
+
+def _create_graph_with_nodes(name: str, nodes: list[tuple[str, str]]) -> None:
+    """Create a graph with specific nodes for diff testing."""
+    graph_dir = GRAPHS_DIR / name
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    kg = KnowledgeGraph(graph_dir / f"{name}.json")
+    for nid, label in nodes:
+        kg.add_node(nid, label=label, type="concept")
+    kg.save()
+
+
+def test_diff_page_no_against():
+    """GET /graphs/{name}/diff without against shows form."""
+    _create_graph("diff-base")
+    resp = client.get("/graphs/diff-base/diff")
+    assert resp.status_code == 200
+    assert "Compare Against" in resp.text
+
+
+def test_diff_page_with_against():
+    """GET /graphs/{name}/diff?against={other} shows diff result."""
+    _create_graph_with_nodes("diff-a", [("x", "X"), ("y", "Y")])
+    _create_graph_with_nodes("diff-b", [("x", "X"), ("z", "Z")])
+    resp = client.get("/graphs/diff-a/diff?against=diff-b")
+    assert resp.status_code == 200
+    assert "Diff" in resp.text
+
+
+def test_diff_api_endpoint():
+    """GET /api/graphs/{name}/diff returns JSON diff."""
+    _create_graph_with_nodes("api-a", [("n1", "N1")])
+    _create_graph_with_nodes("api-b", [("n1", "N1"), ("n2", "N2")])
+    resp = client.get("/api/graphs/api-a/diff?against=api-b")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["has_changes"] is True
+    assert data["counts"]["nodes_added"] >= 1
+
+
+def test_diff_api_missing_graph():
+    """GET /api/graphs/{name}/diff with missing graph returns 404."""
+    _create_graph("exists-only")
+    resp = client.get("/api/graphs/exists-only/diff?against=nonexistent")
+    assert resp.status_code == 404
+
+
+def test_diff_page_missing_against_graph():
+    """GET /graphs/{name}/diff?against=nonexistent shows error."""
+    _create_graph("diff-ok")
+    resp = client.get("/graphs/diff-ok/diff?against=nonexistent")
+    assert resp.status_code == 200
+    assert "not found" in resp.text

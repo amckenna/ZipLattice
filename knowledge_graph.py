@@ -1320,6 +1320,89 @@ class DocumentDiff:
         }
 
 
+@dataclass
+class GraphDiff:
+    """Result of comparing two graph states.
+
+    Tracks nodes and edges that were added, removed, or modified between
+    two ``KnowledgeGraph`` snapshots.  Proposals are tracked separately.
+
+    Attributes:
+        nodes_added: List of node dicts present only in the *newer* graph.
+        nodes_removed: List of node dicts present only in the *older* graph.
+        nodes_modified: List of dicts describing field-level changes for
+            nodes present in both graphs but with different data.
+        edges_added: List of edge dicts present only in the newer graph.
+        edges_removed: List of edge dicts present only in the older graph.
+        edges_modified: List of dicts describing field-level changes for
+            edges present in both graphs but with different data.
+        proposals_added: List of proposal dicts added in the newer graph.
+        proposals_changed: List of dicts describing proposal status changes.
+    """
+
+    nodes_added: list[dict[str, Any]] = field(default_factory=list)
+    nodes_removed: list[dict[str, Any]] = field(default_factory=list)
+    nodes_modified: list[dict[str, Any]] = field(default_factory=list)
+    edges_added: list[dict[str, Any]] = field(default_factory=list)
+    edges_removed: list[dict[str, Any]] = field(default_factory=list)
+    edges_modified: list[dict[str, Any]] = field(default_factory=list)
+    proposals_added: list[dict[str, Any]] = field(default_factory=list)
+    proposals_changed: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(
+            self.nodes_added or self.nodes_removed or self.nodes_modified
+            or self.edges_added or self.edges_removed or self.edges_modified
+            or self.proposals_added or self.proposals_changed
+        )
+
+    @property
+    def summary(self) -> str:
+        parts: list[str] = []
+        if self.nodes_added:
+            parts.append(f"{len(self.nodes_added)} nodes added")
+        if self.nodes_removed:
+            parts.append(f"{len(self.nodes_removed)} nodes removed")
+        if self.nodes_modified:
+            parts.append(f"{len(self.nodes_modified)} nodes modified")
+        if self.edges_added:
+            parts.append(f"{len(self.edges_added)} edges added")
+        if self.edges_removed:
+            parts.append(f"{len(self.edges_removed)} edges removed")
+        if self.edges_modified:
+            parts.append(f"{len(self.edges_modified)} edges modified")
+        if self.proposals_added:
+            parts.append(f"{len(self.proposals_added)} proposals added")
+        if self.proposals_changed:
+            parts.append(f"{len(self.proposals_changed)} proposals changed")
+        return ", ".join(parts) if parts else "no changes"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "nodes_added": self.nodes_added,
+            "nodes_removed": self.nodes_removed,
+            "nodes_modified": self.nodes_modified,
+            "edges_added": self.edges_added,
+            "edges_removed": self.edges_removed,
+            "edges_modified": self.edges_modified,
+            "proposals_added": self.proposals_added,
+            "proposals_changed": self.proposals_changed,
+            "has_changes": self.has_changes,
+            "summary": self.summary,
+            "counts": {
+                "nodes_added": len(self.nodes_added),
+                "nodes_removed": len(self.nodes_removed),
+                "nodes_modified": len(self.nodes_modified),
+                "edges_added": len(self.edges_added),
+                "edges_removed": len(self.edges_removed),
+                "edges_modified": len(self.edges_modified),
+                "proposals_added": len(self.proposals_added),
+                "proposals_changed": len(self.proposals_changed),
+            },
+        }
+
+
 def compute_section_hashes(
     text: str,
     *,
@@ -2154,6 +2237,155 @@ class KnowledgeGraph:
     def to_dict(self) -> dict[str, Any]:
         """Return a deep copy of the raw graph data."""
         return deepcopy(self._data)
+
+    # ------------------------------------------------------------------
+    # Snapshot & diff
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a deep copy of the current graph state for later diffing.
+
+        The returned dict captures ``_data`` and ``_proposals`` so that
+        :meth:`diff` can compare before/after states within a session.
+        """
+        return {
+            "data": deepcopy(self._data),
+            "proposals": [p.to_dict() for p in self._proposals],
+        }
+
+    @staticmethod
+    def _diff_node_fields(
+        node_id: str,
+        old: dict[str, Any],
+        new: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Compare two node dicts and return field-level changes, or None."""
+        changes: dict[str, Any] = {}
+        all_keys = set(old) | set(new)
+        for key in all_keys:
+            old_val = old.get(key)
+            new_val = new.get(key)
+            if old_val != new_val:
+                changes[key] = {"old": old_val, "new": new_val}
+        if changes:
+            return {"node_id": node_id, "label": new.get("label", old.get("label", node_id)), "changes": changes}
+        return None
+
+    @staticmethod
+    def _edge_key(edge: dict[str, Any]) -> tuple[str, str, str]:
+        return (edge["source"], edge["target"], edge.get("relation", "related_to"))
+
+    @staticmethod
+    def _diff_edge_fields(
+        edge_key: tuple[str, str, str],
+        old: dict[str, Any],
+        new: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Compare two edge dicts and return field-level changes, or None."""
+        changes: dict[str, Any] = {}
+        all_keys = set(old) | set(new)
+        for key in all_keys:
+            old_val = old.get(key)
+            new_val = new.get(key)
+            if old_val != new_val:
+                changes[key] = {"old": old_val, "new": new_val}
+        if changes:
+            return {"source": edge_key[0], "target": edge_key[1], "relation": edge_key[2], "changes": changes}
+        return None
+
+    def diff(self, other: "KnowledgeGraph") -> GraphDiff:
+        """Compare this graph against *other* and return a :class:`GraphDiff`.
+
+        ``self`` is treated as the **older** state and *other* as the
+        **newer** state.  The result describes what changed to go from
+        ``self`` to *other*.
+        """
+        return self._diff_data(self._data, [p.to_dict() for p in self._proposals],
+                               other._data, [p.to_dict() for p in other._proposals])
+
+    def diff_from_snapshot(self, snap: dict[str, Any]) -> GraphDiff:
+        """Compare a previously captured :meth:`snapshot` against the current state.
+
+        The snapshot is the **older** state; the current graph is the
+        **newer** state.
+        """
+        return self._diff_data(snap["data"], snap["proposals"],
+                               self._data, [p.to_dict() for p in self._proposals])
+
+    def diff_from_file(self, path: str | Path) -> GraphDiff:
+        """Load a graph from *path* and diff it against the current state.
+
+        The file is the **older** state; the current graph is the
+        **newer** state.
+        """
+        other = KnowledgeGraph(path)
+        return other.diff(self)
+
+    @classmethod
+    def _diff_data(
+        cls,
+        old_data: dict[str, Any],
+        old_proposals: list[dict[str, Any]],
+        new_data: dict[str, Any],
+        new_proposals: list[dict[str, Any]],
+    ) -> GraphDiff:
+        """Core diff logic operating on raw data dicts."""
+        result = GraphDiff()
+
+        # --- Nodes ---
+        old_nodes = old_data.get("nodes", {})
+        new_nodes = new_data.get("nodes", {})
+        old_ids = set(old_nodes)
+        new_ids = set(new_nodes)
+
+        for nid in sorted(new_ids - old_ids):
+            result.nodes_added.append({"node_id": nid, **new_nodes[nid]})
+        for nid in sorted(old_ids - new_ids):
+            result.nodes_removed.append({"node_id": nid, **old_nodes[nid]})
+        for nid in sorted(old_ids & new_ids):
+            mod = cls._diff_node_fields(nid, old_nodes[nid], new_nodes[nid])
+            if mod:
+                result.nodes_modified.append(mod)
+
+        # --- Edges ---
+        old_edges_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for edge in old_data.get("edges", []):
+            old_edges_by_key[cls._edge_key(edge)] = edge
+        new_edges_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for edge in new_data.get("edges", []):
+            new_edges_by_key[cls._edge_key(edge)] = edge
+
+        old_ekeys = set(old_edges_by_key)
+        new_ekeys = set(new_edges_by_key)
+
+        for ek in sorted(new_ekeys - old_ekeys):
+            result.edges_added.append(new_edges_by_key[ek])
+        for ek in sorted(old_ekeys - new_ekeys):
+            result.edges_removed.append(old_edges_by_key[ek])
+        for ek in sorted(old_ekeys & new_ekeys):
+            mod = cls._diff_edge_fields(ek, old_edges_by_key[ek], new_edges_by_key[ek])
+            if mod:
+                result.edges_modified.append(mod)
+
+        # --- Proposals ---
+        old_prop_names = {p["name"] for p in old_proposals}
+        new_prop_names = {p["name"] for p in new_proposals}
+        new_prop_map = {p["name"]: p for p in new_proposals}
+        old_prop_map = {p["name"]: p for p in old_proposals}
+
+        for name in sorted(new_prop_names - old_prop_names):
+            result.proposals_added.append(new_prop_map[name])
+        for name in sorted(old_prop_names & new_prop_names):
+            old_p = old_prop_map[name]
+            new_p = new_prop_map[name]
+            if old_p.get("status") != new_p.get("status"):
+                result.proposals_changed.append({
+                    "name": name,
+                    "old_status": old_p.get("status"),
+                    "new_status": new_p.get("status"),
+                })
+
+        return result
 
     # ------------------------------------------------------------------
     # Internal: networkx sync
@@ -4270,7 +4502,12 @@ TEXT:
 
         Returns:
             Aggregate stats dict with per-section breakdown.
+            Includes a ``"diff"`` key with a :class:`GraphDiff` dict
+            summarising changes made during this ingestion.
         """
+        # Capture pre-ingestion state for post-ingestion diff
+        _pre_snapshot = self.snapshot()
+
         aggregate_stats: dict[str, Any] = {
             "doc_id": doc_id,
             "total_sections": 0,
@@ -4824,6 +5061,10 @@ TEXT:
                 "total_proposals_created": aggregate_stats["total_proposals_created"],
                 "total_proposals_augmented": aggregate_stats["total_proposals_augmented"],
             })
+
+        # Compute diff from pre-ingestion snapshot
+        ingestion_diff = self.diff_from_snapshot(_pre_snapshot)
+        aggregate_stats["diff"] = ingestion_diff.to_dict()
 
         return aggregate_stats
 
@@ -7996,6 +8237,8 @@ def main() -> None:
     parser.add_argument("--analytics", action="store_true",
                         help="Show quality analytics: confidence distributions, hub nodes, "
                              "orphan detection, embedding coverage, quality score")
+    parser.add_argument("--diff", metavar="OTHER_GRAPH",
+                        help="Diff this graph against another graph file and show changes")
     parser.add_argument("--list-models", action="store_true",
                         help="List models available on the API server and exit")
     parser.add_argument("--merge", nargs="+", metavar="GRAPH",
@@ -8265,18 +8508,83 @@ def main() -> None:
             if len(a["orphan_nodes"]) > 10:
                 print(f"    ... and {len(a['orphan_nodes']) - 10} more")
 
+    if args.diff:
+        other_path = Path(args.diff)
+        if not other_path.exists():
+            print(f"Error: '{args.diff}' not found.")
+        else:
+            diff = kg.diff_from_file(other_path)
+            if not diff.has_changes:
+                print("\n  No changes between the two graphs.")
+            else:
+                print(f"\n  Graph Diff: {kg.graph_path} vs {other_path}")
+                print(f"  Summary: {diff.summary}\n")
+                if diff.nodes_added:
+                    print(f"  Nodes Added ({len(diff.nodes_added)}):")
+                    for n in diff.nodes_added[:20]:
+                        print(f"    + {n.get('node_id', '?')}: "
+                              f"{n.get('label', '')} ({n.get('type', '?')})")
+                    if len(diff.nodes_added) > 20:
+                        print(f"    ... and {len(diff.nodes_added) - 20} more")
+                if diff.nodes_removed:
+                    print(f"  Nodes Removed ({len(diff.nodes_removed)}):")
+                    for n in diff.nodes_removed[:20]:
+                        print(f"    - {n.get('node_id', '?')}: "
+                              f"{n.get('label', '')} ({n.get('type', '?')})")
+                    if len(diff.nodes_removed) > 20:
+                        print(f"    ... and {len(diff.nodes_removed) - 20} more")
+                if diff.nodes_modified:
+                    print(f"  Nodes Modified ({len(diff.nodes_modified)}):")
+                    for n in diff.nodes_modified[:20]:
+                        fields = ", ".join(n.get("changes", {}).keys())
+                        print(f"    ~ {n.get('node_id', '?')}: {fields}")
+                    if len(diff.nodes_modified) > 20:
+                        print(f"    ... and {len(diff.nodes_modified) - 20} more")
+                if diff.edges_added:
+                    print(f"  Edges Added ({len(diff.edges_added)}):")
+                    for e in diff.edges_added[:20]:
+                        print(f"    + {e.get('source', '?')} "
+                              f"-[{e.get('relation', '?')}]-> {e.get('target', '?')}")
+                    if len(diff.edges_added) > 20:
+                        print(f"    ... and {len(diff.edges_added) - 20} more")
+                if diff.edges_removed:
+                    print(f"  Edges Removed ({len(diff.edges_removed)}):")
+                    for e in diff.edges_removed[:20]:
+                        print(f"    - {e.get('source', '?')} "
+                              f"-[{e.get('relation', '?')}]-> {e.get('target', '?')}")
+                    if len(diff.edges_removed) > 20:
+                        print(f"    ... and {len(diff.edges_removed) - 20} more")
+                if diff.edges_modified:
+                    print(f"  Edges Modified ({len(diff.edges_modified)}):")
+                    for e in diff.edges_modified[:20]:
+                        fields = ", ".join(e.get("changes", {}).keys())
+                        print(f"    ~ {e.get('source', '?')} "
+                              f"-[{e.get('relation', '?')}]-> {e.get('target', '?')}: {fields}")
+                    if len(diff.edges_modified) > 20:
+                        print(f"    ... and {len(diff.edges_modified) - 20} more")
+                if diff.proposals_added:
+                    print(f"  Proposals Added ({len(diff.proposals_added)}):")
+                    for p in diff.proposals_added:
+                        print(f"    + {p.get('name', '?')} "
+                              f"(confidence: {p.get('confidence', '?')})")
+                if diff.proposals_changed:
+                    print(f"  Proposals Changed ({len(diff.proposals_changed)}):")
+                    for p in diff.proposals_changed:
+                        print(f"    ~ {p.get('name', '?')}: "
+                              f"{p.get('old_status', '?')} -> {p.get('new_status', '?')}")
+
     if not any([args.stats, args.node, args.neighbors, args.split,
                 args.proposals, args.accept, args.accept_all, args.reject,
                 args.patterns, args.pyvis, args.cytoscape,
                 args.preview_md, args.ingest_md,
                 args.doc_history,
                 args.sources, args.check_sources, args.verify_embeddings,
-                args.validate, args.analytics]):
+                args.validate, args.analytics, args.diff]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
               f"--accept, --accept-all, --reject, --patterns, --pyvis, --cytoscape, "
               f"--preview-md, --ingest-md, --doc-history, --sources, --check-sources, "
-              f"--verify-embeddings, --validate, --analytics for details.")
+              f"--verify-embeddings, --validate, --analytics, --diff for details.")
 
 
 if __name__ == "__main__":

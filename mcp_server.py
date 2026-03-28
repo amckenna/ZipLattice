@@ -680,6 +680,28 @@ def document_history(
     return _json(history)
 
 
+@mcp.tool()
+def diff_graphs(
+    graph_path: str,
+    other_graph_path: str,
+) -> str:
+    """Compare two knowledge graphs and return a structured diff.
+
+    Shows nodes added/removed/modified, edges added/removed/modified,
+    and proposal changes between the two graphs.  The first graph is
+    treated as the older state and the second as the newer state.
+
+    Args:
+        graph_path: Path to the base (older) graph JSON file.
+        other_graph_path: Path to the other (newer) graph JSON file.
+    """
+    logger.info("diff_graphs: %s vs %s", graph_path, other_graph_path)
+    kg = _get_graph(graph_path)
+    other = _get_graph(other_graph_path)
+    diff_result = kg.diff(other)
+    return _json(diff_result.to_dict())
+
+
 # =========================================================================
 # Entry point
 # =========================================================================

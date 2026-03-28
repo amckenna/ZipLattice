@@ -1916,3 +1916,180 @@ def test_incremental_structural_nodes_still_updated(tmp_path):
     assert kg.get_node("doc1-gamma") is not None
     # Document node still present
     assert kg.get_node("doc1") is not None
+
+
+# ---------------------------------------------------------------------------
+# Graph diffing
+# ---------------------------------------------------------------------------
+
+
+def test_graph_diff_empty_graphs(tmp_path):
+    """Diffing two empty graphs yields no changes."""
+    from knowledge_graph import GraphDiff
+
+    kg1 = KnowledgeGraph(tmp_path / "a.json")
+    kg2 = KnowledgeGraph(tmp_path / "b.json")
+    diff = kg1.diff(kg2)
+    assert isinstance(diff, GraphDiff)
+    assert not diff.has_changes
+    assert diff.summary == "no changes"
+
+
+def test_graph_diff_nodes_added(tmp_path):
+    """Diff detects nodes present only in the newer graph."""
+    from knowledge_graph import GraphDiff
+
+    kg1 = KnowledgeGraph(tmp_path / "a.json")
+    kg2 = KnowledgeGraph(tmp_path / "b.json")
+    kg2.add_node("radar", type="concept", label="Radar")
+    kg2.add_node("sar", type="technology", label="SAR")
+
+    diff = kg1.diff(kg2)
+    assert len(diff.nodes_added) == 2
+    assert len(diff.nodes_removed) == 0
+    added_ids = {n["node_id"] for n in diff.nodes_added}
+    assert added_ids == {"radar", "sar"}
+    assert diff.has_changes
+
+
+def test_graph_diff_nodes_removed(tmp_path):
+    """Diff detects nodes present only in the older graph."""
+    kg1 = KnowledgeGraph(tmp_path / "a.json")
+    kg1.add_node("radar", type="concept", label="Radar")
+
+    kg2 = KnowledgeGraph(tmp_path / "b.json")
+
+    diff = kg1.diff(kg2)
+    assert len(diff.nodes_removed) == 1
+    assert diff.nodes_removed[0]["node_id"] == "radar"
+
+
+def test_graph_diff_nodes_modified(tmp_path):
+    """Diff detects field-level changes for nodes in both graphs."""
+    kg1 = KnowledgeGraph(tmp_path / "a.json")
+    kg1.add_node("radar", type="concept", label="Radar", confidence=0.5)
+
+    kg2 = KnowledgeGraph(tmp_path / "b.json")
+    kg2.add_node("radar", type="concept", label="Radar System", confidence=0.9)
+
+    diff = kg1.diff(kg2)
+    assert len(diff.nodes_modified) == 1
+    mod = diff.nodes_modified[0]
+    assert mod["node_id"] == "radar"
+    assert "label" in mod["changes"]
+    assert mod["changes"]["label"]["old"] == "Radar"
+    assert mod["changes"]["label"]["new"] == "Radar System"
+    assert "confidence" in mod["changes"]
+
+
+def test_graph_diff_edges(tmp_path):
+    """Diff detects added, removed, and modified edges."""
+    kg1 = KnowledgeGraph(tmp_path / "a.json")
+    kg1.add_node("a", label="A")
+    kg1.add_node("b", label="B")
+    kg1.add_node("c", label="C")
+    kg1.add_edge("a", "b", relation="is_a", confidence=0.5)
+    kg1.add_edge("a", "c", relation="depends_on")
+
+    kg2 = KnowledgeGraph(tmp_path / "b.json")
+    kg2.add_node("a", label="A")
+    kg2.add_node("b", label="B")
+    kg2.add_node("d", label="D")
+    kg2.add_edge("a", "b", relation="is_a", confidence=0.9)  # modified
+    kg2.add_edge("a", "d", relation="uses")  # added
+
+    diff = kg1.diff(kg2)
+    assert len(diff.edges_added) == 1  # a->d uses
+    assert len(diff.edges_removed) == 1  # a->c depends_on
+    assert len(diff.edges_modified) == 1  # a->b is_a confidence change
+    assert diff.edges_modified[0]["changes"]["confidence"]["old"] == 0.5
+    assert diff.edges_modified[0]["changes"]["confidence"]["new"] == 0.9
+
+
+def test_graph_diff_proposals(tmp_path):
+    """Diff detects added and changed proposals."""
+    kg1 = KnowledgeGraph(tmp_path / "a.json")
+    kg1.propose_relation("validates", justification="test",
+                         source_entity="a", target_entity="b")
+
+    kg2 = KnowledgeGraph(tmp_path / "b.json")
+    kg2.propose_relation("validates", justification="test",
+                         source_entity="a", target_entity="b")
+    kg2.accept_proposal("validates")
+    kg2.propose_relation("measures", justification="test2",
+                         source_entity="c", target_entity="d")
+
+    diff = kg1.diff(kg2)
+    assert len(diff.proposals_added) == 1
+    assert diff.proposals_added[0]["name"] == "measures"
+    assert len(diff.proposals_changed) == 1
+    assert diff.proposals_changed[0]["name"] == "validates"
+    assert diff.proposals_changed[0]["new_status"] == "accepted"
+
+
+def test_snapshot_and_diff_from_snapshot(tmp_path):
+    """snapshot() captures state; diff_from_snapshot() detects mutations."""
+    kg = KnowledgeGraph(tmp_path / "a.json")
+    kg.add_node("radar", label="Radar")
+    snap = kg.snapshot()
+
+    kg.add_node("sar", label="SAR")
+    kg.add_edge("sar", "radar", relation="is_a")
+
+    diff = kg.diff_from_snapshot(snap)
+    assert len(diff.nodes_added) == 1
+    assert diff.nodes_added[0]["node_id"] == "sar"
+    assert len(diff.edges_added) == 1
+
+
+def test_diff_from_file(tmp_path):
+    """diff_from_file() loads a saved graph and diffs against current state."""
+    kg1 = KnowledgeGraph(tmp_path / "base.json")
+    kg1.add_node("a", label="A")
+    kg1.save()
+
+    kg2 = KnowledgeGraph(tmp_path / "current.json")
+    kg2.add_node("a", label="A")
+    kg2.add_node("b", label="B")
+
+    diff = kg2.diff_from_file(tmp_path / "base.json")
+    assert len(diff.nodes_added) == 1
+    assert diff.nodes_added[0]["node_id"] == "b"
+
+
+def test_graph_diff_to_dict(tmp_path):
+    """GraphDiff.to_dict() returns serializable structure with counts."""
+    from knowledge_graph import GraphDiff
+
+    kg1 = KnowledgeGraph(tmp_path / "a.json")
+    kg2 = KnowledgeGraph(tmp_path / "b.json")
+    kg2.add_node("x", label="X")
+
+    diff = kg1.diff(kg2)
+    d = diff.to_dict()
+    assert d["has_changes"] is True
+    assert d["counts"]["nodes_added"] == 1
+    assert isinstance(d["summary"], str)
+    # Verify it's JSON-serializable
+    json.dumps(d)
+
+
+def test_ingest_markdown_includes_diff(tmp_path):
+    """ingest_markdown() aggregate stats include a diff of changes."""
+    kg = KnowledgeGraph(tmp_path / "a.json")
+
+    def mock_extract(prompt):
+        return [
+            {"source": "Radar", "target": "Radio waves",
+             "relation": "uses", "confidence": 0.9,
+             "context": "Radar uses radio waves for detection and ranging."},
+        ]
+
+    md = _long_section("Radar Basics",
+                       "Radar uses radio waves for detection and ranging.")
+    stats = kg.ingest_markdown(md, "test-doc", llm_extract_fn=mock_extract)
+
+    assert "diff" in stats
+    diff = stats["diff"]
+    assert diff["has_changes"] is True
+    assert diff["counts"]["nodes_added"] > 0

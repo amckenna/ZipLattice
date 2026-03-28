@@ -591,6 +591,79 @@ async def graph_analytics_api(name: str) -> Response:
     return JSONResponse(kg.analytics())
 
 
+@app.get("/graphs/{name}/diff", response_class=HTMLResponse)
+async def graph_diff_page(request: Request, name: str, against: str = "") -> Response:
+    """Diff two graphs and render the result.
+
+    Query parameter ``against`` is the name of the other graph to compare.
+    If omitted, renders the diff form to select a graph.
+    """
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return RedirectResponse(url="/", status_code=303)
+
+    available = [g["name"] for g in _list_graphs() if g["name"] != name]
+
+    if not against:
+        # Render partial with just the form
+        return templates.TemplateResponse("partials/diff_result.html", {
+            "request": request,
+            "graph_name": name,
+            "available_graphs": available,
+            "diff": None,
+        })
+
+    other_file = GRAPHS_DIR / against / f"{against}.json"
+    if not other_file.exists():
+        return templates.TemplateResponse("partials/diff_result.html", {
+            "request": request,
+            "graph_name": name,
+            "available_graphs": available,
+            "diff": None,
+            "error": f"Graph '{against}' not found",
+        })
+
+    try:
+        kg = _load_graph(name)
+        other = _load_graph(against)
+        diff_result = kg.diff(other)
+        return templates.TemplateResponse("partials/diff_result.html", {
+            "request": request,
+            "graph_name": name,
+            "against_name": against,
+            "available_graphs": available,
+            "diff": diff_result.to_dict(),
+        })
+    except Exception as exc:
+        logger.error("Diff failed for '%s' vs '%s': %s", name, against, exc)
+        return templates.TemplateResponse("partials/diff_result.html", {
+            "request": request,
+            "graph_name": name,
+            "available_graphs": available,
+            "diff": None,
+            "error": f"Diff failed: {exc}",
+        })
+
+
+@app.get("/api/graphs/{name}/diff")
+async def graph_diff_api(name: str, against: str) -> Response:
+    """Return raw diff JSON between two graphs."""
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return JSONResponse({"error": "Graph not found"}, status_code=404)
+    other_file = GRAPHS_DIR / against / f"{against}.json"
+    if not other_file.exists():
+        return JSONResponse({"error": f"Graph '{against}' not found"}, status_code=404)
+    try:
+        kg = _load_graph(name)
+        other = _load_graph(against)
+        diff_result = kg.diff(other)
+        return JSONResponse(diff_result.to_dict())
+    except Exception as exc:
+        logger.error("Diff API failed for '%s' vs '%s': %s", name, against, exc)
+        return JSONResponse({"error": f"Diff failed: {exc}"}, status_code=500)
+
+
 @app.get("/api/models")
 async def list_models(url: str = "http://localhost:11434") -> Response:
     """Proxy request to a local inference endpoint to list available models.

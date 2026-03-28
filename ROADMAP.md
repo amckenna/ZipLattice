@@ -85,17 +85,17 @@ Each item follows the pattern: **core method -> CLI flag -> web endpoint -> temp
 
 ### Checklist
 
-- [ ] **3a.** Add `GraphDiff` dataclass: `nodes_added`, `nodes_removed`, `nodes_modified` (with field-level diffs), `edges_added`, `edges_removed`, `edges_modified`, `proposals_added`, `proposals_changed`
-- [ ] **3b.** Implement `KnowledgeGraph.diff(other) -> GraphDiff` -- compares two graph instances
-- [ ] **3c.** Implement `KnowledgeGraph.diff_from_file(path) -> GraphDiff` -- loads snapshot and diffs against current state
-- [ ] **3d.** Add `snapshot()` method -- deep copy of current `_data` for before/after comparison within a session
-- [ ] **3e.** After `ingest_markdown()` completes, compute diff from pre-ingestion snapshot and attach summary to aggregate stats
-- [ ] **3f.** Add `--diff <other_graph.json>` CLI flag
-- [ ] **3g.** Add `GET /graphs/{name}/diff?against={other_name}` endpoint in `web_app.py`
-- [ ] **3h.** Add `templates/partials/diff_result.html` -- styled add/remove/modify with green/red/yellow highlighting
-- [ ] **3i.** Show "changes since last ingestion" summary on `graph_detail.html` sources table
-- [ ] **3j.** Add MCP tool `diff_graphs` in `mcp_server.py`
-- [ ] **3k.** Tests: create two graph states, verify diff correctly identifies additions, removals, modifications
+- [x] **3a.** Add `GraphDiff` dataclass: `nodes_added`, `nodes_removed`, `nodes_modified` (with field-level diffs), `edges_added`, `edges_removed`, `edges_modified`, `proposals_added`, `proposals_changed`
+- [x] **3b.** Implement `KnowledgeGraph.diff(other) -> GraphDiff` -- compares two graph instances
+- [x] **3c.** Implement `KnowledgeGraph.diff_from_file(path) -> GraphDiff` -- loads snapshot and diffs against current state
+- [x] **3d.** Add `snapshot()` method -- deep copy of current `_data` for before/after comparison within a session
+- [x] **3e.** After `ingest_markdown()` completes, compute diff from pre-ingestion snapshot and attach summary to aggregate stats
+- [x] **3f.** Add `--diff <other_graph.json>` CLI flag
+- [x] **3g.** Add `GET /graphs/{name}/diff?against={other_name}` endpoint in `web_app.py`
+- [x] **3h.** Add `templates/partials/diff_result.html` -- styled add/remove/modify with green/red/yellow highlighting
+- [x] **3i.** Show "changes since last ingestion" summary on `graph_detail.html` sources table
+- [x] **3j.** Add MCP tool `diff_graphs` in `mcp_server.py`
+- [x] **3k.** Tests: create two graph states, verify diff correctly identifies additions, removals, modifications
 
 ### Design Decisions
 
