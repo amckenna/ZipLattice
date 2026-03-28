@@ -617,3 +617,98 @@ class TestMergeGraphsTool:
         ))
         assert result["has_changes"] is False
         _graph_cache.clear()
+
+    def test_bulk_manage_proposals_accept(self, tmp_path):
+        """bulk_manage_proposals with action=accept works."""
+        from mcp_server import bulk_manage_proposals, _graph_cache
+
+        graph_path = str(tmp_path / "bulk.json")
+        _graph_cache.clear()
+
+        # Create proposals directly on the KnowledgeGraph
+        kg = KnowledgeGraph(graph_path)
+        kg.propose_relation("monitors", justification="test",
+                            source_entity="radar", target_entity="weather")
+        kg.propose_relation("validates", justification="test2",
+                            source_entity="sensor", target_entity="data")
+        kg.save()
+        _graph_cache.clear()
+
+        result = json.loads(bulk_manage_proposals(
+            graph_path=graph_path,
+            action="accept",
+            names=["monitors", "validates"],
+            review_note="bulk test",
+        ))
+        assert result["action"] == "accept"
+        assert result["count"] == 2
+        _graph_cache.clear()
+
+    def test_bulk_manage_proposals_reject(self, tmp_path):
+        """bulk_manage_proposals with action=reject works."""
+        from mcp_server import bulk_manage_proposals, _graph_cache
+
+        graph_path = str(tmp_path / "bulk_rej.json")
+        _graph_cache.clear()
+
+        kg = KnowledgeGraph(graph_path)
+        kg.propose_relation("monitors", justification="test",
+                            source_entity="radar", target_entity="weather")
+        kg.save()
+        _graph_cache.clear()
+
+        result = json.loads(bulk_manage_proposals(
+            graph_path=graph_path,
+            action="reject",
+            names=["monitors"],
+        ))
+        assert result["action"] == "reject"
+        assert result["count"] == 1
+        _graph_cache.clear()
+
+    def test_auto_accept_proposals(self, tmp_path):
+        """auto_accept_proposals MCP tool works."""
+        from mcp_server import auto_accept_proposals, _graph_cache
+
+        graph_path = str(tmp_path / "auto.json")
+        _graph_cache.clear()
+
+        kg = KnowledgeGraph(graph_path)
+        kg.propose_relation("monitors", justification="test",
+                            source_entity="radar", target_entity="weather")
+        kg.save()
+        _graph_cache.clear()
+
+        result = json.loads(auto_accept_proposals(
+            graph_path=graph_path,
+            min_confidence=0.0,
+            min_examples=0,
+        ))
+        assert result["count"] >= 1
+        assert "monitors" in result["accepted"]
+        _graph_cache.clear()
+
+    def test_bulk_manage_proposals_merge(self, tmp_path):
+        """bulk_manage_proposals with action=merge works."""
+        from mcp_server import bulk_manage_proposals, _graph_cache
+
+        graph_path = str(tmp_path / "merge.json")
+        _graph_cache.clear()
+
+        kg = KnowledgeGraph(graph_path)
+        kg.propose_relation("monitors", justification="test",
+                            source_entity="radar", target_entity="weather")
+        kg.propose_relation("monitoring", justification="test2",
+                            source_entity="sensor", target_entity="data")
+        kg.save()
+        _graph_cache.clear()
+
+        result = json.loads(bulk_manage_proposals(
+            graph_path=graph_path,
+            action="merge",
+            names=["monitors", "monitoring"],
+        ))
+        assert result["action"] == "merge"
+        assert result["target"] == "monitors"
+        assert result["examples"] >= 2
+        _graph_cache.clear()

@@ -88,6 +88,9 @@
         <a href="/upload" class="hover:text-gray-300 {% block nav_upload %}{% endblock %}">Upload</a>
         <a href="/merge" class="hover:text-gray-300 {% block nav_merge %}{% endblock %}">Merge</a>
         <a href="/query" class="hover:text-gray-300 {% block nav_query %}{% endblock %}">Query</a>
+        {% if graph_name is defined and graph_name %}
+        <a href="/graphs/{{ graph_name }}/proposals" class="hover:text-gray-300 {% block nav_proposals %}{% endblock %}">Proposals</a>
+        {% endif %}
         <button onclick="toggleTheme()" class="ml-2 p-1 hover:text-gray-300" title="Toggle light/dark mode">
           <svg id="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
                fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

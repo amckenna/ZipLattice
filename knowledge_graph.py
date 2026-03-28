@@ -3748,17 +3748,245 @@ class KnowledgeGraph:
         return False
 
     def accept_all_proposals(
-        self, min_confidence: float = 0.7, min_examples: int = 2
+        self,
+        min_confidence: float = 0.7,
+        min_examples: int = 2,
+        max_accept: int = 0,
     ) -> list[str]:
         """
         Bulk-accept proposals that meet confidence and example thresholds.
+
+        Args:
+            min_confidence: Minimum confidence threshold.
+            min_examples: Minimum number of supporting examples.
+            max_accept: Safety cap — accept at most this many (0 = unlimited).
+
         Returns list of accepted relation names.
         """
-        accepted = []
+        accepted: list[str] = []
         for p in self.get_proposals(min_confidence=min_confidence, min_examples=min_examples):
+            if max_accept and len(accepted) >= max_accept:
+                break
             if self.accept_proposal(p.name, review_note="auto-accepted by threshold"):
                 accepted.append(p.name)
         return accepted
+
+    def bulk_accept_proposals(
+        self,
+        names: list[str],
+        *,
+        review_note: str = "",
+        boost_edge_confidence: float = 0.7,
+    ) -> list[str]:
+        """
+        Accept multiple proposals at once, rebuilding NetworkX only once.
+
+        Returns list of names that were successfully accepted.
+        """
+        accepted: list[str] = []
+        for raw_name in names:
+            name = slugify(raw_name)
+            for proposal in self._proposals:
+                if proposal.name == name and proposal.status == ProposalStatus.PENDING.value:
+                    proposal.status = ProposalStatus.ACCEPTED.value
+                    proposal.reviewed_at = now_iso()
+                    proposal.review_note = review_note
+                    self.register_relation(name)
+                    if boost_edge_confidence > 0:
+                        for edge in self._data["edges"]:
+                            if (edge["relation"] == name
+                                    and edge.get("confidence", 1.0) < boost_edge_confidence):
+                                edge["confidence"] = boost_edge_confidence
+                                if self.auto_timestamp:
+                                    edge["updated"] = now_iso()
+                    accepted.append(name)
+                    break
+        if accepted:
+            self._rebuild_networkx()
+            self._dirty = True
+            logger.info("Bulk-accepted %d proposals: %s", len(accepted), accepted)
+        return accepted
+
+    def bulk_reject_proposals(
+        self,
+        names: list[str],
+        *,
+        review_note: str = "",
+    ) -> list[str]:
+        """
+        Reject multiple proposals at once.
+
+        Returns list of names that were successfully rejected.
+        """
+        rejected: list[str] = []
+        for raw_name in names:
+            name = slugify(raw_name)
+            for proposal in self._proposals:
+                if proposal.name == name and proposal.status == ProposalStatus.PENDING.value:
+                    proposal.status = ProposalStatus.REJECTED.value
+                    proposal.reviewed_at = now_iso()
+                    proposal.review_note = review_note
+                    rejected.append(name)
+                    break
+        if rejected:
+            self._dirty = True
+            logger.info("Bulk-rejected %d proposals: %s", len(rejected), rejected)
+        return rejected
+
+    def merge_proposals(
+        self,
+        names: list[str],
+        target_name: str,
+    ) -> "RelationProposal":
+        """
+        Merge multiple proposals into one. Combines all examples and
+        source docs, takes the highest confidence, and rejects the others.
+
+        Args:
+            names: Proposal names to merge (must include target_name or
+                   target_name may be new).
+            target_name: The surviving proposal name.
+
+        Returns the merged RelationProposal.
+
+        Raises ValueError if fewer than 2 proposals are found.
+        """
+        target_name = slugify(target_name)
+        slug_names = [slugify(n) for n in names]
+
+        # Gather matching proposals (any status)
+        sources: list[RelationProposal] = []
+        for p in self._proposals:
+            if p.name in slug_names:
+                sources.append(p)
+
+        if len(sources) < 2:
+            raise ValueError(
+                f"Need at least 2 proposals to merge, found {len(sources)}"
+            )
+
+        # Combine examples, source_docs, justifications
+        all_examples: list[dict[str, str]] = []
+        all_source_docs: list[str] = []
+        justifications: list[str] = []
+        best_confidence = 0.0
+
+        for p in sources:
+            all_examples.extend(p.examples)
+            for doc in p.source_docs:
+                if doc not in all_source_docs:
+                    all_source_docs.append(doc)
+            if p.justification:
+                justifications.append(p.justification)
+            best_confidence = max(best_confidence, p.confidence)
+
+        # Recalculate confidence from example count (same formula as add_example)
+        n = len(all_examples)
+        merged_confidence = max(best_confidence, min(0.95, 0.3 + 0.15 * n))
+
+        # Find or create the target proposal
+        target: RelationProposal | None = None
+        for p in self._proposals:
+            if p.name == target_name:
+                target = p
+                break
+
+        if target is None:
+            target = RelationProposal(
+                name=target_name,
+                justification="; ".join(justifications),
+                examples=all_examples,
+                source_docs=all_source_docs,
+                confidence=merged_confidence,
+                status=ProposalStatus.PENDING.value,
+            )
+            self._proposals.append(target)
+        else:
+            target.examples = all_examples
+            target.source_docs = all_source_docs
+            target.confidence = merged_confidence
+            if not target.justification:
+                target.justification = "; ".join(justifications)
+            target.status = ProposalStatus.PENDING.value
+            target.reviewed_at = None
+            target.review_note = ""
+
+        # Reject the other source proposals
+        for p in sources:
+            if p.name != target_name:
+                p.status = ProposalStatus.REJECTED.value
+                p.reviewed_at = now_iso()
+                p.review_note = f"merged into '{target_name}'"
+
+        self._dirty = True
+        logger.info(
+            "Merged %d proposals into '%s' (%d examples)",
+            len(sources), target_name, len(all_examples),
+        )
+        return target
+
+    @staticmethod
+    def _normalized_edit_distance(a: str, b: str) -> float:
+        """Compute normalized Levenshtein edit distance between two strings."""
+        if a == b:
+            return 0.0
+        la, lb = len(a), len(b)
+        if la == 0 or lb == 0:
+            return 1.0
+        # Standard DP Levenshtein
+        prev = list(range(lb + 1))
+        for i in range(1, la + 1):
+            curr = [i] + [0] * lb
+            for j in range(1, lb + 1):
+                cost = 0 if a[i - 1] == b[j - 1] else 1
+                curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+            prev = curr
+        return prev[lb] / max(la, lb)
+
+    def find_similar_proposals(
+        self,
+        threshold: float = 0.8,
+    ) -> list[list["RelationProposal"]]:
+        """
+        Group pending proposals by name similarity using normalized edit distance.
+
+        Args:
+            threshold: Similarity threshold in [0, 1]. A pair is considered
+                       similar when ``1 - edit_distance >= threshold``.
+
+        Returns list of groups (each group is a list of 2+ similar proposals).
+        """
+        pending = self.get_proposals(status=ProposalStatus.PENDING.value)
+        if len(pending) < 2:
+            return []
+
+        # Union-Find to group similar names
+        parent: dict[str, str] = {p.name: p.name for p in pending}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x: str, y: str) -> None:
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[rx] = ry
+
+        for i, p1 in enumerate(pending):
+            for p2 in pending[i + 1:]:
+                dist = self._normalized_edit_distance(p1.name, p2.name)
+                if 1.0 - dist >= threshold:
+                    union(p1.name, p2.name)
+
+        # Collect groups
+        groups: dict[str, list[RelationProposal]] = {}
+        for p in pending:
+            root = find(p.name)
+            groups.setdefault(root, []).append(p)
+
+        return [g for g in groups.values() if len(g) >= 2]
 
     def purge_rejected_proposals(self) -> int:
         """Remove all rejected proposals from the list. Returns count removed."""

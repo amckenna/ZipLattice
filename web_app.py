@@ -1747,6 +1747,126 @@ async def transplant_document(
     })
 
 
+# ---------------------------------------------------------------------------
+# Proposals management
+# ---------------------------------------------------------------------------
+
+
+@app.get("/graphs/{name}/proposals", response_class=HTMLResponse)
+async def proposals_page(request: Request, name: str) -> HTMLResponse:
+    """Dedicated proposals management page for a graph."""
+    try:
+        kg = _load_graph(name)
+    except Exception:
+        return HTMLResponse("Graph not found", status_code=404)
+
+    all_proposals = kg.get_proposals(status=None)
+    similar_groups = kg.find_similar_proposals()
+    return templates.TemplateResponse("proposals.html", {
+        "request": request,
+        "graph_name": name,
+        "proposals": [p.to_dict() for p in all_proposals],
+        "similar_groups": [
+            [p.to_dict() for p in group] for group in similar_groups
+        ],
+    })
+
+
+@app.get("/api/graphs/{name}/proposals")
+async def api_proposals(name: str) -> JSONResponse:
+    """Return all proposals as JSON."""
+    try:
+        kg = _load_graph(name)
+    except Exception:
+        return JSONResponse({"error": "Graph not found"}, status_code=404)
+    all_proposals = kg.get_proposals(status=None)
+    return JSONResponse(
+        [p.to_dict() for p in all_proposals],
+        media_type="application/json",
+    )
+
+
+@app.post("/graphs/{name}/proposals/bulk", response_class=HTMLResponse)
+async def bulk_proposals(
+    request: Request,
+    name: str,
+    action: str = Form(...),
+    names: list[str] = Form(...),
+    review_note: str = Form(""),
+) -> HTMLResponse:
+    """Bulk accept or reject proposals."""
+    try:
+        kg = _load_graph(name)
+    except Exception:
+        return HTMLResponse("Graph not found", status_code=404)
+
+    if action == "accept":
+        result = kg.bulk_accept_proposals(names, review_note=review_note)
+    elif action == "reject":
+        result = kg.bulk_reject_proposals(names, review_note=review_note)
+    elif action == "merge":
+        # For merge, the first name in the list is the target
+        if len(names) < 2:
+            return HTMLResponse("Need at least 2 proposals to merge", status_code=400)
+        target = names[0]
+        try:
+            kg.merge_proposals(names, target_name=target)
+            result = names
+        except ValueError as exc:
+            return HTMLResponse(str(exc), status_code=400)
+    else:
+        return HTMLResponse(f"Unknown action: {action}", status_code=400)
+
+    kg.save()
+
+    # Re-render the full proposals page
+    all_proposals = kg.get_proposals(status=None)
+    similar_groups = kg.find_similar_proposals()
+    return templates.TemplateResponse("proposals.html", {
+        "request": request,
+        "graph_name": name,
+        "proposals": [p.to_dict() for p in all_proposals],
+        "similar_groups": [
+            [p.to_dict() for p in group] for group in similar_groups
+        ],
+        "flash": f"{action.title()}ed {len(result)} proposal(s)",
+    })
+
+
+@app.post("/graphs/{name}/proposals/auto-accept", response_class=HTMLResponse)
+async def auto_accept_proposals(
+    request: Request,
+    name: str,
+    min_confidence: float = Form(0.7),
+    min_examples: int = Form(2),
+    max_accept: int = Form(0),
+) -> HTMLResponse:
+    """Auto-accept proposals meeting thresholds."""
+    try:
+        kg = _load_graph(name)
+    except Exception:
+        return HTMLResponse("Graph not found", status_code=404)
+
+    accepted = kg.accept_all_proposals(
+        min_confidence=min_confidence,
+        min_examples=min_examples,
+        max_accept=max_accept,
+    )
+    kg.save()
+
+    all_proposals = kg.get_proposals(status=None)
+    similar_groups = kg.find_similar_proposals()
+    return templates.TemplateResponse("proposals.html", {
+        "request": request,
+        "graph_name": name,
+        "proposals": [p.to_dict() for p in all_proposals],
+        "similar_groups": [
+            [p.to_dict() for p in group] for group in similar_groups
+        ],
+        "flash": f"Auto-accepted {len(accepted)} proposal(s)",
+    })
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Health check endpoint."""

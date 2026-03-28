@@ -2238,3 +2238,149 @@ def test_search_bm25_requires_string(tmp_path):
     kg = _make_search_graph(tmp_path)
     with pytest.raises(ValueError, match="text query"):
         kg.search([1.0, 0.0], mode="bm25")
+
+
+# ---------------------------------------------------------------------------
+# Bulk Proposal Management (Item 9)
+# ---------------------------------------------------------------------------
+
+
+def _make_proposals_graph(tmp_path):
+    """Helper: create a graph with several proposals."""
+    kg = KnowledgeGraph(tmp_path / "proposals.json")
+    kg.propose_relation("validates", justification="X validates Y",
+                        source_entity="a", target_entity="b")
+    kg.propose_relation("monitors", justification="A monitors B",
+                        source_entity="c", target_entity="d")
+    kg.propose_relation("triggers", justification="X triggers Y",
+                        source_entity="e", target_entity="f")
+    # Add extra examples to boost confidence
+    kg.propose_relation("validates", source_entity="g", target_entity="h")
+    kg.propose_relation("validates", source_entity="i", target_entity="j")
+    return kg
+
+
+def test_bulk_accept_proposals(tmp_path):
+    """bulk_accept_proposals accepts multiple at once."""
+    kg = _make_proposals_graph(tmp_path)
+    accepted = kg.bulk_accept_proposals(["validates", "monitors"])
+    assert set(accepted) == {"validates", "monitors"}
+    assert "validates" in kg._custom_relations
+    assert "monitors" in kg._custom_relations
+    # Only triggers should remain pending
+    pending = kg.get_proposals()
+    assert len(pending) == 1
+    assert pending[0].name == "triggers"
+
+
+def test_bulk_accept_with_review_note(tmp_path):
+    """bulk_accept_proposals sets review_note on accepted proposals."""
+    kg = _make_proposals_graph(tmp_path)
+    kg.bulk_accept_proposals(["validates"], review_note="looks good")
+    p = [p for p in kg._proposals if p.name == "validates"][0]
+    assert p.review_note == "looks good"
+    assert p.status == "accepted"
+
+
+def test_bulk_accept_nonexistent(tmp_path):
+    """bulk_accept_proposals skips names that don't exist."""
+    kg = _make_proposals_graph(tmp_path)
+    accepted = kg.bulk_accept_proposals(["validates", "nonexistent"])
+    assert accepted == ["validates"]
+
+
+def test_bulk_reject_proposals(tmp_path):
+    """bulk_reject_proposals rejects multiple at once."""
+    kg = _make_proposals_graph(tmp_path)
+    rejected = kg.bulk_reject_proposals(["validates", "triggers"])
+    assert set(rejected) == {"validates", "triggers"}
+    pending = kg.get_proposals()
+    assert len(pending) == 1
+    assert pending[0].name == "monitors"
+
+
+def test_bulk_reject_nonexistent(tmp_path):
+    """bulk_reject_proposals skips names that don't exist."""
+    kg = _make_proposals_graph(tmp_path)
+    rejected = kg.bulk_reject_proposals(["nonexistent"])
+    assert rejected == []
+
+
+def test_accept_all_max_accept(tmp_path):
+    """accept_all_proposals respects max_accept safety cap."""
+    kg = _make_proposals_graph(tmp_path)
+    # All three are pending; validates has 3 examples so high confidence
+    accepted = kg.accept_all_proposals(min_confidence=0.0, min_examples=0, max_accept=2)
+    assert len(accepted) == 2
+
+
+def test_merge_proposals(tmp_path):
+    """merge_proposals combines examples and rejects others."""
+    kg = _make_proposals_graph(tmp_path)
+    # Add a similar proposal
+    kg.propose_relation("validating", justification="same as validates",
+                        source_entity="k", target_entity="l")
+
+    merged = kg.merge_proposals(["validates", "validating"], target_name="validates")
+    assert merged.name == "validates"
+    # Should have examples from both
+    assert len(merged.examples) >= 4  # 3 from validates + 1 from validating
+    assert merged.status == "pending"
+
+    # The other proposal should be rejected
+    validating = [p for p in kg._proposals if p.name == "validating"][0]
+    assert validating.status == "rejected"
+    assert "merged into" in validating.review_note
+
+
+def test_merge_proposals_too_few(tmp_path):
+    """merge_proposals raises ValueError with fewer than 2 proposals."""
+    kg = _make_proposals_graph(tmp_path)
+    with pytest.raises(ValueError, match="at least 2"):
+        kg.merge_proposals(["validates"], target_name="validates")
+
+
+def test_merge_proposals_new_target(tmp_path):
+    """merge_proposals can create a new target proposal."""
+    kg = _make_proposals_graph(tmp_path)
+    merged = kg.merge_proposals(
+        ["validates", "monitors"], target_name="checks"
+    )
+    assert merged.name == "checks"
+    assert merged.status == "pending"
+    # Both originals should be rejected
+    for p in kg._proposals:
+        if p.name in ("validates", "monitors"):
+            assert p.status == "rejected"
+
+
+def test_find_similar_proposals(tmp_path):
+    """find_similar_proposals groups proposals with similar names."""
+    kg = KnowledgeGraph(tmp_path / "sim.json")
+    kg.propose_relation("related-to", source_entity="a", target_entity="b")
+    kg.propose_relation("relates-to", source_entity="c", target_entity="d")
+    kg.propose_relation("something-else", source_entity="e", target_entity="f")
+
+    groups = kg.find_similar_proposals(threshold=0.7)
+    assert len(groups) >= 1
+    # related-to and relates-to should be in the same group
+    group_names = [frozenset(p.name for p in g) for g in groups]
+    assert any({"related-to", "relates-to"}.issubset(names) for names in group_names)
+
+
+def test_find_similar_proposals_none(tmp_path):
+    """find_similar_proposals returns empty when names are very different."""
+    kg = KnowledgeGraph(tmp_path / "nosim.json")
+    kg.propose_relation("abcdefgh", source_entity="a", target_entity="b")
+    kg.propose_relation("xyz", source_entity="c", target_entity="d")
+    groups = kg.find_similar_proposals(threshold=0.9)
+    assert groups == []
+
+
+def test_normalized_edit_distance():
+    """Static method _normalized_edit_distance works correctly."""
+    assert KnowledgeGraph._normalized_edit_distance("abc", "abc") == 0.0
+    assert KnowledgeGraph._normalized_edit_distance("", "abc") == 1.0
+    assert KnowledgeGraph._normalized_edit_distance("abc", "") == 1.0
+    dist = KnowledgeGraph._normalized_edit_distance("kitten", "sitting")
+    assert 0.0 < dist < 1.0

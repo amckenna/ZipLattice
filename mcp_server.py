@@ -551,6 +551,80 @@ def reject_proposal(
     return _json({"rejected": rejected, "relation": name})
 
 
+@mcp.tool()
+def bulk_manage_proposals(
+    graph_path: str,
+    action: str,
+    names: list[str],
+    review_note: str = "",
+    auto_save: bool = True,
+) -> str:
+    """Accept or reject multiple proposals at once.
+
+    For merging, pass action="merge" and the first name in the list
+    will be the target that survives.
+
+    Args:
+        graph_path: Path to the knowledge graph JSON file.
+        action: One of "accept", "reject", or "merge".
+        names: List of proposal names to act on.
+        review_note: Optional review note (for accept/reject).
+        auto_save: Save after changes (default True).
+    """
+    kg = _get_graph(graph_path)
+    if action == "accept":
+        result = kg.bulk_accept_proposals(names, review_note=review_note)
+    elif action == "reject":
+        result = kg.bulk_reject_proposals(names, review_note=review_note)
+    elif action == "merge":
+        if len(names) < 2:
+            return _json({"error": "Need at least 2 proposals to merge"})
+        target = names[0]
+        merged = kg.merge_proposals(names, target_name=target)
+        if auto_save:
+            kg.save()
+        return _json({
+            "action": "merge",
+            "target": target,
+            "merged_names": names,
+            "examples": len(merged.examples),
+            "confidence": merged.confidence,
+        })
+    else:
+        return _json({"error": f"Unknown action: {action}"})
+    if auto_save and result:
+        kg.save()
+    return _json({"action": action, "processed": result, "count": len(result)})
+
+
+@mcp.tool()
+def auto_accept_proposals(
+    graph_path: str,
+    min_confidence: float = 0.7,
+    min_examples: int = 2,
+    max_accept: int = 0,
+    auto_save: bool = True,
+) -> str:
+    """Auto-accept proposals that meet confidence and example thresholds.
+
+    Args:
+        graph_path: Path to the knowledge graph JSON file.
+        min_confidence: Minimum confidence score (0-1).
+        min_examples: Minimum number of supporting examples.
+        max_accept: Safety cap on number to accept (0 = unlimited).
+        auto_save: Save after acceptance (default True).
+    """
+    kg = _get_graph(graph_path)
+    accepted = kg.accept_all_proposals(
+        min_confidence=min_confidence,
+        min_examples=min_examples,
+        max_accept=max_accept,
+    )
+    if auto_save and accepted:
+        kg.save()
+    return _json({"accepted": accepted, "count": len(accepted)})
+
+
 # =========================================================================
 # Embedding tools (still uses ollama backend)
 # =========================================================================

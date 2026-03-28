@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+
+{% block title %}Proposals — {{ graph_name }} — ZipLattice{% endblock %}
+{% block nav_proposals %}font-bold text-white{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+  <a href="/graphs/{{ graph_name }}" class="text-sm text-gray-400 hover:text-gray-200">&larr; Back to {{ graph_name }}</a>
+</div>
+
+<h1 class="text-2xl font-bold mb-6">Proposals: {{ graph_name }}</h1>
+
+{% if flash is defined and flash %}
+<div class="border border-green-700 bg-green-900/30 text-green-300 px-4 py-2 mb-4 text-sm">
+  {{ flash }}
+</div>
+{% endif %}
+
+{% set pending = proposals | selectattr("status", "equalto", "pending") | list %}
+{% set accepted = proposals | selectattr("status", "equalto", "accepted") | list %}
+{% set rejected = proposals | selectattr("status", "equalto", "rejected") | list %}
+
+<!-- Summary stats -->
+<div class="grid grid-cols-4 gap-4 mb-6 text-sm">
+  <div class="border border-gray-800 p-4">
+    <div class="text-gray-400 text-xs">Total</div>
+    <div class="text-xl font-bold">{{ proposals | length }}</div>
+  </div>
+  <div class="border border-gray-800 p-4">
+    <div class="text-gray-400 text-xs">Pending</div>
+    <div class="text-xl font-bold text-yellow-400">{{ pending | length }}</div>
+  </div>
+  <div class="border border-gray-800 p-4">
+    <div class="text-gray-400 text-xs">Accepted</div>
+    <div class="text-xl font-bold text-green-400">{{ accepted | length }}</div>
+  </div>
+  <div class="border border-gray-800 p-4">
+    <div class="text-gray-400 text-xs">Rejected</div>
+    <div class="text-xl font-bold text-red-400">{{ rejected | length }}</div>
+  </div>
+</div>
+
+<!-- Auto-accept form -->
+<div class="border border-gray-800 p-4 mb-6">
+  <h2 class="text-lg font-bold mb-3">Auto-Accept by Threshold</h2>
+  <form method="POST" action="/graphs/{{ graph_name }}/proposals/auto-accept" class="flex items-end gap-4 flex-wrap">
+    <div>
+      <label class="block text-xs text-gray-400 mb-1">Min Confidence</label>
+      <input type="range" name="min_confidence" min="0" max="1" step="0.05" value="0.7"
+             class="w-40" oninput="this.nextElementSibling.textContent = this.value">
+      <span class="text-sm ml-2">0.7</span>
+    </div>
+    <div>
+      <label class="block text-xs text-gray-400 mb-1">Min Examples</label>
+      <input type="number" name="min_examples" value="2" min="1" max="100"
+             class="bg-black border border-gray-700 px-2 py-1 w-20 text-sm">
+    </div>
+    <div>
+      <label class="block text-xs text-gray-400 mb-1">Max Accept (0 = all)</label>
+      <input type="number" name="max_accept" value="0" min="0"
+             class="bg-black border border-gray-700 px-2 py-1 w-20 text-sm">
+    </div>
+    <button type="submit"
+            class="bg-green-800 hover:bg-green-700 text-white px-4 py-1 text-sm border border-green-600">
+      Auto-Accept
+    </button>
+  </form>
+</div>
+
+<!-- Similar proposal groups -->
+{% if similar_groups %}
+<div class="border border-gray-800 p-4 mb-6">
+  <h2 class="text-lg font-bold mb-3">Similar Proposals</h2>
+  <p class="text-xs text-gray-400 mb-3">These pending proposals have similar names and may be candidates for merging.</p>
+  {% for group in similar_groups %}
+  <div class="border border-gray-700 p-3 mb-3">
+    <div class="text-sm mb-2">
+      Group: {% for p in group %}<code class="bg-gray-800 px-1 mx-1">{{ p.name }}</code>{% endfor %}
+    </div>
+    <form method="POST" action="/graphs/{{ graph_name }}/proposals/bulk" class="flex items-center gap-2">
+      <input type="hidden" name="action" value="merge">
+      {% for p in group %}
+      <input type="hidden" name="names" value="{{ p.name }}">
+      {% endfor %}
+      <span class="text-xs text-gray-400">Merge into first:</span>
+      <button type="submit"
+              class="bg-blue-800 hover:bg-blue-700 text-white px-3 py-1 text-xs border border-blue-600">
+        Merge into "{{ group[0].name }}"
+      </button>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<!-- Bulk action form wrapping the proposals table -->
+<form id="bulk-form" method="POST" action="/graphs/{{ graph_name }}/proposals/bulk">
+  <input type="hidden" name="action" id="bulk-action" value="">
+  <input type="hidden" name="review_note" id="bulk-review-note" value="">
+
+  <!-- Bulk action bar -->
+  <div class="flex items-center gap-3 mb-3">
+    <button type="button" onclick="bulkAction('accept')"
+            class="bg-green-800 hover:bg-green-700 text-white px-3 py-1 text-sm border border-green-600 disabled:opacity-50"
+            id="btn-accept" disabled>
+      Accept Selected
+    </button>
+    <button type="button" onclick="bulkAction('reject')"
+            class="bg-red-800 hover:bg-red-700 text-white px-3 py-1 text-sm border border-red-600 disabled:opacity-50"
+            id="btn-reject" disabled>
+      Reject Selected
+    </button>
+    <span class="text-xs text-gray-400" id="selected-count">0 selected</span>
+  </div>
+
+  <!-- Proposals table -->
+  <div class="border border-gray-800">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-gray-800 text-left text-xs text-gray-400">
+          <th class="p-2 w-8"><input type="checkbox" id="select-all" onchange="toggleAll(this)"></th>
+          <th class="p-2">Name</th>
+          <th class="p-2">Status</th>
+          <th class="p-2">Confidence</th>
+          <th class="p-2">Examples</th>
+          <th class="p-2">Source Docs</th>
+          <th class="p-2">Justification</th>
+          <th class="p-2">Proposed</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in proposals %}
+        <tr class="border-b border-gray-800 hover:bg-gray-900/50">
+          <td class="p-2">
+            {% if p.status == "pending" %}
+            <input type="checkbox" name="names" value="{{ p.name }}" class="proposal-cb" onchange="updateCount()">
+            {% endif %}
+          </td>
+          <td class="p-2 font-mono">{{ p.name }}</td>
+          <td class="p-2">
+            {% if p.status == "pending" %}
+            <span class="text-yellow-400 text-xs border border-yellow-700 px-1">pending</span>
+            {% elif p.status == "accepted" %}
+            <span class="text-green-400 text-xs border border-green-700 px-1">accepted</span>
+            {% elif p.status == "rejected" %}
+            <span class="text-red-400 text-xs border border-red-700 px-1">rejected</span>
+            {% endif %}
+          </td>
+          <td class="p-2">{{ "%.2f"|format(p.confidence) }}</td>
+          <td class="p-2">{{ p.examples | length }}</td>
+          <td class="p-2 text-xs text-gray-400">{{ p.source_docs | join(", ") if p.source_docs else "—" }}</td>
+          <td class="p-2 text-xs text-gray-400 max-w-xs truncate" title="{{ p.justification }}">{{ p.justification or "—" }}</td>
+          <td class="p-2 text-xs text-gray-400">{{ p.proposed_at[:10] if p.proposed_at else "—" }}</td>
+        </tr>
+        {% endfor %}
+        {% if not proposals %}
+        <tr><td colspan="8" class="p-4 text-center text-gray-500">No proposals found.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</form>
+
+<script>
+function toggleAll(master) {
+  document.querySelectorAll('.proposal-cb').forEach(cb => { cb.checked = master.checked; });
+  updateCount();
+}
+
+function updateCount() {
+  const checked = document.querySelectorAll('.proposal-cb:checked').length;
+  document.getElementById('selected-count').textContent = checked + ' selected';
+  document.getElementById('btn-accept').disabled = checked === 0;
+  document.getElementById('btn-reject').disabled = checked === 0;
+}
+
+function bulkAction(action) {
+  document.getElementById('bulk-action').value = action;
+  document.getElementById('bulk-form').submit();
+}
+</script>
+{% endblock %}

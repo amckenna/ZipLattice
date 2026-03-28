@@ -904,3 +904,84 @@ def test_diff_page_missing_against_graph():
     resp = client.get("/graphs/diff-ok/diff?against=nonexistent")
     assert resp.status_code == 200
     assert "not found" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Proposals management (Item 9)
+# ---------------------------------------------------------------------------
+
+
+def _create_graph_with_proposals(name: str) -> None:
+    """Create a graph with some relation proposals."""
+    graph_dir = GRAPHS_DIR / name
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    kg = KnowledgeGraph(graph_dir / f"{name}.json")
+    kg.propose_relation("validates", justification="X validates Y",
+                        source_entity="a", target_entity="b")
+    kg.propose_relation("monitors", justification="A monitors B",
+                        source_entity="c", target_entity="d")
+    kg.propose_relation("validates", source_entity="e", target_entity="f")
+    kg.propose_relation("validates", source_entity="g", target_entity="h")
+    kg.save()
+
+
+def test_proposals_page():
+    """GET /graphs/{name}/proposals returns the proposals page."""
+    _create_graph_with_proposals("prop-test")
+    resp = client.get("/graphs/prop-test/proposals")
+    assert resp.status_code == 200
+    assert "validates" in resp.text
+    assert "monitors" in resp.text
+
+
+def test_proposals_page_not_found():
+    """GET /graphs/{name}/proposals returns 404 for nonexistent graph."""
+    resp = client.get("/graphs/nonexistent/proposals")
+    assert resp.status_code == 404
+
+
+def test_api_proposals():
+    """GET /api/graphs/{name}/proposals returns JSON."""
+    _create_graph_with_proposals("prop-api")
+    resp = client.get("/api/graphs/prop-api/proposals")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert isinstance(data, list)
+    names = [p["name"] for p in data]
+    assert "validates" in names
+    assert "monitors" in names
+
+
+def test_bulk_accept_proposals():
+    """POST /graphs/{name}/proposals/bulk with action=accept."""
+    _create_graph_with_proposals("prop-bulk-accept")
+    resp = client.post("/graphs/prop-bulk-accept/proposals/bulk", data={
+        "action": "accept",
+        "names": ["validates"],
+        "review_note": "test accept",
+    })
+    assert resp.status_code == 200
+    assert "Accept" in resp.text or "accepted" in resp.text.lower()
+
+
+def test_bulk_reject_proposals():
+    """POST /graphs/{name}/proposals/bulk with action=reject."""
+    _create_graph_with_proposals("prop-bulk-reject")
+    resp = client.post("/graphs/prop-bulk-reject/proposals/bulk", data={
+        "action": "reject",
+        "names": ["monitors"],
+        "review_note": "not useful",
+    })
+    assert resp.status_code == 200
+
+
+def test_auto_accept_proposals():
+    """POST /graphs/{name}/proposals/auto-accept."""
+    _create_graph_with_proposals("prop-auto")
+    resp = client.post("/graphs/prop-auto/proposals/auto-accept", data={
+        "min_confidence": "0.0",
+        "min_examples": "1",
+        "max_accept": "0",
+    })
+    assert resp.status_code == 200
+    assert "Auto-accepted" in resp.text or "auto-accept" in resp.text.lower()

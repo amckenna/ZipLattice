@@ -247,22 +247,22 @@ Each item follows the pattern: **core method -> CLI flag -> web endpoint -> temp
 
 ### Checklist
 
-- [ ] **9a.** Add `bulk_accept_proposals(names, review_note="") -> list[str]`
-- [ ] **9b.** Add `bulk_reject_proposals(names, review_note="") -> list[str]`
-- [ ] **9c.** Extend `accept_all_proposals()` with `max_accept: int` safety parameter
-- [ ] **9d.** Add `merge_proposals(names, target_name) -> RelationProposal` -- combine examples/docs, reject others
-- [ ] **9e.** Add `find_similar_proposals(threshold=0.8) -> list[list[RelationProposal]]` -- group by edit distance
-- [ ] **9f.** Add `GET /graphs/{name}/proposals` returning all proposals as JSON
-- [ ] **9g.** Add `POST /graphs/{name}/proposals/bulk` accepting `{action, names, review_note}`
-- [ ] **9h.** Add `POST /graphs/{name}/proposals/auto-accept` accepting `{min_confidence, min_examples}`
-- [ ] **9i.** Create `templates/proposals.html`:
+- [x] **9a.** Add `bulk_accept_proposals(names, review_note="") -> list[str]`
+- [x] **9b.** Add `bulk_reject_proposals(names, review_note="") -> list[str]`
+- [x] **9c.** Extend `accept_all_proposals()` with `max_accept: int` safety parameter
+- [x] **9d.** Add `merge_proposals(names, target_name) -> RelationProposal` -- combine examples/docs, reject others
+- [x] **9e.** Add `find_similar_proposals(threshold=0.8) -> list[list[RelationProposal]]` -- group by edit distance
+- [x] **9f.** Add `GET /graphs/{name}/proposals` returning all proposals as JSON
+- [x] **9g.** Add `POST /graphs/{name}/proposals/bulk` accepting `{action, names, review_note}`
+- [x] **9h.** Add `POST /graphs/{name}/proposals/auto-accept` accepting `{min_confidence, min_examples}`
+- [x] **9i.** Create `templates/proposals.html`:
   - Table with status badges, confidence, example count, source docs
   - Checkboxes + bulk action bar (Accept/Reject Selected)
   - Auto-accept form (confidence slider, min examples)
   - Similar proposal groups with "Merge" button
-- [ ] **9j.** Add "Proposals" link to navigation in `base.html`
-- [ ] **9k.** Add MCP tools: `bulk_manage_proposals`, `auto_accept_proposals`
-- [ ] **9l.** Tests: bulk accept/reject, merge, auto-accept threshold, similar detection
+- [x] **9j.** Add "Proposals" link to navigation in `base.html`
+- [x] **9k.** Add MCP tools: `bulk_manage_proposals`, `auto_accept_proposals`
+- [x] **9l.** Tests: bulk accept/reject, merge, auto-accept threshold, similar detection
 
 ### Design Decisions
 
