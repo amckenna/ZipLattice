@@ -350,6 +350,18 @@ def test_ollama_chat_payload_format():
     assert body["model"] == "llama2"
     assert body["messages"] == [{"role": "user", "content": "test prompt"}]
     assert body["stream"] is False
+    assert "chat_template_kwargs" not in body
+
+
+def test_ollama_chat_no_think():
+    """Verify no_think=True adds chat_template_kwargs to payload."""
+    mock_resp = _mock_urlopen_response(_openai_chat_response("ok"))
+    with patch("query_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        ollama_chat("test prompt", model="llama2", url="http://localhost:11434", no_think=True)
+
+    req = mock_urlopen.call_args[0][0]
+    body = json.loads(req.data)
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_ollama_chat_trailing_slash():
@@ -1071,6 +1083,18 @@ def test_local_extract_payload_format():
     assert body["messages"][1] == {"role": "user", "content": "some text"}
     assert body["temperature"] == 0.1
     assert body["stream"] is False
+    assert "chat_template_kwargs" not in body
+
+
+def test_local_extract_no_think():
+    """Verify no_think=True adds chat_template_kwargs to payload."""
+    mock_resp = _mock_urlopen_response(_openai_chat_response("[]"))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        local_extract("some text", model="qwen3:30b", url="http://localhost:11434", no_think=True)
+
+    req = mock_urlopen.call_args[0][0]
+    body = json.loads(req.data)
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_local_extract_http_error():

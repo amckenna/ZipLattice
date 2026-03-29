@@ -326,11 +326,34 @@ def test_build_extract_fn_anthropic():
     assert callable(fn)
 
 
+def test_build_extract_fn_local_no_think():
+    """_build_extract_fn passes no_think to local provider partial."""
+    from web_app import _build_extract_fn
+    fn = _build_extract_fn("local", "test-model", "http://localhost:11434", no_think=True)
+    assert callable(fn)
+    assert fn.keywords.get("no_think") is True
+
+
+def test_build_extract_fn_local_no_think_default():
+    """_build_extract_fn defaults no_think to False."""
+    from web_app import _build_extract_fn
+    fn = _build_extract_fn("local", "test-model", "http://localhost:11434")
+    assert fn.keywords.get("no_think", False) is False
+
+
 def test_build_llm_fn_local():
     """_build_llm_fn returns a callable for local provider."""
     from web_app import _build_llm_fn
     fn = _build_llm_fn("local", "test-model", "http://localhost:11434")
     assert callable(fn)
+
+
+def test_build_llm_fn_local_no_think():
+    """_build_llm_fn passes no_think to local provider partial."""
+    from web_app import _build_llm_fn
+    fn = _build_llm_fn("local", "test-model", "http://localhost:11434", no_think=True)
+    assert callable(fn)
+    assert fn.keywords.get("no_think") is True
 
 
 def test_build_llm_fn_anthropic():

@@ -235,6 +235,14 @@
           </div>
           <p class="text-xs text-gray-600 col-span-2">Uses named profiles from ~/.aws/credentials. Leave AWS Profile blank for the default credential chain (env vars, default profile, IAM role).</p>
         </div>
+
+        <!-- No-think mode (local provider only) -->
+        <div class="flex items-center gap-2 pt-2" id="query-no-think-section">
+          <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
+            <input type="checkbox" name="no_think" value="1" class="accent-white"> Disable thinking mode
+          </label>
+          <span class="text-xs text-gray-600">Local only. Skips chain-of-thought for Qwen3, DeepSeek-R1, etc.</span>
+        </div>
       </div>
     </details>
 

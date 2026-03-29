@@ -212,6 +212,7 @@ def _build_extract_fn(
     bedrock_profile: str = "",
     temperature: float = 0.1,
     thinking_budget: int = 0,
+    no_think: bool = False,
 ) -> ExtractFn:
     """Build an extraction callable for the given provider."""
     cfg = _ProviderConfig(provider, model, api_url,
@@ -224,7 +225,7 @@ def _build_extract_fn(
         return partial(bedrock_extract, model=cfg.model, region=cfg.region, profile=cfg.profile,
                        temperature=temperature)
     return partial(local_extract, model=cfg.model, url=cfg.api_url,
-                   temperature=temperature)
+                   temperature=temperature, no_think=no_think)
 
 
 def _build_llm_fn(
@@ -234,6 +235,7 @@ def _build_llm_fn(
     *,
     bedrock_region: str = "",
     bedrock_profile: str = "",
+    no_think: bool = False,
 ) -> ChatFn:
     """Build a chat callable for the given provider (used by 'ask' mode)."""
     cfg = _ProviderConfig(provider, model, api_url,
@@ -243,7 +245,7 @@ def _build_llm_fn(
         return partial(claude_chat, model=cfg.model, api_key=api_key)
     if cfg.provider == "bedrock":
         return partial(bedrock_chat, model=cfg.model, region=cfg.region, profile=cfg.profile)
-    return partial(ollama_chat, model=cfg.model, url=cfg.api_url)
+    return partial(ollama_chat, model=cfg.model, url=cfg.api_url, no_think=no_think)
 
 
 def _chat_multi_turn(
@@ -254,6 +256,7 @@ def _chat_multi_turn(
     api_url: str = "",
     bedrock_region: str = "",
     bedrock_profile: str = "",
+    no_think: bool = False,
 ) -> str:
     """Call a chat completions endpoint with full conversation history.
 
@@ -327,9 +330,12 @@ def _chat_multi_turn(
     # Default: local (OpenAI-compatible)
     import urllib.request
     endpoint = f"{api_url.rstrip('/')}/v1/chat/completions"
-    payload = json.dumps({
+    body_local: dict[str, Any] = {
         "model": model, "messages": messages, "stream": False,
-    }).encode()
+    }
+    if no_think:
+        body_local["chat_template_kwargs"] = {"enable_thinking": False}
+    payload = json.dumps(body_local).encode()
     req = urllib.request.Request(
         endpoint, data=payload,
         headers={"Content-Type": "application/json"},
@@ -840,10 +846,12 @@ async def ingest_documents(
     incremental: str = Form(""),
     temperature: str = Form("0.1"),
     thinking_budget: str = Form("0"),
+    no_think: str = Form(""),
 ) -> Response:
     """Run LLM ingestion with streaming progress log."""
     _verbose = verbose.strip() == "1"
     _incremental = incremental.strip() == "1"
+    _no_think = no_think.strip() == "1"
     try:
         _parallel = max(1, int(parallel.strip() or "1"))
     except (ValueError, TypeError):
@@ -857,10 +865,10 @@ async def ingest_documents(
     except (ValueError, TypeError):
         _thinking_budget = 0
     logger.info(
-        "POST /ingest graph=%s batch=%s provider=%s model=%s embed=%s verbose=%s parallel=%d temp=%.2f thinking=%d",
+        "POST /ingest graph=%s batch=%s provider=%s model=%s embed=%s verbose=%s parallel=%d temp=%.2f thinking=%d no_think=%s",
         graph_name, batch_id, provider,
         extract_model.strip() or query_model, embed_model, _verbose, _parallel,
-        _temperature, _thinking_budget,
+        _temperature, _thinking_budget, _no_think,
     )
 
     batch_entry = _upload_batches.pop(batch_id, None)
@@ -909,7 +917,8 @@ async def ingest_documents(
                                        bedrock_region=bedrock_region,
                                        bedrock_profile=bedrock_profile,
                                        temperature=_temperature,
-                                       thinking_budget=_thinking_budget)
+                                       thinking_budget=_thinking_budget,
+                                       no_think=_no_think)
         results = []
         total_docs = len(batch)
         graph_stats_before = kg.stats()
@@ -1150,11 +1159,13 @@ async def run_query(
     provider: str = Form("local"),
     bedrock_region: str = Form(""),
     bedrock_profile: str = Form(""),
+    no_think: str = Form(""),
 ) -> HTMLResponse:
     """Execute a query against a knowledge graph."""
+    _no_think = no_think.strip() == "1"
     logger.info(
-        "POST /query graph=%s mode=%s response_mode=%s provider=%s model=%s query=%r",
-        graph_name, mode, response_mode, provider, query_model, query[:80],
+        "POST /query graph=%s mode=%s response_mode=%s provider=%s model=%s no_think=%s query=%r",
+        graph_name, mode, response_mode, provider, query_model, _no_think, query[:80],
     )
     try:
         kg = _load_graph(graph_name)
@@ -1195,7 +1206,8 @@ async def run_query(
         elif mode == "ask":
             llm_fn = _build_llm_fn(provider, query_model, api_url,
                                    bedrock_region=bedrock_region,
-                                   bedrock_profile=bedrock_profile)
+                                   bedrock_profile=bedrock_profile,
+                                   no_think=_no_think)
             answer = ask(kg, query, embed_fn, llm_fn,
                          search_mode=search_mode, alpha=alpha)
 
@@ -1223,6 +1235,7 @@ async def run_query(
                         "api_url": api_url,
                         "bedrock_region": bedrock_region,
                         "bedrock_profile": bedrock_profile,
+                        "no_think": _no_think,
                     },
                     "created_at": time.time(),
                 }
@@ -1289,12 +1302,14 @@ async def chat_follow_up(
     api_url = cfg["api_url"]
     bedrock_region = cfg.get("bedrock_region", "")
     bedrock_profile = cfg.get("bedrock_profile", "")
+    _no_think = cfg.get("no_think", False)
 
     try:
         answer = _chat_multi_turn(
             session["messages"],
             provider=provider, model=model, api_url=api_url,
             bedrock_region=bedrock_region, bedrock_profile=bedrock_profile,
+            no_think=_no_think,
         )
     except Exception as exc:
         # Remove the failed user message so they can retry

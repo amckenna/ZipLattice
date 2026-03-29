@@ -273,19 +273,30 @@ def ask(
 # ---------------------------------------------------------------------------
 
 
-def ollama_chat(prompt: str, *, model: str, url: str) -> str:
+def ollama_chat(prompt: str, *, model: str, url: str, no_think: bool = False) -> str:
     """Call an OpenAI-compatible ``/v1/chat/completions`` endpoint.
 
     Works with Ollama (>=0.1.14), llama.cpp, vLLM, LocalAI, and any
     other server that implements the OpenAI chat completions API.
+
+    Args:
+        prompt: The user prompt.
+        model: Model name.
+        url: Server base URL.
+        no_think: When True, disable thinking/reasoning mode for models
+            that support it (e.g. Qwen3, DeepSeek-R1) by passing
+            ``chat_template_kwargs: {"enable_thinking": false}``.
     """
     endpoint = f"{url.rstrip('/')}/v1/chat/completions"
     logger.debug("ollama_chat: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
-    payload = json.dumps({
+    body: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-    }).encode()
+    }
+    if no_think:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         endpoint,
         data=payload,
@@ -429,6 +440,11 @@ def main() -> None:
                         help="Filter by node type(s)")
     shared.add_argument("--json", action="store_true", dest="json_output",
                         help="Output as JSON instead of formatted text")
+    shared.add_argument("--no-think", action="store_true", dest="no_think",
+                        help="Disable thinking/reasoning mode for models that support it "
+                             "(e.g. Qwen3, DeepSeek-R1). Sends chat_template_kwargs with "
+                             "enable_thinking=false to the server. Only effective with "
+                             "--provider local. Saves tokens and inference time.")
     shared.add_argument("-v", "--verbose", action="store_true",
                         help="Show detailed debug info")
     shared.add_argument("-q", "--quiet", action="store_true",
@@ -595,9 +611,10 @@ def main() -> None:
                 return bedrock_chat(prompt, model=chat_model, region=_br_region, profile=_br_profile)
         else:
             chat_url = args.ollama_url.rstrip("/")
+            _no_think = args.no_think
 
             def llm_fn(prompt: str) -> str:
-                return ollama_chat(prompt, model=chat_model, url=chat_url)
+                return ollama_chat(prompt, model=chat_model, url=chat_url, no_think=_no_think)
 
         answer = ask(kg, args.question, embed_fn, llm_fn, max_nodes=args.top_k,
                      search_mode=args.search_mode, alpha=args.alpha)

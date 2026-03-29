@@ -207,6 +207,7 @@ def local_extract(
     model: str,
     url: str = "http://localhost:11434",
     temperature: float = 0.1,
+    no_think: bool = False,
 ) -> list[dict[str, Any]]:
     """Call an OpenAI-compatible ``/v1/chat/completions`` endpoint for extraction.
 
@@ -218,12 +219,17 @@ def local_extract(
         model: Model name (e.g. ``qwen3-coder:30b``).
         url: Server base URL.
         temperature: Sampling temperature (0.0–2.0, default 0.1).
+        no_think: When True, disable thinking/reasoning mode for models
+            that support it (e.g. Qwen3, DeepSeek-R1) by passing
+            ``chat_template_kwargs: {"enable_thinking": false}`` in the
+            request payload.  This avoids wasting tokens on chain-of-thought
+            reasoning that will be stripped anyway.
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
     """
     endpoint = f"{url.rstrip('/')}/v1/chat/completions"
-    payload = json.dumps({
+    body: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
@@ -232,7 +238,10 @@ def local_extract(
         "stream": False,
         "temperature": temperature,
         "max_tokens": 32768,
-    }).encode()
+    }
+    if no_think:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         endpoint,
         data=payload,
@@ -9037,12 +9046,15 @@ def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
         _provider = args.provider
         _temperature = args.temperature if args.temperature is not None else 0.1
         _thinking_budget = args.thinking_budget
+        _no_think = args.no_think
 
         _extra_info: list[str] = []
         if args.temperature is not None:
             _extra_info.append(f"temperature={_temperature}")
         if _thinking_budget > 0:
             _extra_info.append(f"thinking_budget={_thinking_budget}")
+        if _no_think:
+            _extra_info.append("no_think")
         _extra_str = f" ({', '.join(_extra_info)})" if _extra_info else ""
 
         if _provider == "anthropic":
@@ -9071,7 +9083,7 @@ def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
             extract_fn = (
                 lambda prompt: local_extract(
                     prompt, model=_extract_model, url=_extract_url,
-                    temperature=_temperature,
+                    temperature=_temperature, no_think=_no_think,
                 )
             )
             print(f"  Using model: {_extract_model} at {_extract_url}{_extra_str}")
@@ -9357,6 +9369,12 @@ def main() -> None:
                              "Only effective with --provider anthropic. When set, temperature "
                              "is forced to 1.0 as required by the API. Set to 0 to disable "
                              "(default: 0).")
+    parser.add_argument("--no-think", action="store_true", dest="no_think",
+                        help="Disable thinking/reasoning mode for models that support it "
+                             "(e.g. Qwen3, DeepSeek-R1). Sends chat_template_kwargs with "
+                             "enable_thinking=false to the server. Only effective with "
+                             "--provider local. Saves tokens and inference time by skipping "
+                             "chain-of-thought reasoning.")
     parser.add_argument("--auto-accept", action="store_true",
                         help="Automatically accept all new relation proposals created during ingestion")
     parser.add_argument("--doc-history", metavar="DOC_ID",
