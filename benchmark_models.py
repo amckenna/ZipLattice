@@ -23,6 +23,20 @@ Usage:
     # Limit to first N sections (quick smoke test)
     python benchmark_models.py doc.md \
         --models modelA modelB --max-sections 3
+
+    # Compare extraction at different temperatures
+    python benchmark_models.py doc.md \
+        --models qwen3-coder:30b --temperature 0.0
+
+    # Claude with extended thinking enabled
+    python benchmark_models.py doc.md \
+        --models claude-sonnet-4-6 --provider anthropic \
+        --thinking-budget 10000
+
+    # AWS Bedrock provider
+    python benchmark_models.py doc.md \
+        --models us.anthropic.claude-haiku-4-5-20251001-v1:0 \
+        --provider bedrock --bedrock-region us-west-2
 """
 
 from __future__ import annotations
@@ -39,7 +53,8 @@ from typing import Any, Callable
 
 from knowledge_graph import (
     KnowledgeGraph, local_extract,
-    claude_extract, _get_anthropic_api_key,
+    claude_extract, bedrock_extract,
+    _get_anthropic_api_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,17 +65,42 @@ def _make_extract_fn(
     ollama_url: str,
     verbose: bool = False,
     provider: str = "local",
+    temperature: float = 0.1,
+    thinking_budget: int = 0,
+    bedrock_region: str | None = None,
+    bedrock_profile: str | None = None,
 ) -> Callable[[str], list[dict[str, Any]]]:
     """Build an LLM extraction function for the given model.
 
     When *provider* is ``"local"``, uses the OpenAI-compatible
     ``/v1/chat/completions`` endpoint (Ollama, llama.cpp, vLLM, etc.).
     When ``"anthropic"``, uses the Claude Messages API.
+    When ``"bedrock"``, uses the AWS Bedrock Converse API.
+
+    Args:
+        model: Model name/ID.
+        ollama_url: Base URL for the OpenAI-compatible server.
+        verbose: Enable verbose logging.
+        provider: ``"local"``, ``"anthropic"``, or ``"bedrock"``.
+        temperature: Sampling temperature (0.0–2.0, default 0.1).
+        thinking_budget: Token budget for Claude extended thinking (0=disabled).
+        bedrock_region: AWS region for Bedrock provider.
+        bedrock_profile: AWS profile for Bedrock provider.
     """
     if provider == "anthropic":
         api_key = _get_anthropic_api_key()
-        return lambda prompt: claude_extract(prompt, model=model, api_key=api_key)
-    return lambda prompt: local_extract(prompt, model=model, url=ollama_url)
+        return lambda prompt: claude_extract(
+            prompt, model=model, api_key=api_key,
+            temperature=temperature, thinking_budget=thinking_budget,
+        )
+    if provider == "bedrock":
+        return lambda prompt: bedrock_extract(
+            prompt, model=model, region=bedrock_region, profile=bedrock_profile,
+            temperature=temperature,
+        )
+    return lambda prompt: local_extract(
+        prompt, model=model, url=ollama_url, temperature=temperature,
+    )
 
 
 def run_benchmark(
@@ -71,6 +111,10 @@ def run_benchmark(
     verbose: bool = False,
     quiet: bool = False,
     provider: str = "local",
+    temperature: float = 0.1,
+    thinking_budget: int = 0,
+    bedrock_region: str | None = None,
+    bedrock_profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run each model against the same file(s) and collect stats.
 
@@ -96,10 +140,17 @@ def run_benchmark(
             print(f"  Model {model_idx + 1}/{len(models)}: {model}")
             print(f"{'='*60}")
 
-        extract_fn = _make_extract_fn(model, ollama_url, verbose=verbose, provider=provider)
+        extract_fn = _make_extract_fn(
+            model, ollama_url, verbose=verbose, provider=provider,
+            temperature=temperature, thinking_budget=thinking_budget,
+            bedrock_region=bedrock_region, bedrock_profile=bedrock_profile,
+        )
 
         model_result: dict[str, Any] = {
             "model": model,
+            "provider": provider,
+            "temperature": temperature,
+            "thinking_budget": thinking_budget,
             "files": [],
             "total_sections": 0,
             "total_triples": 0,
@@ -261,6 +312,19 @@ def print_comparison(results: list[dict[str, Any]], total_chars: int) -> None:
     print(f"\n{'='*70}")
     print(f"  MODEL COMPARISON — {len(results)} models, "
           f"{total_chars:,} chars input")
+    # Show non-default settings
+    _settings: list[str] = []
+    _temp = results[0].get("temperature", 0.1)
+    if _temp != 0.1:
+        _settings.append(f"temperature={_temp}")
+    _tb = results[0].get("thinking_budget", 0)
+    if _tb > 0:
+        _settings.append(f"thinking_budget={_tb}")
+    _prov = results[0].get("provider", "local")
+    if _prov != "local":
+        _settings.append(f"provider={_prov}")
+    if _settings:
+        print(f"  Settings: {', '.join(_settings)}")
     print(f"{'='*70}")
 
     # Table header
@@ -351,9 +415,22 @@ def main():
                              "(default: http://localhost:11434)")
     parser.add_argument("--max-sections", type=int, default=None, metavar="N",
                         help="Limit to first N sections per file (quick test)")
-    parser.add_argument("--provider", choices=["local", "anthropic"], default="local",
+    parser.add_argument("--provider", choices=["local", "anthropic", "bedrock"], default="local",
                         help="LLM provider: 'local' for OpenAI-compatible servers, "
-                             "'anthropic' for the Claude API (default: local)")
+                             "'anthropic' for the Claude API, 'bedrock' for AWS Bedrock "
+                             "(default: local)")
+    parser.add_argument("--temperature", type=float, default=0.1, metavar="T",
+                        help="Sampling temperature for extraction (0.0–2.0, default: 0.1). "
+                             "Lower = more deterministic, higher = more diverse.")
+    parser.add_argument("--thinking-budget", type=int, default=0, metavar="TOKENS",
+                        dest="thinking_budget",
+                        help="Enable Claude extended thinking with this token budget. "
+                             "Only effective with --provider anthropic. Forces temperature=1. "
+                             "(default: 0, disabled)")
+    parser.add_argument("--bedrock-region", default=None, metavar="REGION",
+                        help="AWS region for Bedrock (default: AWS_DEFAULT_REGION or us-east-1)")
+    parser.add_argument("--bedrock-profile", default=None, metavar="PROFILE",
+                        help="AWS profile name from ~/.aws/credentials for Bedrock")
     parser.add_argument("--json", action="store_true", dest="json_output",
                         help="Output results as JSON")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -383,7 +460,12 @@ def main():
         print(f"Benchmark: {len(md_files)} file(s), {len(args.models)} model(s)")
         print(f"  Files: {', '.join(p.name for p in md_files)}")
         print(f"  Models: {', '.join(args.models)}")
-        print(f"  Server: {args.ollama_url}")
+        print(f"  Provider: {args.provider}")
+        if args.provider == "local":
+            print(f"  Server: {args.ollama_url}")
+        print(f"  Temperature: {args.temperature}")
+        if args.thinking_budget > 0:
+            print(f"  Thinking budget: {args.thinking_budget} tokens")
         if args.max_sections:
             print(f"  Max sections per file: {args.max_sections}")
 
@@ -408,6 +490,10 @@ def main():
             verbose=args.verbose,
             quiet=args.quiet,
             provider=args.provider,
+            temperature=args.temperature,
+            thinking_budget=args.thinking_budget,
+            bedrock_region=args.bedrock_region,
+            bedrock_profile=args.bedrock_profile,
         )
     finally:
         # Restore original method

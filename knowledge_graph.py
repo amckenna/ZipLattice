@@ -202,7 +202,11 @@ def _parse_extraction_response(raw: str, *, model: str, label: str) -> list[dict
 
 
 def local_extract(
-    prompt: str, *, model: str, url: str = "http://localhost:11434"
+    prompt: str,
+    *,
+    model: str,
+    url: str = "http://localhost:11434",
+    temperature: float = 0.1,
 ) -> list[dict[str, Any]]:
     """Call an OpenAI-compatible ``/v1/chat/completions`` endpoint for extraction.
 
@@ -213,6 +217,7 @@ def local_extract(
         prompt: The user-facing extraction prompt (section text).
         model: Model name (e.g. ``qwen3-coder:30b``).
         url: Server base URL.
+        temperature: Sampling temperature (0.0–2.0, default 0.1).
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
@@ -225,7 +230,7 @@ def local_extract(
             {"role": "user", "content": prompt},
         ],
         "stream": False,
-        "temperature": 0.1,
+        "temperature": temperature,
         "max_tokens": 32768,
     }).encode()
     req = urllib.request.Request(
@@ -403,7 +408,14 @@ def claude_chat(prompt: str, *, model: str, api_key: str | None = None) -> str:
     return answer
 
 
-def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> list[dict[str, Any]]:
+def claude_extract(
+    prompt: str,
+    *,
+    model: str,
+    api_key: str | None = None,
+    temperature: float = 0.1,
+    thinking_budget: int = 0,
+) -> list[dict[str, Any]]:
     """Call the Anthropic Messages API for JSON extraction.
 
     Mirrors the extraction pattern used by the OpenAI-compatible path:
@@ -414,6 +426,14 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
         prompt: The user-facing extraction prompt (section text).
         model: Anthropic model ID (e.g. ``claude-haiku-4-5``).
         api_key: API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
+        temperature: Sampling temperature (0.0–1.0, default 0.1).
+            Ignored when *thinking_budget* > 0 (Anthropic requires
+            ``temperature=1`` for extended thinking).
+        thinking_budget: When > 0, enable Claude's extended thinking with
+            this many tokens as the ``budget_tokens``.  The API requires
+            ``temperature=1`` when thinking is enabled, so the
+            *temperature* parameter is overridden automatically.
+            Set to 0 (default) to disable extended thinking.
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
@@ -421,18 +441,44 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
     if not api_key:
         api_key = _get_anthropic_api_key()
 
+    payload: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 32768,
+        "system": _EXTRACTION_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    if thinking_budget > 0:
+        # Extended thinking requires temperature=1 and the thinking block
+        payload["temperature"] = 1
+        payload["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": thinking_budget,
+        }
+    else:
+        payload["temperature"] = temperature
+
     t0 = time.monotonic()
     body = _anthropic_request(
-        {"model": model, "max_tokens": 32768, "temperature": 0.1,
-         "system": _EXTRACTION_SYSTEM_PROMPT,
-         "messages": [{"role": "user", "content": prompt}]},
+        payload,
         api_key=api_key, model=model, label="extract", on_error="return",
     )
     if body is None:
         return []
 
     elapsed = time.monotonic() - t0
-    raw = body["content"][0]["text"].strip()
+    # When extended thinking is enabled, the response contains
+    # [{"type": "thinking", ...}, {"type": "text", ...}].
+    # Extract the text block.
+    raw = ""
+    for block in body.get("content", []):
+        if block.get("type") == "text":
+            raw = block.get("text", "").strip()
+            break
+    if not raw and body.get("content"):
+        # Fallback: first block's text (non-thinking responses)
+        raw = body["content"][0].get("text", "").strip()
+
     logger.debug("claude_extract: raw response=%d chars (%.1fs)", len(raw), elapsed)
     return _parse_extraction_response(raw, model=model, label="Claude")
 
@@ -627,6 +673,7 @@ def bedrock_extract(
     model: str,
     region: str | None = None,
     profile: str | None = None,
+    temperature: float = 0.1,
 ) -> list[dict[str, Any]]:
     """Call AWS Bedrock Converse API for JSON extraction.
 
@@ -639,6 +686,7 @@ def bedrock_extract(
         model: Bedrock model ID.
         region: AWS region.
         profile: AWS profile name from ``~/.aws/credentials``.
+        temperature: Sampling temperature (0.0–1.0, default 0.1).
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
@@ -648,7 +696,7 @@ def bedrock_extract(
         {"modelId": model,
          "messages": [{"role": "user", "content": [{"text": prompt}]}],
          "system": [{"text": _EXTRACTION_SYSTEM_PROMPT}],
-         "inferenceConfig": {"maxTokens": 32768, "temperature": 0.1}},
+         "inferenceConfig": {"maxTokens": 32768, "temperature": temperature}},
         model=model, region=region, profile=profile,
         label="extract", on_error="return",
     )
@@ -8987,27 +9035,46 @@ def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
     if _has_model:
         _extract_model = args.extract_model or args.query_model
         _provider = args.provider
+        _temperature = args.temperature if args.temperature is not None else 0.1
+        _thinking_budget = args.thinking_budget
+
+        _extra_info: list[str] = []
+        if args.temperature is not None:
+            _extra_info.append(f"temperature={_temperature}")
+        if _thinking_budget > 0:
+            _extra_info.append(f"thinking_budget={_thinking_budget}")
+        _extra_str = f" ({', '.join(_extra_info)})" if _extra_info else ""
 
         if _provider == "anthropic":
             _api_key = _get_anthropic_api_key()
             extract_fn: Callable[[str], list[dict[str, Any]]] = (
-                lambda prompt: claude_extract(prompt, model=_extract_model, api_key=_api_key)
+                lambda prompt: claude_extract(
+                    prompt, model=_extract_model, api_key=_api_key,
+                    temperature=_temperature, thinking_budget=_thinking_budget,
+                )
             )
-            print(f"  Using model: {_extract_model} (provider: anthropic)")
+            print(f"  Using model: {_extract_model} (provider: anthropic){_extra_str}")
         elif _provider == "bedrock":
             _bedrock_region = args.bedrock_region
             _bedrock_profile = args.bedrock_profile
             extract_fn = (
-                lambda prompt: bedrock_extract(prompt, model=_extract_model, region=_bedrock_region, profile=_bedrock_profile)
+                lambda prompt: bedrock_extract(
+                    prompt, model=_extract_model,
+                    region=_bedrock_region, profile=_bedrock_profile,
+                    temperature=_temperature,
+                )
             )
             print(f"  Using model: {_extract_model} (provider: bedrock, "
-                  f"region: {_bedrock_region or 'default'}, profile: {_bedrock_profile or 'default'})")
+                  f"region: {_bedrock_region or 'default'}, profile: {_bedrock_profile or 'default'}){_extra_str}")
         else:
             _extract_url = args.ollama_url.rstrip("/")
             extract_fn = (
-                lambda prompt: local_extract(prompt, model=_extract_model, url=_extract_url)
+                lambda prompt: local_extract(
+                    prompt, model=_extract_model, url=_extract_url,
+                    temperature=_temperature,
+                )
             )
-            print(f"  Using model: {_extract_model} at {_extract_url}")
+            print(f"  Using model: {_extract_model} at {_extract_url}{_extra_str}")
     else:
         extract_fn = lambda _text: []
 
@@ -9279,6 +9346,17 @@ def main() -> None:
                              "ingestion. Uses section-level content hashes to detect changes. "
                              "Structural nodes/edges are always updated. Dramatically reduces "
                              "LLM calls when re-ingesting documents with minor edits.")
+    parser.add_argument("--temperature", type=float, default=None, metavar="T",
+                        help="Sampling temperature for LLM extraction (0.0–2.0, default 0.1). "
+                             "Lower values produce more deterministic output; higher values "
+                             "increase diversity. Ignored when --thinking-budget is set with "
+                             "the anthropic provider (requires temperature=1).")
+    parser.add_argument("--thinking-budget", type=int, default=0, metavar="TOKENS",
+                        dest="thinking_budget",
+                        help="Enable extended thinking for Claude models with this token budget. "
+                             "Only effective with --provider anthropic. When set, temperature "
+                             "is forced to 1.0 as required by the API. Set to 0 to disable "
+                             "(default: 0).")
     parser.add_argument("--auto-accept", action="store_true",
                         help="Automatically accept all new relation proposals created during ingestion")
     parser.add_argument("--doc-history", metavar="DOC_ID",
