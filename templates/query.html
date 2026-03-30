@@ -273,6 +273,12 @@ function showProviderPanel(prefix, provider) {
       panel.querySelectorAll('input, select').forEach(function(el) { el.disabled = true; });
     }
   });
+  // Show no-think only for Local
+  var noThinkSec = document.getElementById(prefix + '-no-think-section');
+  if (noThinkSec) {
+    if (provider === 'local') { noThinkSec.classList.remove('hidden'); }
+    else { noThinkSec.classList.add('hidden'); }
+  }
 }
 
 function toggleQueryBedrockEmbed() {
