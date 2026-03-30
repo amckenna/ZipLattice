@@ -1707,6 +1707,28 @@ async def documents_page(request: Request, q: str = "") -> HTMLResponse:
     })
 
 
+@app.get("/documents/{doc_id}/source")
+async def document_source_text(doc_id: str) -> Response:
+    """Return the stored source text for a document from the first graph that has it."""
+    GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
+    doc_slug = slugify(doc_id)
+    for entry in sorted(GRAPHS_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        json_file = entry / f"{entry.name}.json"
+        if not json_file.exists():
+            continue
+        try:
+            kg = _load_graph(entry.name)
+        except Exception:
+            continue
+        if doc_slug in kg._data.get("meta", {}).get("sources", {}):
+            text = kg.get_source_text(doc_slug)
+            if text is not None:
+                return JSONResponse({"doc_id": doc_slug, "text": text})
+    return JSONResponse({"error": "Source not found"}, status_code=404)
+
+
 @app.get("/graphs/{name}/documents/{doc_id}/extract")
 async def extract_document(name: str, doc_id: str) -> JSONResponse:
     """Extract a document subgraph as JSON."""
