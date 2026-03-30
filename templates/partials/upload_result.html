@@ -192,10 +192,45 @@
           </div>
           <p class="text-xs text-gray-600 col-span-2">Uses named profiles from ~/.aws/credentials. Leave AWS Profile blank for the default credential chain (env vars, default profile, IAM role).</p>
         </div>
+        <!-- Temperature and parallel extraction -->
+        <div class="grid grid-cols-2 gap-3">
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Temperature</label>
+            <input type="number" name="temperature" value="0.1" min="0" max="2" step="0.05"
+                   class="w-24 bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            <span class="text-xs text-gray-600 ml-1">0 = deterministic, higher = more diverse</span>
+          </div>
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Parallel Extraction Threads</label>
+            <input type="number" name="parallel" value="1" min="1" max="32"
+                   class="w-24 bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            <span class="text-xs text-gray-600 ml-1">LLM calls run concurrently; graph writes remain serial</span>
+          </div>
+        </div>
+        <!-- Extended thinking (Anthropic only) -->
+        <div class="space-y-1" id="thinking-budget-section">
+          <label class="block text-xs text-gray-400">Extended Thinking Budget (tokens)</label>
+          <input type="number" name="thinking_budget" value="0" min="0" max="128000" step="1000"
+                 class="w-32 bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+          <span class="text-xs text-gray-600 ml-1">Anthropic only. 0 = disabled. Forces temperature=1 when active.</span>
+        </div>
+        <!-- No-think mode (local provider only) -->
+        <div class="flex items-center gap-2 pt-1" id="no-think-section">
+          <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
+            <input type="checkbox" name="no_think" value="1" class="accent-white"> Disable thinking mode
+          </label>
+          <span class="text-xs text-gray-600">Local only. Skips chain-of-thought for Qwen3, DeepSeek-R1, etc.</span>
+        </div>
         <!-- Verbose logging -->
         <div class="flex items-center gap-2 pt-1">
           <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
             <input type="checkbox" name="verbose" value="1" class="accent-white"> Verbose logging
+          </label>
+        </div>
+        <!-- Incremental ingestion -->
+        <div class="flex items-center gap-2 pt-1">
+          <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
+            <input type="checkbox" name="incremental" value="1" class="accent-white"> Incremental (skip unchanged sections)
           </label>
         </div>
       </div>

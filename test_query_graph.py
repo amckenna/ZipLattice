@@ -350,6 +350,18 @@ def test_ollama_chat_payload_format():
     assert body["model"] == "llama2"
     assert body["messages"] == [{"role": "user", "content": "test prompt"}]
     assert body["stream"] is False
+    assert "chat_template_kwargs" not in body
+
+
+def test_ollama_chat_no_think():
+    """Verify no_think=True adds chat_template_kwargs to payload."""
+    mock_resp = _mock_urlopen_response(_openai_chat_response("ok"))
+    with patch("query_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        ollama_chat("test prompt", model="llama2", url="http://localhost:11434", no_think=True)
+
+    req = mock_urlopen.call_args[0][0]
+    body = json.loads(req.data)
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_ollama_chat_trailing_slash():
@@ -1071,6 +1083,18 @@ def test_local_extract_payload_format():
     assert body["messages"][1] == {"role": "user", "content": "some text"}
     assert body["temperature"] == 0.1
     assert body["stream"] is False
+    assert "chat_template_kwargs" not in body
+
+
+def test_local_extract_no_think():
+    """Verify no_think=True adds chat_template_kwargs to payload."""
+    mock_resp = _mock_urlopen_response(_openai_chat_response("[]"))
+    with patch("knowledge_graph.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        local_extract("some text", model="qwen3:30b", url="http://localhost:11434", no_think=True)
+
+    req = mock_urlopen.call_args[0][0]
+    body = json.loads(req.data)
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_local_extract_http_error():
@@ -1355,3 +1379,50 @@ def test_ask_with_bedrock_llm_fn(kg):
 
     answer = ask(kg, "What is radar?", fake_embed, mock_bedrock_llm, max_nodes=5)
     assert answer == "Bedrock says: Radar uses radio waves."
+
+
+# ---------------------------------------------------------------------------
+# BM25 / Hybrid search mode tests
+# ---------------------------------------------------------------------------
+
+
+def test_search_nodes_bm25_mode(kg):
+    """search_nodes with search_mode='bm25' returns keyword results."""
+    results = search_nodes(
+        kg, "radio detection ranging", fake_embed,
+        top_k=5, expand_depth=0, search_mode="bm25",
+    )
+    assert len(results) > 0
+    # "radar" has "Radio detection and ranging" in description
+    assert results[0]["node_id"] == "radar"
+
+
+def test_search_nodes_hybrid_mode(kg):
+    """search_nodes with search_mode='hybrid' blends BM25 and semantic."""
+    results = search_nodes(
+        kg, "radar", fake_embed,
+        top_k=5, expand_depth=0, search_mode="hybrid", alpha=0.5,
+    )
+    assert len(results) > 0
+    # "radar" should be top result in both modes
+    assert results[0]["node_id"] == "radar"
+
+
+def test_build_context_bm25_mode(kg):
+    """build_context works with search_mode='bm25'."""
+    ctx = build_context(kg, "radio detection", fake_embed, search_mode="bm25")
+    assert isinstance(ctx, str)
+    # Should find radar-related content
+    assert "Radar" in ctx or "radar" in ctx
+
+
+def test_ask_bm25_mode(kg):
+    """ask() works with search_mode='bm25'."""
+    def mock_llm(prompt: str) -> str:
+        return "Answer about radar."
+
+    answer = ask(
+        kg, "What is radar?", fake_embed, mock_llm,
+        max_nodes=5, search_mode="bm25",
+    )
+    assert "Answer about radar" in answer

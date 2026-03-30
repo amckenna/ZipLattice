@@ -63,8 +63,34 @@
         <label class="flex items-center gap-2 text-sm cursor-pointer">
           <input type="radio" name="mode" value="ask" checked class="accent-white" onchange="updateModeHint(this.value)"> Ask
         </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="mode" value="pattern" class="accent-white" onchange="updateModeHint(this.value)"> Pattern
+        </label>
       </div>
       <p id="mode-hint" class="text-xs text-gray-400"></p>
+    </div>
+
+    <!-- Search mode -->
+    <div class="space-y-2">
+      <label class="block text-sm text-gray-400">Search Mode</label>
+      <div class="flex gap-4 items-center">
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="search_mode" value="semantic" checked class="accent-white" onchange="updateSearchModeHint(this.value)"> Semantic
+        </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="search_mode" value="bm25" class="accent-white" onchange="updateSearchModeHint(this.value)"> Keyword (BM25)
+        </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="radio" name="search_mode" value="hybrid" class="accent-white" onchange="updateSearchModeHint(this.value)"> Hybrid
+        </label>
+        <div id="alpha-control" class="hidden flex items-center gap-2 ml-4">
+          <label class="text-xs text-gray-400">Alpha:</label>
+          <input type="range" name="alpha" min="0" max="1" step="0.1" value="0.7"
+                 class="w-20 accent-white" oninput="document.getElementById('alpha-val').textContent=this.value">
+          <span id="alpha-val" class="text-xs text-gray-400">0.7</span>
+        </div>
+      </div>
+      <p id="search-mode-hint" class="text-xs text-gray-400"></p>
     </div>
 
     <!-- Response mode (only relevant for Ask) -->
@@ -209,6 +235,14 @@
           </div>
           <p class="text-xs text-gray-600 col-span-2">Uses named profiles from ~/.aws/credentials. Leave AWS Profile blank for the default credential chain (env vars, default profile, IAM role).</p>
         </div>
+
+        <!-- No-think mode (local provider only) -->
+        <div class="flex items-center gap-2 pt-2" id="query-no-think-section">
+          <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
+            <input type="checkbox" name="no_think" value="1" class="accent-white"> Disable thinking mode
+          </label>
+          <span class="text-xs text-gray-600">Local only. Skips chain-of-thought for Qwen3, DeepSeek-R1, etc.</span>
+        </div>
       </div>
     </details>
 
@@ -258,10 +292,22 @@ function toggleQueryBedrockEmbed() {
   }
 }
 
+var searchModeHints = {
+  semantic: "Embedding similarity — finds nodes by meaning, even when exact keywords differ. Requires pre-computed embeddings.",
+  bm25: "Keyword search — finds nodes by exact term matching using BM25 scoring. No embeddings needed.",
+  hybrid: "Blended search — combines semantic similarity and keyword matching. Alpha controls the blend (0 = pure keyword, 1 = pure semantic)."
+};
+function updateSearchModeHint(mode) {
+  document.getElementById('search-mode-hint').textContent = searchModeHints[mode] || '';
+  document.getElementById('alpha-control').classList.toggle('hidden', mode !== 'hybrid');
+}
+updateSearchModeHint('semantic');
+
 var modeHints = {
   search: "Semantic similarity search — returns the most relevant nodes ranked by how closely they match your query.",
   context: "Builds a RAG context block — searches for relevant nodes, expands their neighborhoods, and formats everything as structured text you can paste into an LLM prompt.",
-  ask: "Asks a question — builds context from the graph and sends it along with your question to an LLM for a full natural-language answer. Requires a running model."
+  ask: "Asks a question — builds context from the graph and sends it along with your question to an LLM for a full natural-language answer. Requires a running model.",
+  pattern: 'Structural pattern query — finds paths matching a graph pattern. Example: (type:concept) -[is_a]-> (*) or (*) -[*]-> (*) WHERE confidence > 0.7 or (*) -[is_a]-> (id:"python") DEPTH 2'
 };
 var responseHints = {
   single: "Get a single answer and stop. Good for one-off questions.",
@@ -270,11 +316,16 @@ var responseHints = {
 function updateModeHint(mode) {
   document.getElementById('mode-hint').textContent = modeHints[mode] || '';
   var rms = document.getElementById('response-mode-section');
-  if (mode === 'ask') {
-    rms.style.display = '';
-  } else {
-    rms.style.display = 'none';
-  }
+  rms.style.display = mode === 'ask' ? '' : 'none';
+  // Hide search mode and model config for pattern queries (they don't use embeddings/LLMs)
+  var searchSection = document.querySelector('[class*="space-y-2"]:has(input[name="search_mode"])');
+  // Fallback: find by label text
+  document.querySelectorAll('.space-y-2').forEach(function(el) {
+    var lbl = el.querySelector('label.block');
+    if (lbl && lbl.textContent.trim() === 'Search Mode') {
+      el.style.display = mode === 'pattern' ? 'none' : '';
+    }
+  });
 }
 function updateResponseHint(val) {
   document.getElementById('response-hint').textContent = responseHints[val] || '';

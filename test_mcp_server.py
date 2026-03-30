@@ -534,3 +534,204 @@ class TestMergeGraphsTool:
         assert result["num_nodes"] == 2
         # Clean up cache
         _graph_cache.clear()
+
+    def test_document_history(self, tmp_path):
+        """document_history returns version timeline with section info."""
+        from knowledge_graph import compute_section_hashes
+        from mcp_server import document_history, _graph_cache
+
+        kg = KnowledgeGraph(tmp_path / "mcp_hist.json")
+        # Sections must be > 80 chars body for parse_markdown_sections
+        body = "This is a sufficiently long section body. " * 5
+        md = f"# Intro\n\n{body}\n\n# Methods\n\n{body}\n"
+        hashes = compute_section_hashes(md)
+        kg.store_source(md, "mydoc", section_hashes=hashes)
+        kg.save()
+
+        result = json.loads(document_history(
+            graph_path=str(kg.graph_path),
+            doc_id="mydoc",
+        ))
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["version"] == 1
+        assert result[0]["section_count"] >= 2
+        _graph_cache.clear()
+
+    def test_document_history_not_found(self, tmp_path):
+        """document_history returns error for unknown doc."""
+        from mcp_server import document_history, _graph_cache
+
+        kg = KnowledgeGraph(tmp_path / "mcp_nohist.json")
+        kg.save()
+
+        result = json.loads(document_history(
+            graph_path=str(kg.graph_path),
+            doc_id="nonexistent",
+        ))
+        assert "error" in result
+        _graph_cache.clear()
+
+    def test_diff_graphs_tool(self, tmp_path):
+        """diff_graphs MCP tool returns structured diff between two graphs."""
+        from mcp_server import diff_graphs, _graph_cache
+        _graph_cache.clear()
+
+        # Create two graphs with some overlap
+        kg1 = KnowledgeGraph(tmp_path / "base.json")
+        kg1.add_node("radar", label="Radar", type="concept")
+        kg1.add_node("antenna", label="Antenna", type="concept")
+        kg1.add_edge("radar", "antenna", relation="depends_on")
+        kg1.save()
+
+        kg2 = KnowledgeGraph(tmp_path / "newer.json")
+        kg2.add_node("radar", label="Radar System", type="concept")
+        kg2.add_node("sar", label="SAR", type="technology")
+        kg2.add_edge("sar", "radar", relation="is_a")
+        kg2.save()
+
+        result = json.loads(diff_graphs(
+            graph_path=str(kg1.graph_path),
+            other_graph_path=str(kg2.graph_path),
+        ))
+        assert result["has_changes"] is True
+        # antenna was removed, sar was added
+        assert result["counts"]["nodes_added"] >= 1
+        assert result["counts"]["nodes_removed"] >= 1
+        # radar was modified (label change)
+        assert result["counts"]["nodes_modified"] >= 1
+        _graph_cache.clear()
+
+    def test_diff_graphs_no_changes(self, tmp_path):
+        """diff_graphs with identical graphs shows no changes."""
+        from mcp_server import diff_graphs, _graph_cache
+        _graph_cache.clear()
+
+        kg = KnowledgeGraph(tmp_path / "same.json")
+        kg.add_node("x", label="X")
+        kg.save()
+
+        result = json.loads(diff_graphs(
+            graph_path=str(kg.graph_path),
+            other_graph_path=str(kg.graph_path),
+        ))
+        assert result["has_changes"] is False
+        _graph_cache.clear()
+
+    def test_bulk_manage_proposals_accept(self, tmp_path):
+        """bulk_manage_proposals with action=accept works."""
+        from mcp_server import bulk_manage_proposals, _graph_cache
+
+        graph_path = str(tmp_path / "bulk.json")
+        _graph_cache.clear()
+
+        # Create proposals directly on the KnowledgeGraph
+        kg = KnowledgeGraph(graph_path)
+        kg.propose_relation("monitors", justification="test",
+                            source_entity="radar", target_entity="weather")
+        kg.propose_relation("validates", justification="test2",
+                            source_entity="sensor", target_entity="data")
+        kg.save()
+        _graph_cache.clear()
+
+        result = json.loads(bulk_manage_proposals(
+            graph_path=graph_path,
+            action="accept",
+            names=["monitors", "validates"],
+            review_note="bulk test",
+        ))
+        assert result["action"] == "accept"
+        assert result["count"] == 2
+        _graph_cache.clear()
+
+    def test_bulk_manage_proposals_reject(self, tmp_path):
+        """bulk_manage_proposals with action=reject works."""
+        from mcp_server import bulk_manage_proposals, _graph_cache
+
+        graph_path = str(tmp_path / "bulk_rej.json")
+        _graph_cache.clear()
+
+        kg = KnowledgeGraph(graph_path)
+        kg.propose_relation("monitors", justification="test",
+                            source_entity="radar", target_entity="weather")
+        kg.save()
+        _graph_cache.clear()
+
+        result = json.loads(bulk_manage_proposals(
+            graph_path=graph_path,
+            action="reject",
+            names=["monitors"],
+        ))
+        assert result["action"] == "reject"
+        assert result["count"] == 1
+        _graph_cache.clear()
+
+    def test_auto_accept_proposals(self, tmp_path):
+        """auto_accept_proposals MCP tool works."""
+        from mcp_server import auto_accept_proposals, _graph_cache
+
+        graph_path = str(tmp_path / "auto.json")
+        _graph_cache.clear()
+
+        kg = KnowledgeGraph(graph_path)
+        kg.propose_relation("monitors", justification="test",
+                            source_entity="radar", target_entity="weather")
+        kg.save()
+        _graph_cache.clear()
+
+        result = json.loads(auto_accept_proposals(
+            graph_path=graph_path,
+            min_confidence=0.0,
+            min_examples=0,
+        ))
+        assert result["count"] >= 1
+        assert "monitors" in result["accepted"]
+        _graph_cache.clear()
+
+    def test_bulk_manage_proposals_merge(self, tmp_path):
+        """bulk_manage_proposals with action=merge works."""
+        from mcp_server import bulk_manage_proposals, _graph_cache
+
+        graph_path = str(tmp_path / "merge.json")
+        _graph_cache.clear()
+
+        kg = KnowledgeGraph(graph_path)
+        kg.propose_relation("monitors", justification="test",
+                            source_entity="radar", target_entity="weather")
+        kg.propose_relation("monitoring", justification="test2",
+                            source_entity="sensor", target_entity="data")
+        kg.save()
+        _graph_cache.clear()
+
+        result = json.loads(bulk_manage_proposals(
+            graph_path=graph_path,
+            action="merge",
+            names=["monitors", "monitoring"],
+        ))
+        assert result["action"] == "merge"
+        assert result["target"] == "monitors"
+        assert result["examples"] >= 2
+        _graph_cache.clear()
+
+    def test_pattern_query_tool(self, tmp_path):
+        """pattern_query MCP tool works."""
+        from mcp_server import pattern_query, _graph_cache
+
+        graph_path = str(tmp_path / "pq.json")
+        _graph_cache.clear()
+
+        kg = KnowledgeGraph(graph_path)
+        kg.add_node("python", type="technology", label="Python")
+        kg.add_node("fastapi", type="library", label="FastAPI")
+        kg.add_edge("fastapi", "python", relation="depends_on")
+        kg.save()
+        _graph_cache.clear()
+
+        result = json.loads(pattern_query(
+            graph_path=graph_path,
+            pattern='(type:library) -[depends_on]-> (type:technology)',
+        ))
+        assert len(result) >= 1
+        assert result[0][0]["node_id"] == "fastapi"
+        assert result[0][2]["node_id"] == "python"
+        _graph_cache.clear()

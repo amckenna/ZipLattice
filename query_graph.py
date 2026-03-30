@@ -27,6 +27,7 @@ from knowledge_graph import (
     KnowledgeGraph, GraphEncoder, ollama_embed, _strip_thinking,
     claude_chat, _get_anthropic_api_key,
     bedrock_chat, bedrock_embed,
+    read_http_error_detail,
 )
 
 logger = logging.getLogger("query_graph")
@@ -45,23 +46,28 @@ def search_nodes(
     top_k: int = 10,
     node_types: list[str] | None = None,
     expand_depth: int = 1,
+    search_mode: str = "semantic",
+    alpha: float = 0.7,
 ) -> list[dict[str, Any]]:
-    """Semantic search over the knowledge graph.
+    """Search over the knowledge graph.
 
     Args:
         kg: A loaded KnowledgeGraph with pre-computed node embeddings.
         query: Natural-language query string.
-        embed_fn: Embedding function for the query text.
+        embed_fn: Embedding function for the query text (not required
+            for ``"bm25"`` mode).
         top_k: Number of results to return.
         node_types: Optional filter by node type.
         expand_depth: Neighborhood expansion depth for each result.
+        search_mode: ``"semantic"``, ``"bm25"``, or ``"hybrid"``.
+        alpha: Hybrid blending weight (0 = pure BM25, 1 = pure semantic).
 
     Returns:
         List of result dicts from ``kg.search()``.
     """
     logger.debug(
-        "search_nodes: %d embeddings loaded, %d nodes in graph",
-        len(kg._embeddings), len(kg._data["nodes"]),
+        "search_nodes: mode=%s %d embeddings loaded, %d nodes in graph",
+        search_mode, len(kg._embeddings), len(kg._data["nodes"]),
     )
     results = kg.search(
         query,
@@ -69,6 +75,8 @@ def search_nodes(
         top_k=top_k,
         node_types=node_types,
         expand_depth=expand_depth,
+        mode=search_mode,
+        alpha=alpha,
     )
     logger.debug("search_nodes: %d results returned", len(results))
     for r in results[:5]:
@@ -86,6 +94,8 @@ def build_context(
     max_nodes: int = 30,
     depth: int = 1,
     max_body_chars: int = 500,
+    search_mode: str = "semantic",
+    alpha: float = 0.7,
 ) -> str:
     """Search the graph and format a context block for an LLM prompt.
 
@@ -96,11 +106,16 @@ def build_context(
         max_nodes: Maximum number of nodes in the context window.
         depth: Neighborhood expansion depth.
         max_body_chars: Truncate section body text to this many characters.
+        search_mode: ``"semantic"``, ``"bm25"``, or ``"hybrid"``.
+        alpha: Hybrid blending weight.
 
     Returns:
         A formatted text block suitable for injecting into an LLM prompt.
     """
-    results = search_nodes(kg, query, embed_fn, top_k=max_nodes, expand_depth=0)
+    results = search_nodes(
+        kg, query, embed_fn, top_k=max_nodes, expand_depth=0,
+        search_mode=search_mode, alpha=alpha,
+    )
     if not results:
         logger.debug("build_context: no search results for query")
         return "(No relevant nodes found in the knowledge graph.)"
@@ -209,6 +224,8 @@ def ask(
     llm_fn: Callable[[str], str],
     *,
     max_nodes: int = 30,
+    search_mode: str = "semantic",
+    alpha: float = 0.7,
 ) -> str:
     """Full RAG pipeline: search the graph, build context, call an LLM.
 
@@ -219,12 +236,17 @@ def ask(
         llm_fn: A callable that takes a prompt string and returns the
                  LLM's response string.
         max_nodes: Maximum number of nodes in the context window.
+        search_mode: ``"semantic"``, ``"bm25"``, or ``"hybrid"``.
+        alpha: Hybrid blending weight.
 
     Returns:
         The LLM's answer string.
     """
     t0 = time.monotonic()
-    context = build_context(kg, question, embed_fn, max_nodes=max_nodes)
+    context = build_context(
+        kg, question, embed_fn, max_nodes=max_nodes,
+        search_mode=search_mode, alpha=alpha,
+    )
     ctx_elapsed = time.monotonic() - t0
     logger.debug("Context length: %d chars (%.2fs)", len(context), ctx_elapsed)
 
@@ -251,19 +273,30 @@ def ask(
 # ---------------------------------------------------------------------------
 
 
-def ollama_chat(prompt: str, *, model: str, url: str) -> str:
+def ollama_chat(prompt: str, *, model: str, url: str, no_think: bool = False) -> str:
     """Call an OpenAI-compatible ``/v1/chat/completions`` endpoint.
 
     Works with Ollama (>=0.1.14), llama.cpp, vLLM, LocalAI, and any
     other server that implements the OpenAI chat completions API.
+
+    Args:
+        prompt: The user prompt.
+        model: Model name.
+        url: Server base URL.
+        no_think: When True, disable thinking/reasoning mode for models
+            that support it (e.g. Qwen3, DeepSeek-R1) by passing
+            ``chat_template_kwargs: {"enable_thinking": false}``.
     """
     endpoint = f"{url.rstrip('/')}/v1/chat/completions"
     logger.debug("ollama_chat: POST %s  model=%s  prompt=%d chars", endpoint, model, len(prompt))
-    payload = json.dumps({
+    body: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-    }).encode()
+    }
+    if no_think:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         endpoint,
         data=payload,
@@ -274,11 +307,7 @@ def ollama_chat(prompt: str, *, model: str, url: str) -> str:
         with urllib.request.urlopen(req, timeout=1800) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode(errors="replace").strip()
-        except Exception:
-            logger.debug("Could not read error detail from HTTP %d response", exc.code)
+        detail = read_http_error_detail(exc)
         msg = (
             f"Chat request failed (HTTP {exc.code}): "
             f"POST {endpoint} with model '{model}'."
@@ -398,12 +427,24 @@ def main() -> None:
                         help="AWS region for Bedrock (default: AWS_DEFAULT_REGION or us-east-1)")
     shared.add_argument("--bedrock-profile", default=None, metavar="PROFILE",
                         help="AWS profile name from ~/.aws/credentials for Bedrock")
+    shared.add_argument("--search-mode", choices=["semantic", "bm25", "hybrid"],
+                        default="semantic", dest="search_mode",
+                        help="Search mode: 'semantic' (embedding similarity), 'bm25' "
+                             "(keyword), or 'hybrid' (blended) (default: semantic)")
+    shared.add_argument("--alpha", type=float, default=0.7,
+                        help="Hybrid search blending weight: 0=pure BM25, 1=pure semantic "
+                             "(default: 0.7, only used with --search-mode hybrid)")
     shared.add_argument("--top-k", type=int, default=10, help="Number of search results")
     shared.add_argument("--depth", type=int, default=1, help="Neighborhood expansion depth")
     shared.add_argument("--node-types", nargs="+", metavar="TYPE",
                         help="Filter by node type(s)")
     shared.add_argument("--json", action="store_true", dest="json_output",
                         help="Output as JSON instead of formatted text")
+    shared.add_argument("--no-think", action="store_true", dest="no_think",
+                        help="Disable thinking/reasoning mode for models that support it "
+                             "(e.g. Qwen3, DeepSeek-R1). Sends chat_template_kwargs with "
+                             "enable_thinking=false to the server. Only effective with "
+                             "--provider local. Saves tokens and inference time.")
     shared.add_argument("-v", "--verbose", action="store_true",
                         help="Show detailed debug info")
     shared.add_argument("-q", "--quiet", action="store_true",
@@ -515,6 +556,8 @@ def main() -> None:
             top_k=args.top_k,
             node_types=args.node_types,
             expand_depth=args.depth,
+            search_mode=args.search_mode,
+            alpha=args.alpha,
         )
         if args.json_output:
             print(json.dumps(results, indent=2, cls=GraphEncoder))
@@ -536,6 +579,8 @@ def main() -> None:
             kg, args.query, embed_fn,
             max_nodes=args.top_k,
             depth=args.depth,
+            search_mode=args.search_mode,
+            alpha=args.alpha,
         )
         if args.json_output:
             # For JSON mode, return the raw context window dict
@@ -566,11 +611,13 @@ def main() -> None:
                 return bedrock_chat(prompt, model=chat_model, region=_br_region, profile=_br_profile)
         else:
             chat_url = args.ollama_url.rstrip("/")
+            _no_think = args.no_think
 
             def llm_fn(prompt: str) -> str:
-                return ollama_chat(prompt, model=chat_model, url=chat_url)
+                return ollama_chat(prompt, model=chat_model, url=chat_url, no_think=_no_think)
 
-        answer = ask(kg, args.question, embed_fn, llm_fn, max_nodes=args.top_k)
+        answer = ask(kg, args.question, embed_fn, llm_fn, max_nodes=args.top_k,
+                     search_mode=args.search_mode, alpha=args.alpha)
         if args.json_output:
             print(json.dumps({"question": args.question, "answer": answer}, indent=2))
         else:

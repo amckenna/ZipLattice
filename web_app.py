@@ -32,10 +32,11 @@ import threading
 import zipfile
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from collections.abc import Generator
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from knowledge_graph import (
@@ -61,7 +62,7 @@ logger = logging.getLogger("web_app")
 class _LogCaptureHandler(logging.Handler):
     """Accumulates formatted log records into a thread-safe list."""
 
-    def __init__(self, level: int = logging.DEBUG):
+    def __init__(self, level: int = logging.DEBUG) -> None:
         super().__init__(level)
         self._records: list[str] = []
         self._lock = threading.Lock()
@@ -71,7 +72,7 @@ class _LogCaptureHandler(logging.Handler):
             msg = self.format(record)
             with self._lock:
                 self._records.append(msg)
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             self.handleError(record)
 
     def drain(self) -> list[str]:
@@ -127,7 +128,7 @@ def _list_graphs() -> list[dict[str, Any]]:
                 "edges": st.get("num_edges", 0),
                 "sources": len(sources),
             })
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.warning("Failed to load graph '%s': %s", entry.name, exc)
             graphs.append({"name": entry.name, "nodes": "?", "edges": "?", "sources": "?"})
     return graphs
@@ -155,42 +156,96 @@ def _is_bedrock_embed_model(model: str) -> bool:
     return "." in model
 
 
+# Type aliases for provider callables
+EmbedFn = Callable[[list[str]], list[list[float]]]
+ExtractFn = Callable[[str], list[dict[str, Any]]]
+ChatFn = Callable[[str], str]
+
+
+class _ProviderConfig:
+    """Resolved provider configuration for building LLM callables.
+
+    Centralises the ``bedrock_region``/``bedrock_profile`` stripping and
+    ``None``-conversion so every builder doesn't repeat it.
+    """
+
+    __slots__ = ("provider", "model", "api_url", "region", "profile")
+
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        api_url: str = "",
+        *,
+        bedrock_region: str = "",
+        bedrock_profile: str = "",
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.api_url = api_url
+        self.region: str | None = bedrock_region.strip() or None
+        self.profile: str | None = bedrock_profile.strip() or None
+
+
 def _build_embed_fn(
-    embed_model: str, embed_url: str, *, provider: str = "local",
-    bedrock_region: str = "", bedrock_profile: str = "",
-) -> partial:
+    embed_model: str,
+    embed_url: str,
+    *,
+    provider: str = "local",
+    bedrock_region: str = "",
+    bedrock_profile: str = "",
+) -> EmbedFn:
     """Build an embedding callable for search/query."""
     if provider == "bedrock" and embed_model and _is_bedrock_embed_model(embed_model):
-        region = bedrock_region.strip() or None
-        profile = bedrock_profile.strip() or None
-        return partial(bedrock_embed, model=embed_model, region=region, profile=profile)
+        cfg = _ProviderConfig(provider, embed_model,
+                              bedrock_region=bedrock_region, bedrock_profile=bedrock_profile)
+        return partial(bedrock_embed, model=embed_model, region=cfg.region, profile=cfg.profile)
     return partial(ollama_embed, model=embed_model, url=embed_url)
 
 
-def _build_extract_fn(provider: str, model: str, api_url: str, *,
-                      bedrock_region: str = "", bedrock_profile: str = ""):
+def _build_extract_fn(
+    provider: str,
+    model: str,
+    api_url: str,
+    *,
+    bedrock_region: str = "",
+    bedrock_profile: str = "",
+    temperature: float = 0.1,
+    thinking_budget: int = 0,
+    no_think: bool = False,
+) -> ExtractFn:
     """Build an extraction callable for the given provider."""
-    if provider == "anthropic":
+    cfg = _ProviderConfig(provider, model, api_url,
+                          bedrock_region=bedrock_region, bedrock_profile=bedrock_profile)
+    if cfg.provider == "anthropic":
         api_key = _get_anthropic_api_key()
-        return partial(claude_extract, model=model, api_key=api_key)
-    if provider == "bedrock":
-        region = bedrock_region.strip() or None
-        profile = bedrock_profile.strip() or None
-        return partial(bedrock_extract, model=model, region=region, profile=profile)
-    return partial(local_extract, model=model, url=api_url)
+        return partial(claude_extract, model=cfg.model, api_key=api_key,
+                       temperature=temperature, thinking_budget=thinking_budget)
+    if cfg.provider == "bedrock":
+        return partial(bedrock_extract, model=cfg.model, region=cfg.region, profile=cfg.profile,
+                       temperature=temperature)
+    return partial(local_extract, model=cfg.model, url=cfg.api_url,
+                   temperature=temperature, no_think=no_think)
 
 
-def _build_llm_fn(provider: str, model: str, api_url: str, *,
-                  bedrock_region: str = "", bedrock_profile: str = ""):
+def _build_llm_fn(
+    provider: str,
+    model: str,
+    api_url: str,
+    *,
+    bedrock_region: str = "",
+    bedrock_profile: str = "",
+    no_think: bool = False,
+) -> ChatFn:
     """Build a chat callable for the given provider (used by 'ask' mode)."""
-    if provider == "anthropic":
+    cfg = _ProviderConfig(provider, model, api_url,
+                          bedrock_region=bedrock_region, bedrock_profile=bedrock_profile)
+    if cfg.provider == "anthropic":
         api_key = _get_anthropic_api_key()
-        return partial(claude_chat, model=model, api_key=api_key)
-    if provider == "bedrock":
-        region = bedrock_region.strip() or None
-        profile = bedrock_profile.strip() or None
-        return partial(bedrock_chat, model=model, region=region, profile=profile)
-    return partial(ollama_chat, model=model, url=api_url)
+        return partial(claude_chat, model=cfg.model, api_key=api_key)
+    if cfg.provider == "bedrock":
+        return partial(bedrock_chat, model=cfg.model, region=cfg.region, profile=cfg.profile)
+    return partial(ollama_chat, model=cfg.model, url=cfg.api_url, no_think=no_think)
 
 
 def _chat_multi_turn(
@@ -201,6 +256,7 @@ def _chat_multi_turn(
     api_url: str = "",
     bedrock_region: str = "",
     bedrock_profile: str = "",
+    no_think: bool = False,
 ) -> str:
     """Call a chat completions endpoint with full conversation history.
 
@@ -274,9 +330,12 @@ def _chat_multi_turn(
     # Default: local (OpenAI-compatible)
     import urllib.request
     endpoint = f"{api_url.rstrip('/')}/v1/chat/completions"
-    payload = json.dumps({
+    body_local: dict[str, Any] = {
         "model": model, "messages": messages, "stream": False,
-    }).encode()
+    }
+    if no_think:
+        body_local["chat_template_kwargs"] = {"enable_thinking": False}
+    payload = json.dumps(body_local).encode()
     req = urllib.request.Request(
         endpoint, data=payload,
         headers={"Content-Type": "application/json"},
@@ -284,6 +343,74 @@ def _chat_multi_turn(
     with urllib.request.urlopen(req, timeout=1800) as resp:
         body = json.loads(resp.read())
     return body["choices"][0]["message"]["content"]
+
+
+def _format_ingest_event(
+    ev: dict[str, Any], *, verbose: bool,
+) -> str | None:
+    """Format a progress event from ``ingest_markdown`` into a human-readable
+    log line for the streaming web UI.
+
+    Returns ``None`` when the event should be suppressed.
+    """
+    evt = ev.get("event", "")
+    idx = ev.get("index", 0) + 1
+    total = ev.get("total", "?")
+    heading = ev.get("heading", "")
+
+    if evt == "doc_start":
+        secs = ev.get("total_sections", 0)
+        ccount = ev.get("char_count", 0)
+        return (f"  Document: \"{ev.get('doc_id', '?')}\" "
+                f"(~{ccount // 4:,} tokens, {secs} sections)")
+    if evt == "section_start":
+        return (f"  section {idx}/{total}: {heading} "
+                f"(~{ev.get('char_count', 0) // 4:,} tokens)...")
+    if evt == "extraction_done":
+        if verbose:
+            n = ev.get("triples_returned", 0)
+            return f"    LLM returned {n} triples"
+        return None
+    if evt == "section_done":
+        elapsed = ev.get("elapsed_seconds", 0)
+        triples = ev.get("triples", 0)
+        nodes_added = ev.get("nodes_added", 0)
+        nodes_updated = ev.get("nodes_updated", 0)
+        edges_added = ev.get("edges_added", 0)
+        edges_updated = ev.get("edges_updated", 0)
+        n_parts: list[str] = []
+        if nodes_added:
+            n_parts.append(f"+{nodes_added} new")
+        if nodes_updated:
+            n_parts.append(f"{nodes_updated} updated")
+        node_str = ", ".join(n_parts) if n_parts else "0"
+        e_parts: list[str] = []
+        if edges_added:
+            e_parts.append(f"+{edges_added} new")
+        if edges_updated:
+            e_parts.append(f"{edges_updated} updated")
+        edge_str = ", ".join(e_parts) if e_parts else "0"
+        lines = [f"    {triples} triples → {node_str} nodes, {edge_str} edges ({elapsed}s)"]
+        if verbose:
+            proposals = ev.get("proposals_created", 0)
+            augmented = ev.get("proposals_augmented", 0)
+            if proposals:
+                lines.append(f"    ({proposals} new relation proposal(s))")
+            if augmented:
+                lines.append(f"    ({augmented} existing proposal(s) augmented)")
+            for err in ev.get("errors", []):
+                lines.append(f"    warning: {err}")
+        return "\n".join(lines)
+    if evt == "doc_done":
+        if verbose:
+            return (f"  Document complete: {ev.get('total_triples', 0)} triples, "
+                    f"{ev.get('total_nodes_added', 0)} nodes, "
+                    f"{ev.get('total_edges_added', 0)} edges")
+        return None
+    if evt == "section_skip":
+        return (f"  section {idx}/{total}: {heading} "
+                f"(skipped: {ev.get('reason', '')})")
+    return None
 
 
 def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
@@ -344,7 +471,7 @@ def _evict_stale_chat_sessions() -> None:
 
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def dashboard(request: Request) -> HTMLResponse:
     """Dashboard — list all knowledge graphs."""
     graphs = _list_graphs()
     logger.info("GET / — dashboard, %d graph(s) found", len(graphs))
@@ -356,7 +483,7 @@ async def dashboard(request: Request):
 
 
 @app.get("/graphs/{name}", response_class=HTMLResponse)
-async def graph_detail(request: Request, name: str):
+async def graph_detail(request: Request, name: str) -> Response:
     """Graph detail page with Cytoscape visualization."""
     logger.info("GET /graphs/%s — detail page", name)
     json_file = GRAPHS_DIR / name / f"{name}.json"
@@ -410,7 +537,7 @@ async def graph_detail(request: Request, name: str):
 
 
 @app.get("/graphs/{name}/source/{doc_id}")
-async def get_source_text(name: str, doc_id: str):
+async def get_source_text(name: str, doc_id: str) -> Response:
     """Return the stored source text for a document."""
     json_file = GRAPHS_DIR / name / f"{name}.json"
     if not json_file.exists():
@@ -426,8 +553,130 @@ async def get_source_text(name: str, doc_id: str):
     return {"doc_id": doc_id, "text": text}
 
 
+@app.get("/graphs/{name}/validate")
+async def validate_graph(name: str) -> Response:
+    """Run consistency checks on a graph and return the validation report."""
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return JSONResponse({"error": "Graph not found"}, status_code=404)
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        logger.error("Failed to load graph '%s' for validation: %s", name, exc)
+        return JSONResponse({"error": f"Cannot load graph: {exc}"}, status_code=500)
+    report = kg.validate()
+    return JSONResponse(report.to_dict())
+
+
+@app.get("/graphs/{name}/analytics", response_class=HTMLResponse)
+async def graph_analytics(request: Request, name: str) -> Response:
+    """Analytics dashboard for a knowledge graph."""
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return RedirectResponse(url="/", status_code=303)
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        logger.error("Failed to load graph '%s' for analytics: %s", name, exc)
+        return RedirectResponse(url="/", status_code=303)
+    a = kg.analytics()
+    return templates.TemplateResponse("analytics.html", {
+        "request": request,
+        "name": name,
+        "analytics": a,
+        "analytics_json": json.dumps(a, cls=GraphEncoder),
+    })
+
+
+@app.get("/api/graphs/{name}/analytics")
+async def graph_analytics_api(name: str) -> Response:
+    """Return raw analytics JSON for a graph."""
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return JSONResponse({"error": "Graph not found"}, status_code=404)
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        logger.error("Failed to load graph '%s' for analytics: %s", name, exc)
+        return JSONResponse({"error": f"Cannot load graph: {exc}"}, status_code=500)
+    return JSONResponse(kg.analytics())
+
+
+@app.get("/graphs/{name}/diff", response_class=HTMLResponse)
+async def graph_diff_page(request: Request, name: str, against: str = "") -> Response:
+    """Diff two graphs and render the result.
+
+    Query parameter ``against`` is the name of the other graph to compare.
+    If omitted, renders the diff form to select a graph.
+    """
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return RedirectResponse(url="/", status_code=303)
+
+    available = [g["name"] for g in _list_graphs() if g["name"] != name]
+
+    if not against:
+        # Render partial with just the form
+        return templates.TemplateResponse("partials/diff_result.html", {
+            "request": request,
+            "graph_name": name,
+            "available_graphs": available,
+            "diff": None,
+        })
+
+    other_file = GRAPHS_DIR / against / f"{against}.json"
+    if not other_file.exists():
+        return templates.TemplateResponse("partials/diff_result.html", {
+            "request": request,
+            "graph_name": name,
+            "available_graphs": available,
+            "diff": None,
+            "error": f"Graph '{against}' not found",
+        })
+
+    try:
+        kg = _load_graph(name)
+        other = _load_graph(against)
+        diff_result = kg.diff(other)
+        return templates.TemplateResponse("partials/diff_result.html", {
+            "request": request,
+            "graph_name": name,
+            "against_name": against,
+            "available_graphs": available,
+            "diff": diff_result.to_dict(),
+        })
+    except Exception as exc:
+        logger.error("Diff failed for '%s' vs '%s': %s", name, against, exc)
+        return templates.TemplateResponse("partials/diff_result.html", {
+            "request": request,
+            "graph_name": name,
+            "available_graphs": available,
+            "diff": None,
+            "error": f"Diff failed: {exc}",
+        })
+
+
+@app.get("/api/graphs/{name}/diff")
+async def graph_diff_api(name: str, against: str) -> Response:
+    """Return raw diff JSON between two graphs."""
+    json_file = GRAPHS_DIR / name / f"{name}.json"
+    if not json_file.exists():
+        return JSONResponse({"error": "Graph not found"}, status_code=404)
+    other_file = GRAPHS_DIR / against / f"{against}.json"
+    if not other_file.exists():
+        return JSONResponse({"error": f"Graph '{against}' not found"}, status_code=404)
+    try:
+        kg = _load_graph(name)
+        other = _load_graph(against)
+        diff_result = kg.diff(other)
+        return JSONResponse(diff_result.to_dict())
+    except Exception as exc:
+        logger.error("Diff API failed for '%s' vs '%s': %s", name, against, exc)
+        return JSONResponse({"error": f"Diff failed: {exc}"}, status_code=500)
+
+
 @app.get("/api/models")
-async def list_models(url: str = "http://localhost:11434"):
+async def list_models(url: str = "http://localhost:11434") -> Response:
     """Proxy request to a local inference endpoint to list available models.
 
     Tries Ollama ``/api/tags`` first, then the OpenAI-compatible ``/v1/models``
@@ -444,7 +693,7 @@ async def list_models(url: str = "http://localhost:11434"):
             data = json.loads(resp.read())
         names = sorted({m.get("name") or m.get("model", "") for m in data.get("models", [])})
         return {"models": [n for n in names if n]}
-    except Exception:
+    except (urllib.error.URLError, json.JSONDecodeError, OSError):
         pass
 
     # 2) Try OpenAI-compatible /v1/models
@@ -454,7 +703,7 @@ async def list_models(url: str = "http://localhost:11434"):
             data = json.loads(resp.read())
         names = sorted({m.get("id", "") for m in data.get("data", [])})
         return {"models": [n for n in names if n]}
-    except Exception as exc:
+    except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
         return JSONResponse(
             {"error": f"Could not reach {base}: {exc}"},
             status_code=502,
@@ -462,7 +711,7 @@ async def list_models(url: str = "http://localhost:11434"):
 
 
 @app.get("/upload", response_class=HTMLResponse)
-async def upload_page(request: Request, graph: str = ""):
+async def upload_page(request: Request, graph: str = "") -> HTMLResponse:
     """Upload form page."""
     logger.info("GET /upload — upload page (graph=%r)", graph)
     graphs = _list_graphs()
@@ -479,7 +728,7 @@ async def upload_files(
     graph_name: str = Form(""),
     new_graph_name: str = Form(""),
     files: list[UploadFile] = File(...),
-):
+) -> HTMLResponse:
     """Handle file uploads — convert to markdown."""
     filenames = [f.filename for f in files]
     logger.info(
@@ -539,7 +788,7 @@ async def upload_files(
 
 
 @app.get("/download-markdown/{batch_id}/{doc_index}")
-async def download_markdown(batch_id: str, doc_index: int):
+async def download_markdown(batch_id: str, doc_index: int) -> Response:
     """Download a single converted markdown file from an upload batch."""
     batch_entry = _upload_batches.get(batch_id)
     if not batch_entry:
@@ -558,7 +807,7 @@ async def download_markdown(batch_id: str, doc_index: int):
 
 
 @app.get("/download-markdown-zip/{batch_id}")
-async def download_markdown_zip(batch_id: str):
+async def download_markdown_zip(batch_id: str) -> Response:
     """Download all converted markdown files from an upload batch as a ZIP."""
     batch_entry = _upload_batches.get(batch_id)
     if not batch_entry:
@@ -593,13 +842,33 @@ async def ingest_documents(
     bedrock_region: str = Form(""),
     bedrock_profile: str = Form(""),
     verbose: str = Form(""),
-):
+    parallel: str = Form("1"),
+    incremental: str = Form(""),
+    temperature: str = Form("0.1"),
+    thinking_budget: str = Form("0"),
+    no_think: str = Form(""),
+) -> Response:
     """Run LLM ingestion with streaming progress log."""
     _verbose = verbose.strip() == "1"
+    _incremental = incremental.strip() == "1"
+    _no_think = no_think.strip() == "1"
+    try:
+        _parallel = max(1, int(parallel.strip() or "1"))
+    except (ValueError, TypeError):
+        _parallel = 1
+    try:
+        _temperature = max(0.0, min(2.0, float(temperature.strip() or "0.1")))
+    except (ValueError, TypeError):
+        _temperature = 0.1
+    try:
+        _thinking_budget = max(0, int(thinking_budget.strip() or "0"))
+    except (ValueError, TypeError):
+        _thinking_budget = 0
     logger.info(
-        "POST /ingest graph=%s batch=%s provider=%s model=%s embed=%s verbose=%s",
+        "POST /ingest graph=%s batch=%s provider=%s model=%s embed=%s verbose=%s parallel=%d temp=%.2f thinking=%d no_think=%s",
         graph_name, batch_id, provider,
-        extract_model.strip() or query_model, embed_model, _verbose,
+        extract_model.strip() or query_model, embed_model, _verbose, _parallel,
+        _temperature, _thinking_budget, _no_think,
     )
 
     batch_entry = _upload_batches.pop(batch_id, None)
@@ -623,7 +892,7 @@ async def ingest_documents(
         logger.info("[ingest %s] %s", graph_name, msg)
         return json.dumps({"type": "log", "message": msg}) + "\n"
 
-    def _stream():
+    def _stream() -> Generator[str, None, None]:
       # Attach a log-capture handler to surface knowledge_graph logs in verbose mode
       kg_logger = logging.getLogger("knowledge_graph")
       capture_handler: _LogCaptureHandler | None = None
@@ -635,7 +904,7 @@ async def ingest_documents(
           kg_logger.setLevel(logging.DEBUG)
           kg_logger.addHandler(capture_handler)
 
-      def _drain_captured():
+      def _drain_captured() -> Generator[str, None, None]:
           """Yield any captured knowledge_graph log messages."""
           if capture_handler is None:
               return
@@ -646,16 +915,23 @@ async def ingest_documents(
         _model = extract_model.strip() or query_model
         extract_fn = _build_extract_fn(provider, _model, api_url,
                                        bedrock_region=bedrock_region,
-                                       bedrock_profile=bedrock_profile)
+                                       bedrock_profile=bedrock_profile,
+                                       temperature=_temperature,
+                                       thinking_budget=_thinking_budget,
+                                       no_think=_no_think)
         results = []
         total_docs = len(batch)
         graph_stats_before = kg.stats()
+
+        if _parallel > 1:
+            yield _log(f"Parallel extractions: {_parallel} threads")
 
         if _verbose:
             yield _log(
                 f"Config: provider={provider} extract_model={_model} "
                 f"embed_model={embed_model} api_url={api_url} "
-                f"embed_url={embed_url.strip() or api_url}"
+                f"embed_url={embed_url.strip() or api_url} "
+                f"parallel={_parallel}"
             )
             yield _log(
                 f"Graph before: {graph_stats_before.get('num_nodes', 0)} nodes, "
@@ -677,7 +953,7 @@ async def ingest_documents(
                 # instead of being batched until ingest_markdown returns.
                 event_queue: queue.Queue = queue.Queue()
 
-                def _capture_progress(event: dict):
+                def _capture_progress(event: dict) -> None:
                     event_queue.put(event)
 
                 # Run ingestion in a background thread so the generator
@@ -685,7 +961,7 @@ async def ingest_documents(
                 ingest_result: dict = {}
                 ingest_error: list = []
 
-                def _run_ingest():
+                def _run_ingest() -> None:
                     try:
                         stats = kg.ingest_markdown(
                             doc["text"],
@@ -693,6 +969,8 @@ async def ingest_documents(
                             llm_extract_fn=extract_fn,
                             original_path=doc.get("filename"),
                             progress_fn=_capture_progress,
+                            parallel_extractions=_parallel,
+                            incremental=_incremental,
                         )
                         ingest_result.update(stats)
                     except Exception as exc:
@@ -713,57 +991,10 @@ async def ingest_documents(
                     # Drain any captured knowledge_graph debug logs
                     yield from _drain_captured()
 
-                    evt = ev.get("event", "")
-                    idx = ev.get("index", 0) + 1
-                    total = ev.get("total", "?")
-                    heading = ev.get("heading", "")
-                    if evt == "doc_start":
-                        secs = ev.get("total_sections", 0)
-                        ccount = ev.get("char_count", 0)
-                        yield _log(f"  Document: \"{ev.get('doc_id', '?')}\" (~{ccount // 4:,} tokens, {secs} sections)")
-                    elif evt == "section_start":
-                        yield _log(f"  section {idx}/{total}: {heading} (~{ev.get('char_count', 0) // 4:,} tokens)...")
-                    elif evt == "extraction_done":
-                        if _verbose:
-                            n = ev.get("triples_returned", 0)
-                            yield _log(f"    LLM returned {n} triples")
-                    elif evt == "section_done":
-                        elapsed = ev.get("elapsed_seconds", 0)
-                        triples = ev.get("triples", 0)
-                        nodes_added = ev.get("nodes_added", 0)
-                        nodes_updated = ev.get("nodes_updated", 0)
-                        edges_added = ev.get("edges_added", 0)
-                        edges_updated = ev.get("edges_updated", 0)
-                        # Build concise summary
-                        n_parts = []
-                        if nodes_added:
-                            n_parts.append(f"+{nodes_added} new")
-                        if nodes_updated:
-                            n_parts.append(f"{nodes_updated} updated")
-                        node_str = ", ".join(n_parts) if n_parts else "0"
-                        e_parts = []
-                        if edges_added:
-                            e_parts.append(f"+{edges_added} new")
-                        if edges_updated:
-                            e_parts.append(f"{edges_updated} updated")
-                        edge_str = ", ".join(e_parts) if e_parts else "0"
-                        yield _log(f"    {triples} triples → {node_str} nodes, {edge_str} edges ({elapsed}s)")
-                        if _verbose:
-                            proposals = ev.get("proposals_created", 0)
-                            augmented = ev.get("proposals_augmented", 0)
-                            if proposals:
-                                yield _log(f"    ({proposals} new relation proposal(s))")
-                            if augmented:
-                                yield _log(f"    ({augmented} existing proposal(s) augmented)")
-                            errors = ev.get("errors", [])
-                            for err in errors:
-                                yield _log(f"    warning: {err}")
-                    elif evt == "doc_done":
-                        if _verbose:
-                            yield _log(f"  Document complete: {ev.get('total_triples', 0)} triples, "
-                                       f"{ev.get('total_nodes_added', 0)} nodes, {ev.get('total_edges_added', 0)} edges")
-                    elif evt == "section_skip":
-                        yield _log(f"  section {idx}/{total}: {heading} (skipped: {ev.get('reason', '')})")
+                    formatted = _format_ingest_event(ev, verbose=_verbose)
+                    if formatted:
+                        for line in formatted.split("\n"):
+                            yield _log(line)
 
                 ingest_thread.join()
 
@@ -902,7 +1133,7 @@ async def ingest_documents(
 
 
 @app.get("/query", response_class=HTMLResponse)
-async def query_page(request: Request):
+async def query_page(request: Request) -> HTMLResponse:
     """Query form page."""
     logger.info("GET /query — query page")
     graphs = _list_graphs()
@@ -919,6 +1150,8 @@ async def run_query(
     query: str = Form(...),
     mode: str = Form("search"),
     response_mode: str = Form("single"),
+    search_mode: str = Form("semantic"),
+    alpha: float = Form(0.7),
     api_url: str = Form("http://localhost:11434"),
     query_model: str = Form("qwen3-coder:30b"),
     embed_url: str = Form(""),
@@ -926,11 +1159,13 @@ async def run_query(
     provider: str = Form("local"),
     bedrock_region: str = Form(""),
     bedrock_profile: str = Form(""),
-):
+    no_think: str = Form(""),
+) -> HTMLResponse:
     """Execute a query against a knowledge graph."""
+    _no_think = no_think.strip() == "1"
     logger.info(
-        "POST /query graph=%s mode=%s response_mode=%s provider=%s model=%s query=%r",
-        graph_name, mode, response_mode, provider, query_model, query[:80],
+        "POST /query graph=%s mode=%s response_mode=%s provider=%s model=%s no_think=%s query=%r",
+        graph_name, mode, response_mode, provider, query_model, _no_think, query[:80],
     )
     try:
         kg = _load_graph(graph_name)
@@ -952,7 +1187,8 @@ async def run_query(
 
     try:
         if mode == "search":
-            results = search_nodes(kg, query, embed_fn, top_k=10)
+            results = search_nodes(kg, query, embed_fn, top_k=10,
+                                   search_mode=search_mode, alpha=alpha)
             return templates.TemplateResponse("partials/query_result.html", {
                 "request": request,
                 "mode": "search",
@@ -960,7 +1196,8 @@ async def run_query(
                 "graph_name": graph_name,
             })
         elif mode == "context":
-            ctx = build_context(kg, query, embed_fn)
+            ctx = build_context(kg, query, embed_fn,
+                                search_mode=search_mode, alpha=alpha)
             return templates.TemplateResponse("partials/query_result.html", {
                 "request": request,
                 "mode": "context",
@@ -969,15 +1206,18 @@ async def run_query(
         elif mode == "ask":
             llm_fn = _build_llm_fn(provider, query_model, api_url,
                                    bedrock_region=bedrock_region,
-                                   bedrock_profile=bedrock_profile)
-            answer = ask(kg, query, embed_fn, llm_fn)
+                                   bedrock_profile=bedrock_profile,
+                                   no_think=_no_think)
+            answer = ask(kg, query, embed_fn, llm_fn,
+                         search_mode=search_mode, alpha=alpha)
 
             # If chat mode, create a session so the user can follow up
             chat_session_id = None
             if response_mode == "chat":
                 _evict_stale_chat_sessions()
                 # Build the RAG context that was used for this answer
-                rag_context = build_context(kg, query, embed_fn)
+                rag_context = build_context(kg, query, embed_fn,
+                                            search_mode=search_mode, alpha=alpha)
                 chat_session_id = uuid.uuid4().hex[:12]
                 _chat_sessions[chat_session_id] = {
                     "messages": [
@@ -995,6 +1235,7 @@ async def run_query(
                         "api_url": api_url,
                         "bedrock_region": bedrock_region,
                         "bedrock_profile": bedrock_profile,
+                        "no_think": _no_think,
                     },
                     "created_at": time.time(),
                 }
@@ -1005,6 +1246,20 @@ async def run_query(
                 "mode": "ask",
                 "answer": answer,
                 "chat_session_id": chat_session_id,
+            })
+        elif mode == "pattern":
+            from knowledge_graph import QueryParseError
+            try:
+                paths = kg.graph_query(query, limit=50)
+            except QueryParseError as qe:
+                return templates.TemplateResponse("partials/query_result.html", {
+                    "request": request,
+                    "error": f"Pattern query parse error: {qe}",
+                })
+            return templates.TemplateResponse("partials/query_result.html", {
+                "request": request,
+                "mode": "pattern",
+                "paths": paths,
             })
         else:
             return templates.TemplateResponse("partials/query_result.html", {
@@ -1027,7 +1282,7 @@ async def chat_follow_up(
     request: Request,
     session_id: str = Form(...),
     message: str = Form(...),
-):
+) -> HTMLResponse:
     """Handle a follow-up message in an active chat session."""
     logger.info("POST /chat session=%s message=%r", session_id, message[:80])
 
@@ -1047,12 +1302,14 @@ async def chat_follow_up(
     api_url = cfg["api_url"]
     bedrock_region = cfg.get("bedrock_region", "")
     bedrock_profile = cfg.get("bedrock_profile", "")
+    _no_think = cfg.get("no_think", False)
 
     try:
         answer = _chat_multi_turn(
             session["messages"],
             provider=provider, model=model, api_url=api_url,
             bedrock_region=bedrock_region, bedrock_profile=bedrock_profile,
+            no_think=_no_think,
         )
     except Exception as exc:
         # Remove the failed user message so they can retry
@@ -1076,7 +1333,7 @@ async def chat_follow_up(
 
 
 @app.delete("/graphs/{name}")
-async def delete_graph(name: str):
+async def delete_graph(name: str) -> HTMLResponse:
     """Delete a knowledge graph and all its artifacts."""
     logger.info("DELETE /graphs/%s — deleting graph", name)
     graph_dir = GRAPHS_DIR / name
@@ -1099,7 +1356,7 @@ async def delete_graph(name: str):
 
 
 @app.get("/graphs/{name}/export")
-async def export_graph(name: str):
+async def export_graph(name: str) -> Response:
     """Export a knowledge graph as a portable .zip archive."""
     logger.info("GET /graphs/%s/export — exporting graph", name)
     graph_dir = GRAPHS_DIR / name
@@ -1164,7 +1421,7 @@ def _make_relative(path_str: str, base: Path) -> str:
 async def import_graph(
     request: Request,
     file: UploadFile = File(...),
-):
+) -> HTMLResponse:
     """Import a knowledge graph from a previously exported .zip archive."""
     filename = file.filename or "upload.zip"
     logger.info("POST /import file=%s", filename)
@@ -1293,7 +1550,7 @@ async def import_graph(
 
 
 @app.get("/merge", response_class=HTMLResponse)
-async def merge_form(request: Request):
+async def merge_form(request: Request) -> HTMLResponse:
     """Show the merge graph form with checkboxes for each graph."""
     graphs = _list_graphs()
     return templates.TemplateResponse("merge.html", {
@@ -1308,7 +1565,7 @@ async def merge_graphs_route(
     graph_names: list[str] = Form(...),
     output_name: str = Form(...),
     strategy: str = Form("latest"),
-):
+) -> HTMLResponse:
     """Merge selected graphs into a new graph."""
     logger.info("POST /merge graphs=%s output=%s strategy=%s",
                 graph_names, output_name, strategy)
@@ -1362,8 +1619,303 @@ async def merge_graphs_route(
     })
 
 
+# ---------------------------------------------------------------------------
+# Cross-graph document browser & transplant
+# ---------------------------------------------------------------------------
+
+
+def _list_all_documents() -> list[dict[str, Any]]:
+    """Scan all graphs and build a unified document inventory.
+
+    Each entry includes the document metadata plus a ``graphs`` list showing
+    which graphs the document belongs to and whether it was transplanted there.
+    """
+    GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
+    # doc_slug → { doc info + graphs: [{name, node_count, edge_count, is_transplant, transplanted_from}] }
+    docs: dict[str, dict[str, Any]] = {}
+    for entry in sorted(GRAPHS_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        json_file = entry / f"{entry.name}.json"
+        if not json_file.exists():
+            continue
+        try:
+            kg = KnowledgeGraph(json_file)
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            continue
+        sources = kg._data.get("meta", {}).get("sources", {})
+
+        # Count nodes/edges per doc in this graph
+        doc_node_counts: dict[str, int] = {}
+        doc_edge_counts: dict[str, int] = {}
+        for node in kg._data.get("nodes", {}).values():
+            src = node.get("source", "")
+            if src.startswith("doc:"):
+                doc_key = slugify(src.split("::")[0].removeprefix("doc:"))
+                doc_node_counts[doc_key] = doc_node_counts.get(doc_key, 0) + 1
+        for edge in kg._data.get("edges", []):
+            src_tag = edge.get("source_tag", "")
+            if src_tag.startswith("doc:"):
+                doc_key = slugify(src_tag.split("::")[0].removeprefix("doc:"))
+                doc_edge_counts[doc_key] = doc_edge_counts.get(doc_key, 0) + 1
+
+        for doc_slug, info in sources.items():
+            if doc_slug not in docs:
+                docs[doc_slug] = {
+                    "doc_id": doc_slug,
+                    "content_hash": info.get("content_hash", ""),
+                    "char_count": info.get("char_count", 0),
+                    "original_path": info.get("original_path"),
+                    "stored_at": info.get("stored_at", ""),
+                    "version": info.get("version", 1),
+                    "graphs": [],
+                }
+            transplanted_from = info.get("transplanted_from", [])
+            is_transplant = len(transplanted_from) > 0
+            docs[doc_slug]["graphs"].append({
+                "name": entry.name,
+                "node_count": doc_node_counts.get(doc_slug, 0),
+                "edge_count": doc_edge_counts.get(doc_slug, 0),
+                "is_transplant": is_transplant,
+                "transplanted_from": transplanted_from,
+            })
+            # Update top-level metadata to latest version seen
+            if info.get("stored_at", "") > docs[doc_slug].get("stored_at", ""):
+                docs[doc_slug]["stored_at"] = info.get("stored_at", "")
+                docs[doc_slug]["char_count"] = info.get("char_count", 0)
+                docs[doc_slug]["version"] = info.get("version", 1)
+    return sorted(docs.values(), key=lambda d: d["doc_id"])
+
+
+@app.get("/documents", response_class=HTMLResponse)
+async def documents_page(request: Request, q: str = "") -> HTMLResponse:
+    """Cross-graph document browser."""
+    all_docs = _list_all_documents()
+    graphs = _list_graphs()
+    if q:
+        q_lower = q.lower()
+        all_docs = [
+            d for d in all_docs
+            if q_lower in d["doc_id"].lower()
+            or q_lower in (d.get("original_path") or "").lower()
+        ]
+    return templates.TemplateResponse("documents.html", {
+        "request": request,
+        "documents": all_docs,
+        "graphs": graphs,
+        "query": q,
+    })
+
+
+@app.get("/graphs/{name}/documents/{doc_id}/extract")
+async def extract_document(name: str, doc_id: str) -> JSONResponse:
+    """Extract a document subgraph as JSON."""
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    try:
+        subgraph = kg.extract_document_subgraph(doc_id)
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse(
+        json.loads(json.dumps(subgraph, cls=GraphEncoder)),
+    )
+
+
+@app.get("/graphs/{name}/documents/{doc_id}/history")
+async def document_history(name: str, doc_id: str) -> JSONResponse:
+    """Get version history for a document including section diffs."""
+    try:
+        kg = _load_graph(name)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    history = kg.get_document_history(doc_id)
+    if not history:
+        return JSONResponse({"error": f"No history for '{doc_id}'"}, status_code=404)
+    return JSONResponse(
+        json.loads(json.dumps(history, cls=GraphEncoder)),
+    )
+
+
+@app.post("/transplant", response_class=HTMLResponse)
+async def transplant_document(
+    request: Request,
+    source_graph: str = Form(...),
+    doc_id: str = Form(...),
+    target_graph: str = Form(...),
+) -> HTMLResponse:
+    """Transplant a document subgraph from one graph to another."""
+    logger.info(
+        "POST /transplant doc=%s from=%s to=%s",
+        doc_id, source_graph, target_graph,
+    )
+    if source_graph == target_graph:
+        return templates.TemplateResponse("partials/transplant_result.html", {
+            "request": request,
+            "error": "Source and target graph must be different.",
+        })
+    try:
+        src_kg = _load_graph(source_graph)
+    except Exception as exc:
+        return templates.TemplateResponse("partials/transplant_result.html", {
+            "request": request,
+            "error": f"Cannot load source graph: {exc}",
+        })
+    try:
+        dst_kg = _load_graph(target_graph)
+    except Exception as exc:
+        return templates.TemplateResponse("partials/transplant_result.html", {
+            "request": request,
+            "error": f"Cannot load target graph: {exc}",
+        })
+    try:
+        subgraph = src_kg.extract_document_subgraph(doc_id)
+        stats = dst_kg.import_document_subgraph(subgraph)
+        dst_kg.save_all()
+    except KeyError as exc:
+        return templates.TemplateResponse("partials/transplant_result.html", {
+            "request": request,
+            "error": f"Document not found: {exc}",
+        })
+    except Exception as exc:
+        logger.error("Transplant failed: %s", exc, exc_info=True)
+        return templates.TemplateResponse("partials/transplant_result.html", {
+            "request": request,
+            "error": f"Transplant failed: {exc}",
+        })
+
+    return templates.TemplateResponse("partials/transplant_result.html", {
+        "request": request,
+        "doc_id": doc_id,
+        "source_graph": source_graph,
+        "target_graph": target_graph,
+        "stats": stats,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Proposals management
+# ---------------------------------------------------------------------------
+
+
+@app.get("/graphs/{name}/proposals", response_class=HTMLResponse)
+async def proposals_page(request: Request, name: str) -> HTMLResponse:
+    """Dedicated proposals management page for a graph."""
+    try:
+        kg = _load_graph(name)
+    except Exception:
+        return HTMLResponse("Graph not found", status_code=404)
+
+    all_proposals = kg.get_proposals(status=None)
+    similar_groups = kg.find_similar_proposals()
+    return templates.TemplateResponse("proposals.html", {
+        "request": request,
+        "graph_name": name,
+        "proposals": [p.to_dict() for p in all_proposals],
+        "similar_groups": [
+            [p.to_dict() for p in group] for group in similar_groups
+        ],
+    })
+
+
+@app.get("/api/graphs/{name}/proposals")
+async def api_proposals(name: str) -> JSONResponse:
+    """Return all proposals as JSON."""
+    try:
+        kg = _load_graph(name)
+    except Exception:
+        return JSONResponse({"error": "Graph not found"}, status_code=404)
+    all_proposals = kg.get_proposals(status=None)
+    return JSONResponse(
+        [p.to_dict() for p in all_proposals],
+        media_type="application/json",
+    )
+
+
+@app.post("/graphs/{name}/proposals/bulk", response_class=HTMLResponse)
+async def bulk_proposals(
+    request: Request,
+    name: str,
+    action: str = Form(...),
+    names: list[str] = Form(...),
+    review_note: str = Form(""),
+) -> HTMLResponse:
+    """Bulk accept or reject proposals."""
+    try:
+        kg = _load_graph(name)
+    except Exception:
+        return HTMLResponse("Graph not found", status_code=404)
+
+    if action == "accept":
+        result = kg.bulk_accept_proposals(names, review_note=review_note)
+    elif action == "reject":
+        result = kg.bulk_reject_proposals(names, review_note=review_note)
+    elif action == "merge":
+        # For merge, the first name in the list is the target
+        if len(names) < 2:
+            return HTMLResponse("Need at least 2 proposals to merge", status_code=400)
+        target = names[0]
+        try:
+            kg.merge_proposals(names, target_name=target)
+            result = names
+        except ValueError as exc:
+            return HTMLResponse(str(exc), status_code=400)
+    else:
+        return HTMLResponse(f"Unknown action: {action}", status_code=400)
+
+    kg.save()
+
+    # Re-render the full proposals page
+    all_proposals = kg.get_proposals(status=None)
+    similar_groups = kg.find_similar_proposals()
+    return templates.TemplateResponse("proposals.html", {
+        "request": request,
+        "graph_name": name,
+        "proposals": [p.to_dict() for p in all_proposals],
+        "similar_groups": [
+            [p.to_dict() for p in group] for group in similar_groups
+        ],
+        "flash": f"{action.title()}ed {len(result)} proposal(s)",
+    })
+
+
+@app.post("/graphs/{name}/proposals/auto-accept", response_class=HTMLResponse)
+async def auto_accept_proposals(
+    request: Request,
+    name: str,
+    min_confidence: float = Form(0.7),
+    min_examples: int = Form(2),
+    max_accept: int = Form(0),
+) -> HTMLResponse:
+    """Auto-accept proposals meeting thresholds."""
+    try:
+        kg = _load_graph(name)
+    except Exception:
+        return HTMLResponse("Graph not found", status_code=404)
+
+    accepted = kg.accept_all_proposals(
+        min_confidence=min_confidence,
+        min_examples=min_examples,
+        max_accept=max_accept,
+    )
+    kg.save()
+
+    all_proposals = kg.get_proposals(status=None)
+    similar_groups = kg.find_similar_proposals()
+    return templates.TemplateResponse("proposals.html", {
+        "request": request,
+        "graph_name": name,
+        "proposals": [p.to_dict() for p in all_proposals],
+        "similar_groups": [
+            [p.to_dict() for p in group] for group in similar_groups
+        ],
+        "flash": f"Auto-accepted {len(accepted)} proposal(s)",
+    })
+
+
 @app.get("/health")
-async def health():
+async def health() -> dict[str, str]:
     """Health check endpoint."""
     return {"status": "ok"}
 

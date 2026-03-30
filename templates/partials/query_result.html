@@ -77,4 +77,24 @@ document.getElementById('chat-form').addEventListener('htmx:afterRequest', funct
 });
 </script>
 {% endif %}
+{% elif mode == "pattern" %}
+<div class="border border-gray-800 p-4 mt-4 space-y-2">
+  <h3 class="text-sm font-bold">Pattern Results ({{ paths|length }} path{{ "s" if paths|length != 1 else "" }})</h3>
+  {% if paths %}
+  {% for path in paths %}
+  <div class="border-b border-gray-800 py-2 text-sm flex flex-wrap items-center gap-1">
+    <span class="text-gray-600 mr-2">{{ loop.index }}.</span>
+    {% for item in path %}
+      {% if item.node_id is defined %}
+        <span class="border border-gray-700 px-2 py-0.5 text-xs" title="id: {{ item.node_id }} | type: {{ item.type }} | confidence: {{ item.confidence }}">{{ item.label }}</span>
+      {% elif item.relation is defined %}
+        <span class="text-gray-500 text-xs">-[{{ item.relation }}]-&gt;</span>
+      {% endif %}
+    {% endfor %}
+  </div>
+  {% endfor %}
+  {% else %}
+  <p class="text-sm text-gray-400">No matching paths found.</p>
+  {% endif %}
+</div>
 {% endif %}

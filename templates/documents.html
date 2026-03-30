@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+
+{% block title %}Documents — ZipLattice{% endblock %}
+{% block nav_documents %}text-white border-b border-white{% endblock %}
+
+{% block content %}
+<div class="space-y-8">
+  <div class="flex items-center justify-between">
+    <h1 class="text-2xl font-bold">Documents</h1>
+    <span class="text-sm text-gray-400">{{ documents|length }} document{{ 's' if documents|length != 1 else '' }} across all graphs</span>
+  </div>
+
+  <!-- Search -->
+  <form method="get" action="/documents" class="flex gap-3">
+    <input type="text" name="q" value="{{ query }}" placeholder="Search documents by name or path..."
+           class="flex-1 bg-black border border-gray-800 px-4 py-2 text-sm text-white placeholder-gray-600 focus:border-white focus:outline-none">
+    <button type="submit"
+            class="border border-white px-4 py-2 text-sm hover:bg-white hover:text-black transition-colors">
+      Search
+    </button>
+    {% if query %}
+    <a href="/documents"
+       class="border border-gray-800 px-4 py-2 text-sm text-gray-400 hover:border-white hover:text-white transition-colors">
+      Clear
+    </a>
+    {% endif %}
+  </form>
+
+  <!-- Transplant result area -->
+  <div id="transplant-result"></div>
+
+  {% if documents %}
+  <div class="space-y-4">
+    {% for doc in documents %}
+    <div class="border border-gray-800 p-4 space-y-3">
+      <!-- Document header -->
+      <div class="flex items-start justify-between">
+        <div>
+          <h2 class="text-sm font-bold">{{ doc.doc_id }}</h2>
+          {% if doc.original_path %}
+          <p class="text-xs text-gray-600 mt-0.5 break-all">{{ doc.original_path }}</p>
+          {% endif %}
+        </div>
+        <div class="text-right text-xs text-gray-400 space-y-0.5 shrink-0 ml-4">
+          <div>{{ (doc.char_count / 1000)|round(1) }}k chars</div>
+          <div>v{{ doc.version }}</div>
+          <div>{{ doc.content_hash[:8] }}</div>
+        </div>
+      </div>
+
+      <!-- Graph memberships -->
+      <div class="text-xs space-y-1">
+        <span class="text-gray-400">In {{ doc.graphs|length }} graph{{ 's' if doc.graphs|length != 1 else '' }}:</span>
+        <div class="flex flex-wrap gap-2 mt-1">
+          {% for g in doc.graphs %}
+          <a href="/graphs/{{ g.name }}"
+             class="inline-flex items-center gap-1.5 border border-gray-800 px-2 py-1 hover:border-white hover:text-white transition-colors {% if g.is_transplant %}text-gray-300{% else %}text-white{% endif %}">
+            <span>{{ g.name }}</span>
+            <span class="text-gray-600">{{ g.node_count }}n/{{ g.edge_count }}e</span>
+            {% if g.is_transplant %}
+            <span class="text-gray-400" title="Transplanted from {{ g.transplanted_from[-1].graph if g.transplanted_from else 'unknown' }}">T</span>
+            {% else %}
+            <span class="text-gray-600" title="Primary (ingested here)">P</span>
+            {% endif %}
+          </a>
+          {% endfor %}
+        </div>
+      </div>
+
+      <!-- Transplant form -->
+      <details class="text-xs">
+        <summary class="text-gray-400 cursor-pointer hover:text-white">Transplant to another graph...</summary>
+        <form hx-post="/transplant" hx-target="#transplant-result" hx-swap="innerHTML"
+              class="mt-2 flex items-end gap-3">
+          <input type="hidden" name="doc_id" value="{{ doc.doc_id }}">
+          <div>
+            <label class="block text-gray-400 mb-1">From</label>
+            <select name="source_graph"
+                    class="bg-black border border-gray-800 px-3 py-1.5 text-sm text-white focus:border-white focus:outline-none">
+              {% for g in doc.graphs %}
+              <option value="{{ g.name }}">{{ g.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label class="block text-gray-400 mb-1">To</label>
+            <select name="target_graph"
+                    class="bg-black border border-gray-800 px-3 py-1.5 text-sm text-white focus:border-white focus:outline-none">
+              {% for g in graphs %}
+              <option value="{{ g.name }}">{{ g.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <button type="submit"
+                  class="border border-white px-4 py-1.5 text-sm hover:bg-white hover:text-black transition-colors">
+            Transplant
+          </button>
+        </form>
+      </details>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="border border-gray-800 p-8 text-center text-gray-400">
+    {% if query %}
+    No documents matching "{{ query }}". <a href="/documents" class="underline hover:text-white">Clear search</a>
+    {% else %}
+    No documents found. <a href="/upload" class="underline hover:text-white">Upload documents</a> to get started.
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- Legend -->
+  <div class="text-xs text-gray-600 flex gap-4">
+    <span><strong class="text-gray-400">P</strong> = Primary (ingested directly)</span>
+    <span><strong class="text-gray-400">T</strong> = Transplanted (imported from another graph)</span>
+    <span><strong class="text-gray-400">n/e</strong> = nodes/edges attributed to this document</span>
+  </div>
+</div>
+{% endblock %}

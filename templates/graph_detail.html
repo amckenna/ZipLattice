@@ -150,6 +150,30 @@
   .source-md-body th { background: var(--border); font-weight: 600; }
   .source-md-body a { color: var(--accent); text-decoration: underline; }
   .source-md-body hr { border: none; border-top: 1px solid var(--border-strong); margin: 1em 0; }
+
+  /* Version history timeline */
+  .version-badge { cursor: pointer; text-decoration: underline dotted; }
+  .version-badge:hover { color: var(--accent); }
+  .version-history-pane {
+    border-top: 1px solid var(--border);
+    padding: 12px 24px;
+    background: var(--surface);
+    font-size: 12px;
+  }
+  .version-timeline { list-style: none; padding: 0; margin: 0; }
+  .version-timeline li {
+    padding: 6px 0; border-left: 2px solid var(--border-strong);
+    padding-left: 12px; margin-left: 6px; position: relative;
+  }
+  .version-timeline li::before {
+    content: ''; position: absolute; left: -5px; top: 10px;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--border-strong);
+  }
+  .version-timeline li.current::before { background: var(--accent); }
+  .diff-added { color: #4ade80; }
+  .diff-removed { color: #f87171; }
+  .diff-modified { color: #fbbf24; }
 </style>
 {% endblock %}
 
@@ -165,6 +189,14 @@
       <a href="/upload?graph={{ graph_name }}"
          class="border border-gray-800 px-4 py-1.5 text-sm text-gray-400 hover:border-white hover:text-white transition-colors">
         Upload Documents
+      </a>
+      <a href="/graphs/{{ graph_name }}/analytics"
+         class="border border-gray-800 px-4 py-1.5 text-sm text-gray-400 hover:border-white hover:text-white transition-colors">
+        Analytics
+      </a>
+      <a href="/graphs/{{ graph_name }}/diff"
+         class="border border-gray-800 px-4 py-1.5 text-sm text-gray-400 hover:border-white hover:text-white transition-colors">
+        Diff
       </a>
       <a href="/graphs/{{ graph_name }}/export"
          class="border border-gray-800 px-4 py-1.5 text-sm text-gray-400 hover:border-white hover:text-white transition-colors">
@@ -197,6 +229,61 @@
       <div class="text-xs text-gray-400 mt-1">Relation Types</div>
     </div>
   </div>
+
+  <!-- Validation card (loaded via HTMX) -->
+  <div id="validation-card" class="border border-gray-800 p-4 mt-4" style="display:none;">
+    <div class="flex items-center justify-between">
+      <div class="text-xs text-gray-400">Validation</div>
+      <button class="text-xs px-2 py-1 border border-gray-700 hover:border-gray-500"
+              onclick="runValidation()">Run Checks</button>
+    </div>
+    <div id="validation-result" class="mt-2 text-sm"></div>
+  </div>
+  <script>
+  // Show the validation card after page loads
+  document.getElementById('validation-card').style.display = 'block';
+
+  function runValidation() {
+    const resultDiv = document.getElementById('validation-result');
+    resultDiv.innerHTML = '<span class="text-gray-500">Validating…</span>';
+    fetch('/graphs/{{ name }}/validate')
+      .then(r => r.json())
+      .then(data => {
+        let html = '';
+        if (data.is_valid && data.summary.warning_count === 0) {
+          html = '<span style="color:#10b981;">&#10003; All checks passed</span>';
+        } else {
+          const parts = [];
+          if (data.summary.error_count > 0) {
+            parts.push('<span style="color:#ef4444;">' + data.summary.error_count + ' error(s)</span>');
+          }
+          if (data.summary.warning_count > 0) {
+            parts.push('<span style="color:#f59e0b;">' + data.summary.warning_count + ' warning(s)</span>');
+          }
+          html = parts.join(', ');
+          if (data.errors.length > 0) {
+            html += '<details class="mt-2"><summary class="cursor-pointer text-xs text-gray-400">Errors</summary><ul class="mt-1 text-xs" style="color:#ef4444;">';
+            data.errors.forEach(e => { html += '<li class="mt-1">' + e.replace(/</g,'&lt;') + '</li>'; });
+            html += '</ul></details>';
+          }
+          if (data.warnings.length > 0) {
+            html += '<details class="mt-2"><summary class="cursor-pointer text-xs text-gray-400">Warnings</summary><ul class="mt-1 text-xs" style="color:#f59e0b;">';
+            data.warnings.forEach(w => { html += '<li class="mt-1">' + w.replace(/</g,'&lt;') + '</li>'; });
+            html += '</ul></details>';
+          }
+        }
+        if (data.info.length > 0) {
+          html += '<details class="mt-2"><summary class="cursor-pointer text-xs text-gray-400">Info</summary><ul class="mt-1 text-xs text-gray-500">';
+          data.info.forEach(i => { html += '<li class="mt-1">' + i.replace(/</g,'&lt;') + '</li>'; });
+          html += '</ul></details>';
+        }
+        resultDiv.innerHTML = html;
+      })
+      .catch(err => {
+        resultDiv.innerHTML = '<span style="color:#ef4444;">Validation failed: ' + err + '</span>';
+      });
+  }
+  </script>
 
   <!-- Cytoscape visualization -->
   <div id="cy-container">
@@ -283,10 +370,19 @@
         <tr class="border-b border-gray-800 source-row" data-doc-id="{{ doc_id }}" {% if info.get("has_text") %}style="cursor:pointer"{% endif %}>
           <td class="py-2 text-gray-400">{% if info.get("has_text") %}<span class="source-toggle">&#9654;</span>{% endif %}</td>
           <td class="py-2">{{ doc_id }}</td>
-          <td class="py-2 text-right text-gray-400">v{{ info.get("version", 1) }}</td>
+          <td class="py-2 text-right text-gray-400">
+            <span class="version-badge" data-doc-id="{{ doc_id }}" title="Click for version history">v{{ info.get("version", 1) }}</span>
+          </td>
           <td class="py-2 text-right text-gray-400">{{ info.get("node_count", 0) }}</td>
           <td class="py-2 text-right text-gray-400">{{ info.get("edge_count", 0) }}</td>
           <td class="py-2 text-right text-gray-400">~{{ "{:,}".format(info.get("char_count", 0) // 4) }}</td>
+        </tr>
+        <tr class="source-history-row" id="source-history-{{ doc_id }}" style="display:none">
+          <td colspan="6" class="p-0">
+            <div class="version-history-pane" id="version-history-{{ doc_id }}">
+              <span class="text-gray-500 text-xs">Loading history…</span>
+            </div>
+          </td>
         </tr>
         <tr class="source-content-row" id="source-content-{{ doc_id }}" style="display:none">
           <td colspan="6" class="p-0">
@@ -676,6 +772,54 @@ document.querySelectorAll('.source-row[data-doc-id]').forEach(row => {
       }
       mdBody.dataset.loaded = '1';
     }
+  });
+});
+
+// --- Version history expandable badges ---
+document.querySelectorAll('.version-badge[data-doc-id]').forEach(badge => {
+  badge.addEventListener('click', async function(e) {
+    e.stopPropagation();
+    const docId = this.dataset.docId;
+    const historyRow = document.getElementById('source-history-' + docId);
+    const pane = document.getElementById('version-history-' + docId);
+    const isOpen = historyRow.style.display !== 'none';
+    if (isOpen) {
+      historyRow.style.display = 'none';
+      return;
+    }
+    historyRow.style.display = '';
+    if (pane.dataset.loaded) return;
+    try {
+      const resp = await fetch('/graphs/{{ graph_name }}/documents/' + encodeURIComponent(docId) + '/history');
+      const data = await resp.json();
+      if (data.error) {
+        pane.innerHTML = '<span class="text-gray-500">' + data.error + '</span>';
+      } else {
+        let html = '<ul class="version-timeline">';
+        data.forEach(v => {
+          const cls = v.is_current ? ' current' : '';
+          html += '<li class="' + cls + '">';
+          html += '<strong>v' + v.version + '</strong>' + (v.is_current ? ' (current)' : '');
+          html += ' &mdash; ' + (v.stored_at || '').slice(0, 10);
+          html += '<br><span class="text-gray-400">' + (v.char_count || 0).toLocaleString() + ' chars, ';
+          html += (v.section_count || 0) + ' sections, ';
+          html += (v.node_count || 0) + ' nodes, ' + (v.edge_count || 0) + ' edges</span>';
+          if (v.diff && v.diff.has_changes) {
+            html += '<br>';
+            if (v.diff.added.length) html += '<span class="diff-added">+' + v.diff.added.length + ' added</span> ';
+            if (v.diff.removed.length) html += '<span class="diff-removed">-' + v.diff.removed.length + ' removed</span> ';
+            if (v.diff.modified.length) html += '<span class="diff-modified">~' + v.diff.modified.length + ' modified</span> ';
+            if (v.diff.unchanged.length) html += '<span class="text-gray-500">' + v.diff.unchanged.length + ' unchanged</span>';
+          }
+          html += '</li>';
+        });
+        html += '</ul>';
+        pane.innerHTML = html;
+      }
+    } catch (e) {
+      pane.innerHTML = '<span class="text-gray-500">Failed to load history</span>';
+    }
+    pane.dataset.loaded = '1';
   });
 });
 

@@ -32,6 +32,7 @@ import math
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from copy import deepcopy
@@ -44,6 +45,24 @@ from typing import Any, Callable, Optional
 import networkx as nx
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared HTTP error handling
+# ---------------------------------------------------------------------------
+
+
+def read_http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """Safely extract the response body text from an ``HTTPError``.
+
+    Returns the decoded body string (stripped), or ``""`` if the body
+    cannot be read (e.g. the stream was already consumed).
+    """
+    try:
+        return exc.read().decode(errors="replace").strip()
+    except OSError:
+        logger.debug("Could not read error detail from HTTP %d response", exc.code)
+        return ""
 
 
 def ollama_embed(
@@ -74,11 +93,7 @@ def ollama_embed(
         with urllib.request.urlopen(req, timeout=300) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode(errors="replace").strip()
-        except Exception:
-            logger.debug("Could not read error detail from HTTP %d response", exc.code)
+        detail = read_http_error_detail(exc)
         msg = (
             f"Embedding request failed (HTTP {exc.code}): "
             f"POST {endpoint} with model '{model}'."
@@ -187,7 +202,12 @@ def _parse_extraction_response(raw: str, *, model: str, label: str) -> list[dict
 
 
 def local_extract(
-    prompt: str, *, model: str, url: str = "http://localhost:11434"
+    prompt: str,
+    *,
+    model: str,
+    url: str = "http://localhost:11434",
+    temperature: float = 0.1,
+    no_think: bool = False,
 ) -> list[dict[str, Any]]:
     """Call an OpenAI-compatible ``/v1/chat/completions`` endpoint for extraction.
 
@@ -198,21 +218,30 @@ def local_extract(
         prompt: The user-facing extraction prompt (section text).
         model: Model name (e.g. ``qwen3-coder:30b``).
         url: Server base URL.
+        temperature: Sampling temperature (0.0–2.0, default 0.1).
+        no_think: When True, disable thinking/reasoning mode for models
+            that support it (e.g. Qwen3, DeepSeek-R1) by passing
+            ``chat_template_kwargs: {"enable_thinking": false}`` in the
+            request payload.  This avoids wasting tokens on chain-of-thought
+            reasoning that will be stripped anyway.
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
     """
     endpoint = f"{url.rstrip('/')}/v1/chat/completions"
-    payload = json.dumps({
+    body: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
         "stream": False,
-        "temperature": 0.1,
+        "temperature": temperature,
         "max_tokens": 32768,
-    }).encode()
+    }
+    if no_think:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         endpoint,
         data=payload,
@@ -224,11 +253,7 @@ def local_extract(
         with urllib.request.urlopen(req, timeout=1800) as resp:
             body = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode(errors="replace").strip()
-        except Exception:
-            logger.debug("Could not read error detail from HTTP %d response", exc.code)
+        detail = read_http_error_detail(exc)
         logger.error(
             "Extraction request failed (HTTP %d, model=%s): %s",
             exc.code, model, detail or "(no detail)",
@@ -277,12 +302,10 @@ def _rate_limit_wait(detail: str, attempt: int) -> float:
     try:
         err = json.loads(detail) if detail else {}
         msg = err.get("error", {}).get("message", "")
-        # Some APIs include "retry after X seconds" in the message
-        import re as _re
-        m = _re.search(r"retry.after\D*(\d+)", msg, _re.IGNORECASE)
+        m = re.search(r"retry.after\D*(\d+)", msg, re.IGNORECASE)
         if m:
             return float(m.group(1))
-    except Exception:
+    except (json.JSONDecodeError, KeyError, AttributeError):
         pass
     return min(30 * (2 ** attempt), 300)
 
@@ -326,11 +349,7 @@ def _anthropic_request(
             with urllib.request.urlopen(req, timeout=1800) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode(errors="replace").strip()
-            except Exception:
-                logger.debug("Could not read error detail from HTTP %d response", exc.code)
+            detail = read_http_error_detail(exc)
             if exc.code == 429 and attempt < max_retries - 1:
                 wait = _rate_limit_wait(detail, attempt)
                 logger.warning(
@@ -398,7 +417,14 @@ def claude_chat(prompt: str, *, model: str, api_key: str | None = None) -> str:
     return answer
 
 
-def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> list[dict[str, Any]]:
+def claude_extract(
+    prompt: str,
+    *,
+    model: str,
+    api_key: str | None = None,
+    temperature: float = 0.1,
+    thinking_budget: int = 0,
+) -> list[dict[str, Any]]:
     """Call the Anthropic Messages API for JSON extraction.
 
     Mirrors the extraction pattern used by the OpenAI-compatible path:
@@ -409,6 +435,14 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
         prompt: The user-facing extraction prompt (section text).
         model: Anthropic model ID (e.g. ``claude-haiku-4-5``).
         api_key: API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
+        temperature: Sampling temperature (0.0–1.0, default 0.1).
+            Ignored when *thinking_budget* > 0 (Anthropic requires
+            ``temperature=1`` for extended thinking).
+        thinking_budget: When > 0, enable Claude's extended thinking with
+            this many tokens as the ``budget_tokens``.  The API requires
+            ``temperature=1`` when thinking is enabled, so the
+            *temperature* parameter is overridden automatically.
+            Set to 0 (default) to disable extended thinking.
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
@@ -416,18 +450,44 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
     if not api_key:
         api_key = _get_anthropic_api_key()
 
+    payload: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 32768,
+        "system": _EXTRACTION_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    if thinking_budget > 0:
+        # Extended thinking requires temperature=1 and the thinking block
+        payload["temperature"] = 1
+        payload["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": thinking_budget,
+        }
+    else:
+        payload["temperature"] = temperature
+
     t0 = time.monotonic()
     body = _anthropic_request(
-        {"model": model, "max_tokens": 32768, "temperature": 0.1,
-         "system": _EXTRACTION_SYSTEM_PROMPT,
-         "messages": [{"role": "user", "content": prompt}]},
+        payload,
         api_key=api_key, model=model, label="extract", on_error="return",
     )
     if body is None:
         return []
 
     elapsed = time.monotonic() - t0
-    raw = body["content"][0]["text"].strip()
+    # When extended thinking is enabled, the response contains
+    # [{"type": "thinking", ...}, {"type": "text", ...}].
+    # Extract the text block.
+    raw = ""
+    for block in body.get("content", []):
+        if block.get("type") == "text":
+            raw = block.get("text", "").strip()
+            break
+    if not raw and body.get("content"):
+        # Fallback: first block's text (non-thinking responses)
+        raw = body["content"][0].get("text", "").strip()
+
     logger.debug("claude_extract: raw response=%d chars (%.1fs)", len(raw), elapsed)
     return _parse_extraction_response(raw, model=model, label="Claude")
 
@@ -437,7 +497,7 @@ def claude_extract(prompt: str, *, model: str, api_key: str | None = None) -> li
 # ---------------------------------------------------------------------------
 
 
-def _get_bedrock_client(region: str | None = None, profile: str | None = None):
+def _get_bedrock_client(region: str | None = None, profile: str | None = None) -> Any:
     """Return a ``boto3`` Bedrock Runtime client.
 
     Relies on standard AWS credential resolution (env vars, shared
@@ -622,6 +682,7 @@ def bedrock_extract(
     model: str,
     region: str | None = None,
     profile: str | None = None,
+    temperature: float = 0.1,
 ) -> list[dict[str, Any]]:
     """Call AWS Bedrock Converse API for JSON extraction.
 
@@ -634,6 +695,7 @@ def bedrock_extract(
         model: Bedrock model ID.
         region: AWS region.
         profile: AWS profile name from ``~/.aws/credentials``.
+        temperature: Sampling temperature (0.0–1.0, default 0.1).
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
@@ -643,7 +705,7 @@ def bedrock_extract(
         {"modelId": model,
          "messages": [{"role": "user", "content": [{"text": prompt}]}],
          "system": [{"text": _EXTRACTION_SYSTEM_PROMPT}],
-         "inferenceConfig": {"maxTokens": 32768, "temperature": 0.1}},
+         "inferenceConfig": {"maxTokens": 32768, "temperature": temperature}},
         model=model, region=region, profile=profile,
         label="extract", on_error="return",
     )
@@ -1205,6 +1267,518 @@ class RelationProposal:
 
 
 # ---------------------------------------------------------------------------
+# Structured Graph Query Language
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NodeFilter:
+    """Filter criteria for matching nodes in a pattern query."""
+    type: str | None = None        # type:X
+    label: str | None = None       # label:X (exact match)
+    label_glob: str | None = None  # label:~"pattern" (glob/fnmatch)
+    node_id: str | None = None     # id:X
+    wildcard: bool = False         # * (matches any)
+
+    def matches(self, node_id: str, node_data: dict[str, Any]) -> bool:
+        """Test whether a node matches this filter."""
+        if self.wildcard:
+            return True
+        if self.node_id is not None:
+            return node_id == self.node_id
+        if self.type is not None and node_data.get("type", "concept") != self.type:
+            return False
+        if self.label is not None:
+            node_label = node_data.get("label", node_id)
+            if node_label.lower() != self.label.lower():
+                return False
+        if self.label_glob is not None:
+            import fnmatch
+            node_label = node_data.get("label", node_id)
+            if not fnmatch.fnmatchcase(node_label.lower(), self.label_glob.lower()):
+                return False
+        return True
+
+
+@dataclass
+class EdgeFilter:
+    """Filter criteria for matching edges in a pattern query."""
+    relations: list[str] | None = None  # [rel] or [rel1|rel2]
+    wildcard: bool = False              # [*] (matches any relation)
+
+    def matches(self, relation: str) -> bool:
+        """Test whether an edge relation matches this filter."""
+        if self.wildcard:
+            return True
+        if self.relations is not None:
+            return relation in self.relations
+        return True
+
+
+@dataclass
+class QueryStep:
+    """One step (node + edge transition) in a graph pattern query."""
+    node_filter: NodeFilter
+    edge_filter: EdgeFilter | None = None   # None for the last node in the pattern
+    direction: str = "out"                  # "out" (->), "in" (<-), "any" (--)
+
+
+class QueryParseError(ValueError):
+    """Raised when a graph query string cannot be parsed."""
+    def __init__(self, message: str, position: int = -1):
+        self.position = position
+        if position >= 0:
+            message = f"at position {position}: {message}"
+        super().__init__(message)
+
+
+def _parse_graph_query(query_str: str) -> tuple[list[QueryStep], float | None, int | None]:
+    """
+    Parse a graph pattern query string into a list of QuerySteps
+    plus optional WHERE confidence and DEPTH modifiers.
+
+    Syntax::
+
+        (type:technology) -[depends_on]-> (*) -[is_a]-> (label:"database")
+        (label:~"SAR*") -[*]-> (*) WHERE confidence > 0.7
+        (*) -[is_a]-> (id:"python") DEPTH 2
+
+    Returns:
+        (steps, min_confidence, depth)
+        - steps: list of QueryStep
+        - min_confidence: float from WHERE clause or None
+        - depth: int from DEPTH clause or None
+    """
+    raw = query_str.strip()
+    if not raw:
+        raise QueryParseError("empty query", 0)
+
+    # Extract WHERE and DEPTH clauses from the end
+    min_confidence: float | None = None
+    depth: int | None = None
+
+    import re as _re
+
+    # Extract DEPTH N
+    depth_match = _re.search(r'\bDEPTH\s+(\d+)\s*$', raw, _re.IGNORECASE)
+    if depth_match:
+        depth = int(depth_match.group(1))
+        raw = raw[:depth_match.start()].strip()
+
+    # Extract WHERE confidence > N
+    where_match = _re.search(
+        r'\bWHERE\s+confidence\s*>\s*([\d.]+)\s*$', raw, _re.IGNORECASE
+    )
+    if where_match:
+        min_confidence = float(where_match.group(1))
+        raw = raw[:where_match.start()].strip()
+
+    # Tokenize into node specs and edge specs
+    # Pattern: (node_spec) followed by optional -[edge_spec]-> or <-[edge_spec]- or --[edge_spec]--
+    # We'll parse by scanning for balanced parens and bracket groups
+
+    steps: list[QueryStep] = []
+    pos = 0
+
+    while pos < len(raw):
+        # Skip whitespace
+        while pos < len(raw) and raw[pos] in ' \t':
+            pos += 1
+        if pos >= len(raw):
+            break
+
+        # Expect a node: (...)
+        if raw[pos] != '(':
+            raise QueryParseError(f"expected '(' for node filter, got '{raw[pos]}'", pos)
+        node_start = pos
+        paren_depth = 1
+        pos += 1
+        while pos < len(raw) and paren_depth > 0:
+            if raw[pos] == '(':
+                paren_depth += 1
+            elif raw[pos] == ')':
+                paren_depth -= 1
+            pos += 1
+        if paren_depth != 0:
+            raise QueryParseError("unmatched '('", node_start)
+        node_spec = raw[node_start + 1:pos - 1].strip()
+        node_filter = _parse_node_filter(node_spec, node_start + 1)
+
+        # Skip whitespace
+        while pos < len(raw) and raw[pos] in ' \t':
+            pos += 1
+
+        # Check for edge transition
+        if pos >= len(raw):
+            # Last node in pattern, no edge
+            steps.append(QueryStep(node_filter=node_filter))
+            break
+
+        # Parse edge: -[...]-> or <-[...]- or --[...]--
+        edge_filter, direction, pos = _parse_edge_transition(raw, pos)
+        steps.append(QueryStep(
+            node_filter=node_filter,
+            edge_filter=edge_filter,
+            direction=direction,
+        ))
+
+    if not steps:
+        raise QueryParseError("no node patterns found", 0)
+
+    return steps, min_confidence, depth
+
+
+def _parse_node_filter(spec: str, base_pos: int) -> NodeFilter:
+    """Parse the content inside (...) into a NodeFilter."""
+    spec = spec.strip()
+    if spec == '*':
+        return NodeFilter(wildcard=True)
+
+    nf = NodeFilter()
+    # Parse key:value pairs separated by commas or spaces
+    # Supported: type:X, label:X, label:~"pattern", id:X
+    import re as _re
+
+    # Handle multiple filters (comma-separated)
+    parts = [p.strip() for p in spec.split(',') if p.strip()]
+    if not parts:
+        parts = [spec]
+
+    for part in parts:
+        part = part.strip()
+        if part == '*':
+            nf.wildcard = True
+            continue
+
+        # type:value
+        m = _re.match(r'^type:\s*"?([^"]+?)"?\s*$', part)
+        if m:
+            nf.type = m.group(1).strip()
+            continue
+
+        # label:~"pattern" (glob)
+        m = _re.match(r'^label:\s*~\s*"([^"]+)"$', part)
+        if m:
+            nf.label_glob = m.group(1)
+            continue
+
+        # label:"value" or label:value
+        m = _re.match(r'^label:\s*"([^"]+)"$', part)
+        if m:
+            nf.label = m.group(1)
+            continue
+        m = _re.match(r'^label:\s*(\S+)$', part)
+        if m:
+            nf.label = m.group(1)
+            continue
+
+        # id:"value" or id:value
+        m = _re.match(r'^id:\s*"?([^"]+?)"?\s*$', part)
+        if m:
+            nf.node_id = slugify(m.group(1).strip())
+            continue
+
+        raise QueryParseError(f"unknown node filter: '{part}'", base_pos)
+
+    return nf
+
+
+def _parse_edge_transition(raw: str, pos: int) -> tuple[EdgeFilter, str, int]:
+    """
+    Parse an edge transition at position pos in the raw query string.
+
+    Supported forms:
+        -[rel]->       forward
+        <-[rel]-       backward
+        --[rel]--      undirected
+        -[*]->         wildcard forward
+        -[rel1|rel2]-> alternatives
+
+    Returns (EdgeFilter, direction, new_pos).
+    """
+    start = pos
+    direction = "out"
+
+    # Detect direction prefix
+    if raw[pos:pos + 2] == '<-':
+        direction = "in"
+        pos += 2
+    elif raw[pos:pos + 2] == '--':
+        direction = "any"
+        pos += 2
+    elif raw[pos] == '-':
+        pos += 1
+    else:
+        raise QueryParseError(
+            f"expected edge transition ('-', '<-', or '--'), got '{raw[pos]}'", pos
+        )
+
+    # Expect [...]
+    if pos >= len(raw) or raw[pos] != '[':
+        raise QueryParseError("expected '[' for edge filter", pos)
+    bracket_start = pos
+    pos += 1
+    bracket_end = raw.find(']', pos)
+    if bracket_end < 0:
+        raise QueryParseError("unmatched '['", bracket_start)
+    edge_spec = raw[pos:bracket_end].strip()
+    pos = bracket_end + 1
+
+    # Detect direction suffix
+    if direction == "in":
+        # <-[rel]-  (expect trailing -)
+        if pos < len(raw) and raw[pos] == '-':
+            pos += 1
+    elif direction == "any":
+        # --[rel]--  (expect trailing --)
+        if raw[pos:pos + 2] == '--':
+            pos += 2
+        elif pos < len(raw) and raw[pos] == '-':
+            pos += 1
+    else:
+        # -[rel]->  (expect trailing ->)
+        if raw[pos:pos + 2] == '->':
+            pos += 2
+        elif pos < len(raw) and raw[pos] == '-':
+            pos += 1
+
+    # Parse edge filter
+    if edge_spec == '*':
+        edge_filter = EdgeFilter(wildcard=True)
+    else:
+        relations = [r.strip() for r in edge_spec.split('|') if r.strip()]
+        if not relations:
+            raise QueryParseError("empty edge filter", bracket_start)
+        edge_filter = EdgeFilter(relations=relations)
+
+    return edge_filter, direction, pos
+
+
+# ---------------------------------------------------------------------------
+# Graph Validation
+# ---------------------------------------------------------------------------
+
+# Taxonomic relations that should not form cycles
+TAXONOMIC_RELATIONS = {"is_a", "subclass_of", "instance_of", "part_of"}
+
+# Pairs of relations that are contradictory on the same (source, target) pair
+CONTRADICTORY_PAIRS: set[tuple[str, str]] = {
+    ("is_a", "has_part"),
+    ("supersedes", "superseded_by"),
+    ("causes", "caused_by"),
+    ("depends_on", "required_by"),
+    ("uses", "used_by"),
+    ("documents", "documented_by"),
+    ("references", "referenced_by"),
+    ("contains", "part_of"),
+}
+
+
+@dataclass
+class ValidationReport:
+    """Result of graph validation checks.
+
+    Attributes:
+        errors: Serious issues that indicate data corruption or logical
+                inconsistency (e.g., dangling edges, taxonomic cycles).
+        warnings: Potential problems worth investigating (e.g., orphan
+                  nodes, contradictory edge pairs, zero-confidence items).
+        info: Informational observations (e.g., missing embeddings,
+              graph structure notes).
+    """
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    info: list[str] = field(default_factory=list)
+
+    @property
+    def is_valid(self) -> bool:
+        """True if no errors were found."""
+        return len(self.errors) == 0
+
+    @property
+    def total_issues(self) -> int:
+        return len(self.errors) + len(self.warnings)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "is_valid": self.is_valid,
+            "errors": self.errors,
+            "warnings": self.warnings,
+            "info": self.info,
+            "summary": {
+                "error_count": len(self.errors),
+                "warning_count": len(self.warnings),
+                "info_count": len(self.info),
+            },
+        }
+
+
+@dataclass
+class DocumentDiff:
+    """Result of comparing two document versions at section level.
+
+    Attributes:
+        doc_id: The document identifier.
+        version_from: The older version number.
+        version_to: The newer version number.
+        added: Section headings present only in the newer version.
+        removed: Section headings present only in the older version.
+        modified: Section headings present in both but with different hashes.
+        unchanged: Section headings present in both with identical hashes.
+    """
+    doc_id: str
+    version_from: int
+    version_to: int
+    added: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    modified: list[str] = field(default_factory=list)
+    unchanged: list[str] = field(default_factory=list)
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(self.added or self.removed or self.modified)
+
+    @property
+    def summary(self) -> str:
+        parts = []
+        if self.added:
+            parts.append(f"{len(self.added)} added")
+        if self.removed:
+            parts.append(f"{len(self.removed)} removed")
+        if self.modified:
+            parts.append(f"{len(self.modified)} modified")
+        if self.unchanged:
+            parts.append(f"{len(self.unchanged)} unchanged")
+        return ", ".join(parts) if parts else "no sections"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "doc_id": self.doc_id,
+            "version_from": self.version_from,
+            "version_to": self.version_to,
+            "added": self.added,
+            "removed": self.removed,
+            "modified": self.modified,
+            "unchanged": self.unchanged,
+            "has_changes": self.has_changes,
+            "summary": self.summary,
+        }
+
+
+@dataclass
+class GraphDiff:
+    """Result of comparing two graph states.
+
+    Tracks nodes and edges that were added, removed, or modified between
+    two ``KnowledgeGraph`` snapshots.  Proposals are tracked separately.
+
+    Attributes:
+        nodes_added: List of node dicts present only in the *newer* graph.
+        nodes_removed: List of node dicts present only in the *older* graph.
+        nodes_modified: List of dicts describing field-level changes for
+            nodes present in both graphs but with different data.
+        edges_added: List of edge dicts present only in the newer graph.
+        edges_removed: List of edge dicts present only in the older graph.
+        edges_modified: List of dicts describing field-level changes for
+            edges present in both graphs but with different data.
+        proposals_added: List of proposal dicts added in the newer graph.
+        proposals_changed: List of dicts describing proposal status changes.
+    """
+
+    nodes_added: list[dict[str, Any]] = field(default_factory=list)
+    nodes_removed: list[dict[str, Any]] = field(default_factory=list)
+    nodes_modified: list[dict[str, Any]] = field(default_factory=list)
+    edges_added: list[dict[str, Any]] = field(default_factory=list)
+    edges_removed: list[dict[str, Any]] = field(default_factory=list)
+    edges_modified: list[dict[str, Any]] = field(default_factory=list)
+    proposals_added: list[dict[str, Any]] = field(default_factory=list)
+    proposals_changed: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(
+            self.nodes_added or self.nodes_removed or self.nodes_modified
+            or self.edges_added or self.edges_removed or self.edges_modified
+            or self.proposals_added or self.proposals_changed
+        )
+
+    @property
+    def summary(self) -> str:
+        parts: list[str] = []
+        if self.nodes_added:
+            parts.append(f"{len(self.nodes_added)} nodes added")
+        if self.nodes_removed:
+            parts.append(f"{len(self.nodes_removed)} nodes removed")
+        if self.nodes_modified:
+            parts.append(f"{len(self.nodes_modified)} nodes modified")
+        if self.edges_added:
+            parts.append(f"{len(self.edges_added)} edges added")
+        if self.edges_removed:
+            parts.append(f"{len(self.edges_removed)} edges removed")
+        if self.edges_modified:
+            parts.append(f"{len(self.edges_modified)} edges modified")
+        if self.proposals_added:
+            parts.append(f"{len(self.proposals_added)} proposals added")
+        if self.proposals_changed:
+            parts.append(f"{len(self.proposals_changed)} proposals changed")
+        return ", ".join(parts) if parts else "no changes"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "nodes_added": self.nodes_added,
+            "nodes_removed": self.nodes_removed,
+            "nodes_modified": self.nodes_modified,
+            "edges_added": self.edges_added,
+            "edges_removed": self.edges_removed,
+            "edges_modified": self.edges_modified,
+            "proposals_added": self.proposals_added,
+            "proposals_changed": self.proposals_changed,
+            "has_changes": self.has_changes,
+            "summary": self.summary,
+            "counts": {
+                "nodes_added": len(self.nodes_added),
+                "nodes_removed": len(self.nodes_removed),
+                "nodes_modified": len(self.nodes_modified),
+                "edges_added": len(self.edges_added),
+                "edges_removed": len(self.edges_removed),
+                "edges_modified": len(self.edges_modified),
+                "proposals_added": len(self.proposals_added),
+                "proposals_changed": len(self.proposals_changed),
+            },
+        }
+
+
+def compute_section_hashes(
+    text: str,
+    *,
+    min_section_chars: int = 80,
+    max_section_chars: int = 6000,
+) -> dict[str, str]:
+    """Compute SHA-256 hashes for each section in a markdown document.
+
+    Args:
+        text: Raw markdown text.
+        min_section_chars: Passed through to ``parse_markdown_sections``.
+        max_section_chars: Passed through to ``parse_markdown_sections``.
+
+    Returns:
+        Dict mapping section heading (or ``"__preamble__"`` for the
+        untitled preamble) to the 12-char SHA-256 hash of that
+        section's body text.
+    """
+    sections = KnowledgeGraph.parse_markdown_sections(
+        text,
+        min_section_chars=min_section_chars,
+        max_section_chars=max_section_chars,
+    )
+    hashes: dict[str, str] = {}
+    for section in sections:
+        heading = section["heading"] or "__preamble__"
+        hashes[heading] = content_hash(section["body"])
+    return hashes
+
+
+# ---------------------------------------------------------------------------
 # KnowledgeGraph
 # ---------------------------------------------------------------------------
 
@@ -1418,6 +1992,7 @@ class KnowledgeGraph:
         *,
         original_path: str | Path | None = None,
         encoding: str = "utf-8",
+        section_hashes: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """
         Store a source document's text in the managed sources directory.
@@ -1465,6 +2040,7 @@ class KnowledgeGraph:
                     "is_update": False,
                     "version": entry.get("version", 1),
                     "ingestion_id": ingestion_id,
+                    "section_hashes": entry.get("section_hashes", {}),
                 }
 
         # Check if same content was already stored for this doc_id
@@ -1480,6 +2056,7 @@ class KnowledgeGraph:
                     "is_update": False,
                     "version": old_entry.get("version", 1),
                     "ingestion_id": ingestion_id,
+                    "section_hashes": old_entry.get("section_hashes", {}),
                 }
 
         # Determine filename: {hash}_{slug}.md
@@ -1536,6 +2113,7 @@ class KnowledgeGraph:
             "stored_at": ts,
             "version": version,
             "ingestion_id": ingestion_id,
+            "section_hashes": section_hashes or {},
         }
 
         # Build version history: carry over old history + append the just-archived version
@@ -1552,6 +2130,7 @@ class KnowledgeGraph:
                     "stored_at": old_entry.get("stored_at", ""),
                     "ingestion_id": old_entry.get("ingestion_id", ""),
                     "archived_to": str(self.sources_dir / "archive" / archive_name),
+                    "section_hashes": old_entry.get("section_hashes", {}),
                 })
 
         manifest[doc_slug] = entry
@@ -1568,6 +2147,7 @@ class KnowledgeGraph:
             "is_update": is_update,
             "version": version,
             "ingestion_id": ingestion_id,
+            "section_hashes": section_hashes or {},
         }
 
     def get_source_path(self, doc_id: str) -> Path | None:
@@ -1661,6 +2241,7 @@ class KnowledgeGraph:
                 "archived_to": str(v.get("archived_to", "")),
                 "file_exists": archived.exists(),
                 "is_current": False,
+                "section_hashes": v.get("section_hashes", {}),
             })
 
         # Current version
@@ -1676,9 +2257,124 @@ class KnowledgeGraph:
             "stored_path": str(entry.get("stored_path", "")),
             "file_exists": stored.exists(),
             "is_current": True,
+            "section_hashes": entry.get("section_hashes", {}),
         })
 
         return sorted(versions, key=lambda v: v["version"])
+
+    def diff_document_versions(
+        self, doc_id: str, v1: int, v2: int,
+    ) -> DocumentDiff:
+        """Compare two versions of a document at section level.
+
+        Uses ``section_hashes`` stored in the source manifest to identify
+        which sections were added, removed, modified, or unchanged between
+        two versions.
+
+        Args:
+            doc_id: The document identifier.
+            v1: The older version number.
+            v2: The newer version number.
+
+        Returns:
+            A :class:`DocumentDiff` describing changes between the versions.
+
+        Raises:
+            KeyError: If the document or either version is not found.
+        """
+        versions = self.get_source_versions(doc_id)
+        if not versions:
+            raise KeyError(f"Document '{doc_id}' not found in source manifest")
+
+        v1_entry = None
+        v2_entry = None
+        for v in versions:
+            if v["version"] == v1:
+                v1_entry = v
+            if v["version"] == v2:
+                v2_entry = v
+
+        if v1_entry is None:
+            raise KeyError(f"Version {v1} not found for document '{doc_id}'")
+        if v2_entry is None:
+            raise KeyError(f"Version {v2} not found for document '{doc_id}'")
+
+        hashes_v1: dict[str, str] = v1_entry.get("section_hashes", {})
+        hashes_v2: dict[str, str] = v2_entry.get("section_hashes", {})
+
+        keys_v1 = set(hashes_v1.keys())
+        keys_v2 = set(hashes_v2.keys())
+
+        added = sorted(keys_v2 - keys_v1)
+        removed = sorted(keys_v1 - keys_v2)
+        common = keys_v1 & keys_v2
+        modified = sorted(h for h in common if hashes_v1[h] != hashes_v2[h])
+        unchanged = sorted(h for h in common if hashes_v1[h] == hashes_v2[h])
+
+        return DocumentDiff(
+            doc_id=doc_id,
+            version_from=v1,
+            version_to=v2,
+            added=added,
+            removed=removed,
+            modified=modified,
+            unchanged=unchanged,
+        )
+
+    def get_document_history(self, doc_id: str) -> list[dict[str, Any]]:
+        """Get a rich version timeline for a document.
+
+        Extends :meth:`get_source_versions` with per-version section counts
+        and node/edge counts from the graph.
+
+        Args:
+            doc_id: The document identifier.
+
+        Returns:
+            List of version dicts (oldest first), each augmented with:
+              - ``section_count``: number of sections (from section_hashes)
+              - ``node_count``: number of nodes created during this ingestion
+              - ``edge_count``: number of edges created during this ingestion
+              - ``diff``: if not the first version, a :class:`DocumentDiff`
+                dict showing changes from the previous version
+        """
+        versions = self.get_source_versions(doc_id)
+        if not versions:
+            return []
+
+        result: list[dict[str, Any]] = []
+        prev_version_num: int | None = None
+
+        for v in versions:
+            entry = dict(v)  # shallow copy
+            shashes = v.get("section_hashes", {})
+            entry["section_count"] = len(shashes)
+
+            # Count nodes and edges from this ingestion run
+            iid = v.get("ingestion_id", "")
+            if iid:
+                entry["node_count"] = len(self.get_nodes_by_ingestion(iid))
+                entry["edge_count"] = len(self.get_edges_by_ingestion(iid))
+            else:
+                entry["node_count"] = 0
+                entry["edge_count"] = 0
+
+            # Compute diff from previous version
+            if prev_version_num is not None:
+                try:
+                    diff = self.diff_document_versions(
+                        doc_id, prev_version_num, v["version"],
+                    )
+                    entry["diff"] = diff.to_dict()
+                except KeyError:
+                    entry["diff"] = None
+            else:
+                entry["diff"] = None
+
+            prev_version_num = v["version"]
+            result.append(entry)
+
+        return result
 
     def get_nodes_by_ingestion(self, ingestion_id: str) -> list[tuple[str, dict]]:
         """
@@ -1886,6 +2582,155 @@ class KnowledgeGraph:
     def to_dict(self) -> dict[str, Any]:
         """Return a deep copy of the raw graph data."""
         return deepcopy(self._data)
+
+    # ------------------------------------------------------------------
+    # Snapshot & diff
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a deep copy of the current graph state for later diffing.
+
+        The returned dict captures ``_data`` and ``_proposals`` so that
+        :meth:`diff` can compare before/after states within a session.
+        """
+        return {
+            "data": deepcopy(self._data),
+            "proposals": [p.to_dict() for p in self._proposals],
+        }
+
+    @staticmethod
+    def _diff_node_fields(
+        node_id: str,
+        old: dict[str, Any],
+        new: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Compare two node dicts and return field-level changes, or None."""
+        changes: dict[str, Any] = {}
+        all_keys = set(old) | set(new)
+        for key in all_keys:
+            old_val = old.get(key)
+            new_val = new.get(key)
+            if old_val != new_val:
+                changes[key] = {"old": old_val, "new": new_val}
+        if changes:
+            return {"node_id": node_id, "label": new.get("label", old.get("label", node_id)), "changes": changes}
+        return None
+
+    @staticmethod
+    def _edge_key(edge: dict[str, Any]) -> tuple[str, str, str]:
+        return (edge["source"], edge["target"], edge.get("relation", "related_to"))
+
+    @staticmethod
+    def _diff_edge_fields(
+        edge_key: tuple[str, str, str],
+        old: dict[str, Any],
+        new: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Compare two edge dicts and return field-level changes, or None."""
+        changes: dict[str, Any] = {}
+        all_keys = set(old) | set(new)
+        for key in all_keys:
+            old_val = old.get(key)
+            new_val = new.get(key)
+            if old_val != new_val:
+                changes[key] = {"old": old_val, "new": new_val}
+        if changes:
+            return {"source": edge_key[0], "target": edge_key[1], "relation": edge_key[2], "changes": changes}
+        return None
+
+    def diff(self, other: "KnowledgeGraph") -> GraphDiff:
+        """Compare this graph against *other* and return a :class:`GraphDiff`.
+
+        ``self`` is treated as the **older** state and *other* as the
+        **newer** state.  The result describes what changed to go from
+        ``self`` to *other*.
+        """
+        return self._diff_data(self._data, [p.to_dict() for p in self._proposals],
+                               other._data, [p.to_dict() for p in other._proposals])
+
+    def diff_from_snapshot(self, snap: dict[str, Any]) -> GraphDiff:
+        """Compare a previously captured :meth:`snapshot` against the current state.
+
+        The snapshot is the **older** state; the current graph is the
+        **newer** state.
+        """
+        return self._diff_data(snap["data"], snap["proposals"],
+                               self._data, [p.to_dict() for p in self._proposals])
+
+    def diff_from_file(self, path: str | Path) -> GraphDiff:
+        """Load a graph from *path* and diff it against the current state.
+
+        The file is the **older** state; the current graph is the
+        **newer** state.
+        """
+        other = KnowledgeGraph(path)
+        return other.diff(self)
+
+    @classmethod
+    def _diff_data(
+        cls,
+        old_data: dict[str, Any],
+        old_proposals: list[dict[str, Any]],
+        new_data: dict[str, Any],
+        new_proposals: list[dict[str, Any]],
+    ) -> GraphDiff:
+        """Core diff logic operating on raw data dicts."""
+        result = GraphDiff()
+
+        # --- Nodes ---
+        old_nodes = old_data.get("nodes", {})
+        new_nodes = new_data.get("nodes", {})
+        old_ids = set(old_nodes)
+        new_ids = set(new_nodes)
+
+        for nid in sorted(new_ids - old_ids):
+            result.nodes_added.append({"node_id": nid, **new_nodes[nid]})
+        for nid in sorted(old_ids - new_ids):
+            result.nodes_removed.append({"node_id": nid, **old_nodes[nid]})
+        for nid in sorted(old_ids & new_ids):
+            mod = cls._diff_node_fields(nid, old_nodes[nid], new_nodes[nid])
+            if mod:
+                result.nodes_modified.append(mod)
+
+        # --- Edges ---
+        old_edges_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for edge in old_data.get("edges", []):
+            old_edges_by_key[cls._edge_key(edge)] = edge
+        new_edges_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for edge in new_data.get("edges", []):
+            new_edges_by_key[cls._edge_key(edge)] = edge
+
+        old_ekeys = set(old_edges_by_key)
+        new_ekeys = set(new_edges_by_key)
+
+        for ek in sorted(new_ekeys - old_ekeys):
+            result.edges_added.append(new_edges_by_key[ek])
+        for ek in sorted(old_ekeys - new_ekeys):
+            result.edges_removed.append(old_edges_by_key[ek])
+        for ek in sorted(old_ekeys & new_ekeys):
+            mod = cls._diff_edge_fields(ek, old_edges_by_key[ek], new_edges_by_key[ek])
+            if mod:
+                result.edges_modified.append(mod)
+
+        # --- Proposals ---
+        old_prop_names = {p["name"] for p in old_proposals}
+        new_prop_names = {p["name"] for p in new_proposals}
+        new_prop_map = {p["name"]: p for p in new_proposals}
+        old_prop_map = {p["name"]: p for p in old_proposals}
+
+        for name in sorted(new_prop_names - old_prop_names):
+            result.proposals_added.append(new_prop_map[name])
+        for name in sorted(old_prop_names & new_prop_names):
+            old_p = old_prop_map[name]
+            new_p = new_prop_map[name]
+            if old_p.get("status") != new_p.get("status"):
+                result.proposals_changed.append({
+                    "name": name,
+                    "old_status": old_p.get("status"),
+                    "new_status": new_p.get("status"),
+                })
+
+        return result
 
     # ------------------------------------------------------------------
     # Internal: networkx sync
@@ -2773,6 +3618,230 @@ class KnowledgeGraph:
         result = embed_fn([query])
         return result[0]
 
+    # ------------------------------------------------------------------
+    # BM25 text search
+    # ------------------------------------------------------------------
+
+    # Small English stopword set for BM25 tokenisation — no dependencies.
+    _BM25_STOPWORDS: set[str] = {
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to",
+        "for", "of", "with", "by", "from", "is", "are", "was", "were",
+        "be", "been", "being", "have", "has", "had", "do", "does", "did",
+        "will", "would", "could", "should", "may", "might", "shall",
+        "can", "not", "no", "nor", "so", "if", "then", "than", "too",
+        "very", "just", "about", "into", "over", "after", "before",
+        "between", "under", "above", "up", "down", "out", "off",
+        "it", "its", "this", "that", "these", "those", "i", "we",
+        "you", "he", "she", "they", "me", "him", "her", "us", "them",
+        "my", "your", "his", "our", "their", "what", "which", "who",
+        "whom", "how", "when", "where", "why", "all", "each", "every",
+        "both", "few", "more", "most", "other", "some", "such", "only",
+        "own", "same", "as",
+    }
+
+    @staticmethod
+    def _bm25_tokenize(text: str) -> list[str]:
+        """Lowercase, split on non-alphanumeric, remove stopwords."""
+        import re
+        tokens = re.findall(r"[a-z0-9]+", text.lower())
+        return [t for t in tokens if t not in KnowledgeGraph._BM25_STOPWORDS and len(t) > 1]
+
+    def _build_bm25_index(self) -> None:
+        """Build an in-memory BM25 inverted index from node text.
+
+        Indexes node labels, descriptions, body text, and property values.
+        Uses standard BM25 parameters (k1=1.2, b=0.75).  The index is
+        stored in ``_bm25_*`` attributes and lazily rebuilt when the graph
+        is dirty.
+        """
+        docs: dict[str, list[str]] = {}  # node_id → token list
+        for nid, node in self._data["nodes"].items():
+            parts: list[str] = []
+            label = node.get("label", "")
+            if label:
+                # Boost label by repeating it
+                parts.extend(self._bm25_tokenize(label) * 2)
+            props = node.get("properties", {})
+            desc = props.get("description", "")
+            if desc:
+                parts.extend(self._bm25_tokenize(desc))
+            body = props.get("body_text", "")
+            if body:
+                parts.extend(self._bm25_tokenize(body[:2000]))
+            # Index other string properties
+            for k, v in props.items():
+                if k not in ("description", "body_text") and isinstance(v, str):
+                    parts.extend(self._bm25_tokenize(v))
+            if parts:
+                docs[nid] = parts
+
+        # Compute document frequencies
+        df: dict[str, int] = {}
+        for tokens in docs.values():
+            for term in set(tokens):
+                df[term] = df.get(term, 0) + 1
+
+        # Compute average document length
+        total_tokens = sum(len(t) for t in docs.values())
+        avg_dl = total_tokens / len(docs) if docs else 1.0
+
+        self._bm25_docs = docs
+        self._bm25_df = df
+        self._bm25_avg_dl = avg_dl
+        self._bm25_n_docs = len(docs)
+        self._bm25_dirty = False
+        logger.debug(
+            "BM25 index built: %d documents, %d terms, avg_dl=%.1f",
+            len(docs), len(df), avg_dl,
+        )
+
+    def _ensure_bm25_index(self) -> None:
+        """Rebuild the BM25 index if it's stale or missing."""
+        if not hasattr(self, "_bm25_docs") or self._bm25_dirty or self._dirty:
+            self._build_bm25_index()
+
+    def bm25_search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        node_types: list[str] | None = None,
+        min_confidence: float = 0.0,
+    ) -> list[tuple[str, float]]:
+        """BM25 full-text search over node text.
+
+        Args:
+            query: Natural-language query string.
+            top_k: Number of results to return.
+            node_types: Filter results to these node types.
+            min_confidence: Minimum node confidence.
+
+        Returns:
+            List of ``(node_id, bm25_score)`` tuples, descending by score.
+        """
+        import math as _math
+
+        self._ensure_bm25_index()
+
+        query_tokens = self._bm25_tokenize(query)
+        if not query_tokens:
+            return []
+
+        k1 = 1.2
+        b = 0.75
+        n = self._bm25_n_docs
+
+        scores: list[tuple[str, float]] = []
+        for nid, doc_tokens in self._bm25_docs.items():
+            # Apply filters before scoring
+            node = self._data["nodes"].get(nid)
+            if not node:
+                continue
+            if node_types and node.get("type") not in node_types:
+                continue
+            if node.get("confidence", 1.0) < min_confidence:
+                continue
+
+            dl = len(doc_tokens)
+            # Count term frequencies in this document
+            tf_map: dict[str, int] = {}
+            for t in doc_tokens:
+                tf_map[t] = tf_map.get(t, 0) + 1
+
+            score = 0.0
+            for qt in query_tokens:
+                if qt not in self._bm25_df:
+                    continue
+                tf = tf_map.get(qt, 0)
+                if tf == 0:
+                    continue
+                df_val = self._bm25_df[qt]
+                # IDF with floor to avoid negative values
+                idf = _math.log(max((n - df_val + 0.5) / (df_val + 0.5), 0.1) + 1.0)
+                # BM25 TF saturation
+                tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / self._bm25_avg_dl))
+                score += idf * tf_norm
+
+            if score > 0:
+                scores.append((nid, score))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:top_k]
+
+    def hybrid_search(
+        self,
+        query: str,
+        embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
+        *,
+        top_k: int = 5,
+        alpha: float = 0.7,
+        node_types: list[str] | None = None,
+        min_confidence: float = 0.0,
+    ) -> list[tuple[str, float]]:
+        """Hybrid search combining BM25 and semantic similarity.
+
+        Scores are normalised to [0, 1] and blended:
+        ``hybrid = alpha * semantic + (1 - alpha) * bm25``
+
+        Args:
+            query: Natural-language query string.
+            embed_fn: Embedding function (required for the semantic component).
+            top_k: Number of results to return.
+            alpha: Blending weight (0 = pure BM25, 1 = pure semantic,
+                   default 0.7).
+            node_types: Filter results to these node types.
+            min_confidence: Minimum node confidence.
+
+        Returns:
+            List of ``(node_id, hybrid_score)`` tuples, descending.
+        """
+        # BM25 scores (always available)
+        bm25_results = self.bm25_search(
+            query, top_k=top_k * 3,
+            node_types=node_types, min_confidence=min_confidence,
+        )
+
+        # Semantic scores (requires embeddings + embed_fn)
+        semantic_results: list[tuple[str, float]] = []
+        if embed_fn and self._embeddings:
+            query_vec = self.embed_query(query, embed_fn)
+            semantic_results = self.find_similar(query_vec, top_k=top_k * 3)
+
+        # Normalise scores to [0, 1]
+        def _normalise(pairs: list[tuple[str, float]]) -> dict[str, float]:
+            if not pairs:
+                return {}
+            max_score = max(s for _, s in pairs)
+            min_score = min(s for _, s in pairs)
+            rng = max_score - min_score
+            if rng == 0:
+                return {nid: 1.0 for nid, _ in pairs}
+            return {nid: (s - min_score) / rng for nid, s in pairs}
+
+        bm25_norm = _normalise(bm25_results)
+        sem_norm = _normalise(semantic_results)
+
+        # Combine scores
+        all_ids = set(bm25_norm) | set(sem_norm)
+        combined: list[tuple[str, float]] = []
+        for nid in all_ids:
+            # Apply filters (for semantic results that bypass BM25 filtering)
+            node = self._data["nodes"].get(nid)
+            if not node:
+                continue
+            if node_types and node.get("type") not in node_types:
+                continue
+            if node.get("confidence", 1.0) < min_confidence:
+                continue
+
+            sem_score = sem_norm.get(nid, 0.0)
+            bm25_score = bm25_norm.get(nid, 0.0)
+            hybrid = alpha * sem_score + (1 - alpha) * bm25_score
+            combined.append((nid, round(hybrid, 4)))
+
+        combined.sort(key=lambda x: x[1], reverse=True)
+        return combined[:top_k]
+
     def search(
         self,
         query: str | list[float],
@@ -2782,22 +3851,32 @@ class KnowledgeGraph:
         node_types: list[str] | None = None,
         min_confidence: float = 0.0,
         expand_depth: int = 0,
+        mode: str = "semantic",
+        alpha: float = 0.7,
     ) -> list[dict[str, Any]]:
         """
-        Semantic search over the knowledge graph.
+        Search over the knowledge graph.
 
-        Combines embedding similarity with optional graph expansion for
-        graph-RAG workflows.
+        Supports three modes:
+
+        * ``"semantic"`` — embedding similarity (default, original behaviour).
+        * ``"bm25"`` — BM25 full-text keyword search (no embeddings needed).
+        * ``"hybrid"`` — blended BM25 + semantic (``alpha`` controls weight:
+          0 = pure BM25, 1 = pure semantic, default 0.7).
 
         Args:
-            query: Either a text string (requires embed_fn) or a
-                   pre-computed embedding vector.
-            embed_fn: Embedding function, required if query is a string.
+            query: Either a text string (requires embed_fn for semantic/hybrid)
+                   or a pre-computed embedding vector (semantic only).
+            embed_fn: Embedding function, required when *query* is a string
+                      and *mode* is ``"semantic"`` or ``"hybrid"``.
             top_k: Number of top results to return.
             node_types: Filter results to these node types.
             min_confidence: Minimum node confidence.
             expand_depth: If > 0, expand each result's neighborhood to
                           this depth and include connected nodes.
+            mode: Search mode — ``"semantic"``, ``"bm25"``, or ``"hybrid"``.
+            alpha: Hybrid blending weight (only used when mode is
+                   ``"hybrid"``).
 
         Returns:
             List of result dicts, each with:
@@ -2805,18 +3884,32 @@ class KnowledgeGraph:
               - neighbors (if expand_depth > 0)
               - context (subgraph data if expand_depth > 0)
         """
-        # Get query embedding
-        if isinstance(query, str):
-            if embed_fn is None:
-                raise ValueError(
-                    "embed_fn is required when query is a string."
-                )
-            query_vec = self.embed_query(query, embed_fn)
+        # Route to the appropriate scoring backend
+        if mode == "bm25":
+            if not isinstance(query, str):
+                raise ValueError("BM25 search requires a text query string.")
+            candidates = self.bm25_search(
+                query, top_k=top_k * 3,
+                node_types=node_types, min_confidence=min_confidence,
+            )
+        elif mode == "hybrid":
+            if not isinstance(query, str):
+                raise ValueError("Hybrid search requires a text query string.")
+            candidates = self.hybrid_search(
+                query, embed_fn, top_k=top_k * 3, alpha=alpha,
+                node_types=node_types, min_confidence=min_confidence,
+            )
         else:
-            query_vec = query
-
-        # Find similar nodes
-        candidates = self.find_similar(query_vec, top_k=top_k * 3)  # over-fetch for filtering
+            # Default: semantic search
+            if isinstance(query, str):
+                if embed_fn is None:
+                    raise ValueError(
+                        "embed_fn is required when query is a string."
+                    )
+                query_vec = self.embed_query(query, embed_fn)
+            else:
+                query_vec = query
+            candidates = self.find_similar(query_vec, top_k=top_k * 3)
 
         results: list[dict[str, Any]] = []
         for nid, similarity in candidates:
@@ -2827,11 +3920,12 @@ class KnowledgeGraph:
             if not node:
                 continue
 
-            # Apply filters
-            if node_types and node.get("type") not in node_types:
-                continue
-            if node.get("confidence", 1.0) < min_confidence:
-                continue
+            # Apply filters (BM25/hybrid already filter; semantic still needs this)
+            if mode == "semantic":
+                if node_types and node.get("type") not in node_types:
+                    continue
+                if node.get("confidence", 1.0) < min_confidence:
+                    continue
 
             result: dict[str, Any] = {
                 "node_id": nid,
@@ -2999,17 +4093,245 @@ class KnowledgeGraph:
         return False
 
     def accept_all_proposals(
-        self, min_confidence: float = 0.7, min_examples: int = 2
+        self,
+        min_confidence: float = 0.7,
+        min_examples: int = 2,
+        max_accept: int = 0,
     ) -> list[str]:
         """
         Bulk-accept proposals that meet confidence and example thresholds.
+
+        Args:
+            min_confidence: Minimum confidence threshold.
+            min_examples: Minimum number of supporting examples.
+            max_accept: Safety cap — accept at most this many (0 = unlimited).
+
         Returns list of accepted relation names.
         """
-        accepted = []
+        accepted: list[str] = []
         for p in self.get_proposals(min_confidence=min_confidence, min_examples=min_examples):
+            if max_accept and len(accepted) >= max_accept:
+                break
             if self.accept_proposal(p.name, review_note="auto-accepted by threshold"):
                 accepted.append(p.name)
         return accepted
+
+    def bulk_accept_proposals(
+        self,
+        names: list[str],
+        *,
+        review_note: str = "",
+        boost_edge_confidence: float = 0.7,
+    ) -> list[str]:
+        """
+        Accept multiple proposals at once, rebuilding NetworkX only once.
+
+        Returns list of names that were successfully accepted.
+        """
+        accepted: list[str] = []
+        for raw_name in names:
+            name = slugify(raw_name)
+            for proposal in self._proposals:
+                if proposal.name == name and proposal.status == ProposalStatus.PENDING.value:
+                    proposal.status = ProposalStatus.ACCEPTED.value
+                    proposal.reviewed_at = now_iso()
+                    proposal.review_note = review_note
+                    self.register_relation(name)
+                    if boost_edge_confidence > 0:
+                        for edge in self._data["edges"]:
+                            if (edge["relation"] == name
+                                    and edge.get("confidence", 1.0) < boost_edge_confidence):
+                                edge["confidence"] = boost_edge_confidence
+                                if self.auto_timestamp:
+                                    edge["updated"] = now_iso()
+                    accepted.append(name)
+                    break
+        if accepted:
+            self._rebuild_networkx()
+            self._dirty = True
+            logger.info("Bulk-accepted %d proposals: %s", len(accepted), accepted)
+        return accepted
+
+    def bulk_reject_proposals(
+        self,
+        names: list[str],
+        *,
+        review_note: str = "",
+    ) -> list[str]:
+        """
+        Reject multiple proposals at once.
+
+        Returns list of names that were successfully rejected.
+        """
+        rejected: list[str] = []
+        for raw_name in names:
+            name = slugify(raw_name)
+            for proposal in self._proposals:
+                if proposal.name == name and proposal.status == ProposalStatus.PENDING.value:
+                    proposal.status = ProposalStatus.REJECTED.value
+                    proposal.reviewed_at = now_iso()
+                    proposal.review_note = review_note
+                    rejected.append(name)
+                    break
+        if rejected:
+            self._dirty = True
+            logger.info("Bulk-rejected %d proposals: %s", len(rejected), rejected)
+        return rejected
+
+    def merge_proposals(
+        self,
+        names: list[str],
+        target_name: str,
+    ) -> "RelationProposal":
+        """
+        Merge multiple proposals into one. Combines all examples and
+        source docs, takes the highest confidence, and rejects the others.
+
+        Args:
+            names: Proposal names to merge (must include target_name or
+                   target_name may be new).
+            target_name: The surviving proposal name.
+
+        Returns the merged RelationProposal.
+
+        Raises ValueError if fewer than 2 proposals are found.
+        """
+        target_name = slugify(target_name)
+        slug_names = [slugify(n) for n in names]
+
+        # Gather matching proposals (any status)
+        sources: list[RelationProposal] = []
+        for p in self._proposals:
+            if p.name in slug_names:
+                sources.append(p)
+
+        if len(sources) < 2:
+            raise ValueError(
+                f"Need at least 2 proposals to merge, found {len(sources)}"
+            )
+
+        # Combine examples, source_docs, justifications
+        all_examples: list[dict[str, str]] = []
+        all_source_docs: list[str] = []
+        justifications: list[str] = []
+        best_confidence = 0.0
+
+        for p in sources:
+            all_examples.extend(p.examples)
+            for doc in p.source_docs:
+                if doc not in all_source_docs:
+                    all_source_docs.append(doc)
+            if p.justification:
+                justifications.append(p.justification)
+            best_confidence = max(best_confidence, p.confidence)
+
+        # Recalculate confidence from example count (same formula as add_example)
+        n = len(all_examples)
+        merged_confidence = max(best_confidence, min(0.95, 0.3 + 0.15 * n))
+
+        # Find or create the target proposal
+        target: RelationProposal | None = None
+        for p in self._proposals:
+            if p.name == target_name:
+                target = p
+                break
+
+        if target is None:
+            target = RelationProposal(
+                name=target_name,
+                justification="; ".join(justifications),
+                examples=all_examples,
+                source_docs=all_source_docs,
+                confidence=merged_confidence,
+                status=ProposalStatus.PENDING.value,
+            )
+            self._proposals.append(target)
+        else:
+            target.examples = all_examples
+            target.source_docs = all_source_docs
+            target.confidence = merged_confidence
+            if not target.justification:
+                target.justification = "; ".join(justifications)
+            target.status = ProposalStatus.PENDING.value
+            target.reviewed_at = None
+            target.review_note = ""
+
+        # Reject the other source proposals
+        for p in sources:
+            if p.name != target_name:
+                p.status = ProposalStatus.REJECTED.value
+                p.reviewed_at = now_iso()
+                p.review_note = f"merged into '{target_name}'"
+
+        self._dirty = True
+        logger.info(
+            "Merged %d proposals into '%s' (%d examples)",
+            len(sources), target_name, len(all_examples),
+        )
+        return target
+
+    @staticmethod
+    def _normalized_edit_distance(a: str, b: str) -> float:
+        """Compute normalized Levenshtein edit distance between two strings."""
+        if a == b:
+            return 0.0
+        la, lb = len(a), len(b)
+        if la == 0 or lb == 0:
+            return 1.0
+        # Standard DP Levenshtein
+        prev = list(range(lb + 1))
+        for i in range(1, la + 1):
+            curr = [i] + [0] * lb
+            for j in range(1, lb + 1):
+                cost = 0 if a[i - 1] == b[j - 1] else 1
+                curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+            prev = curr
+        return prev[lb] / max(la, lb)
+
+    def find_similar_proposals(
+        self,
+        threshold: float = 0.8,
+    ) -> list[list["RelationProposal"]]:
+        """
+        Group pending proposals by name similarity using normalized edit distance.
+
+        Args:
+            threshold: Similarity threshold in [0, 1]. A pair is considered
+                       similar when ``1 - edit_distance >= threshold``.
+
+        Returns list of groups (each group is a list of 2+ similar proposals).
+        """
+        pending = self.get_proposals(status=ProposalStatus.PENDING.value)
+        if len(pending) < 2:
+            return []
+
+        # Union-Find to group similar names
+        parent: dict[str, str] = {p.name: p.name for p in pending}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x: str, y: str) -> None:
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[rx] = ry
+
+        for i, p1 in enumerate(pending):
+            for p2 in pending[i + 1:]:
+                dist = self._normalized_edit_distance(p1.name, p2.name)
+                if 1.0 - dist >= threshold:
+                    union(p1.name, p2.name)
+
+        # Collect groups
+        groups: dict[str, list[RelationProposal]] = {}
+        for p in pending:
+            root = find(p.name)
+            groups.setdefault(root, []).append(p)
+
+        return [g for g in groups.values() if len(g) >= 2]
 
     def purge_rejected_proposals(self) -> int:
         """Remove all rejected proposals from the list. Returns count removed."""
@@ -3022,6 +4344,299 @@ class KnowledgeGraph:
         if removed:
             self._dirty = True
         return removed
+
+    # ------------------------------------------------------------------
+    # Structured Graph Query Language
+    # ------------------------------------------------------------------
+
+    def graph_query(
+        self,
+        query_str: str,
+        *,
+        limit: int = 50,
+    ) -> list[list[dict[str, Any]]]:
+        """
+        Execute a pattern-matching query against the graph.
+
+        The query language supports multi-hop traversal patterns::
+
+            (type:technology) -[depends_on]-> (*) -[is_a]-> (label:"database")
+            (label:~"SAR*") -[*]-> (*) WHERE confidence > 0.7
+            (*) -[is_a]-> (id:"python") DEPTH 2
+
+        Args:
+            query_str: Pattern query string.
+            limit: Maximum number of matching paths to return.
+
+        Returns:
+            List of matching paths.  Each path is a list of alternating
+            node-dicts and edge-dicts::
+
+                [node_dict, edge_dict, node_dict, ...]
+
+        Raises:
+            QueryParseError: If the query string is malformed.
+        """
+        steps, min_confidence, depth = _parse_graph_query(query_str)
+
+        if len(steps) < 2:
+            # Single node query — find matching nodes
+            return self._query_single_node(steps[0], limit, min_confidence)
+
+        if depth is not None:
+            return self._query_variable_depth(steps, depth, limit, min_confidence)
+
+        return self._query_fixed_path(steps, limit, min_confidence)
+
+    def _node_dict(self, nid: str) -> dict[str, Any]:
+        """Return a serialisable dict for a node."""
+        node = self._data["nodes"].get(nid, {})
+        return {
+            "node_id": nid,
+            "label": node.get("label", nid),
+            "type": node.get("type", "concept"),
+            "confidence": node.get("confidence", 1.0),
+        }
+
+    def _edge_dict(self, src: str, tgt: str, relation: str) -> dict[str, Any]:
+        """Return a serialisable dict for an edge."""
+        for edge in self._data["edges"]:
+            if edge["source"] == src and edge["target"] == tgt and edge.get("relation") == relation:
+                return {
+                    "source": src,
+                    "target": tgt,
+                    "relation": relation,
+                    "confidence": edge.get("confidence", 1.0),
+                }
+        return {"source": src, "target": tgt, "relation": relation, "confidence": 1.0}
+
+    def _query_single_node(
+        self,
+        step: "QueryStep",
+        limit: int,
+        min_confidence: float | None,
+    ) -> list[list[dict[str, Any]]]:
+        """Match a single-node pattern (no edges)."""
+        results: list[list[dict[str, Any]]] = []
+        for nid, node in self._data["nodes"].items():
+            if step.node_filter.matches(nid, node):
+                if min_confidence is not None and node.get("confidence", 1.0) <= min_confidence:
+                    continue
+                results.append([self._node_dict(nid)])
+                if len(results) >= limit:
+                    break
+        return results
+
+    def _get_transitions(
+        self,
+        nid: str,
+        edge_filter: "EdgeFilter",
+        direction: str,
+    ) -> list[tuple[str, str, str]]:
+        """
+        Get valid transitions from a node given edge filter and direction.
+
+        Returns list of (neighbor_id, relation, actual_direction) tuples
+        where actual_direction is used to build the edge dict correctly.
+        """
+        transitions: list[tuple[str, str, str]] = []
+
+        if direction in ("out", "any"):
+            for _, tgt, key in self._G.out_edges(nid, keys=True):
+                if edge_filter.matches(key):
+                    transitions.append((tgt, key, "out"))
+
+        if direction in ("in", "any"):
+            for src, _, key in self._G.in_edges(nid, keys=True):
+                if edge_filter.matches(key):
+                    # Avoid duplicates for undirected if already found in out
+                    if direction == "any" and (src, key, "out") in transitions:
+                        continue
+                    transitions.append((src, key, "in"))
+
+        return transitions
+
+    def _query_fixed_path(
+        self,
+        steps: list["QueryStep"],
+        limit: int,
+        min_confidence: float | None,
+    ) -> list[list[dict[str, Any]]]:
+        """Execute a fixed-length multi-hop pattern query via DFS."""
+        results: list[list[dict[str, Any]]] = []
+
+        # Collect seed nodes matching the first step
+        seeds: list[str] = []
+        for nid, node in self._data["nodes"].items():
+            if steps[0].node_filter.matches(nid, node):
+                seeds.append(nid)
+
+        for seed in seeds:
+            if len(results) >= limit:
+                break
+            # DFS through the pattern steps
+            self._dfs_match(
+                steps, 0, seed, [], set(), results, limit, min_confidence
+            )
+
+        return results
+
+    def _dfs_match(
+        self,
+        steps: list["QueryStep"],
+        step_idx: int,
+        current_node: str,
+        current_path: list[dict[str, Any]],
+        visited: set[str],
+        results: list[list[dict[str, Any]]],
+        limit: int,
+        min_confidence: float | None,
+    ) -> None:
+        """Recursive DFS path matching."""
+        if len(results) >= limit:
+            return
+
+        node_data = self._data["nodes"].get(current_node, {})
+        step = steps[step_idx]
+
+        # Check node matches current step
+        if not step.node_filter.matches(current_node, node_data):
+            return
+
+        node_dict = self._node_dict(current_node)
+        path = current_path + [node_dict]
+
+        # If this is the last step, we have a complete match
+        if step_idx == len(steps) - 1:
+            # Apply WHERE confidence filter to the whole path
+            if min_confidence is not None:
+                for item in path:
+                    if item.get("confidence", 1.0) <= min_confidence:
+                        return
+            results.append(path)
+            return
+
+        # Follow edges matching the edge filter
+        edge_filter = step.edge_filter
+        if edge_filter is None:
+            return
+
+        new_visited = visited | {current_node}
+
+        for neighbor, relation, actual_dir in self._get_transitions(
+            current_node, edge_filter, step.direction
+        ):
+            if neighbor in new_visited:
+                continue
+            if actual_dir == "out":
+                edge_d = self._edge_dict(current_node, neighbor, relation)
+            else:
+                edge_d = self._edge_dict(neighbor, current_node, relation)
+
+            self._dfs_match(
+                steps,
+                step_idx + 1,
+                neighbor,
+                path + [edge_d],
+                new_visited,
+                results,
+                limit,
+                min_confidence,
+            )
+
+    def _query_variable_depth(
+        self,
+        steps: list["QueryStep"],
+        max_depth: int,
+        limit: int,
+        min_confidence: float | None,
+    ) -> list[list[dict[str, Any]]]:
+        """
+        Execute a variable-depth pattern query.
+
+        When DEPTH N is specified, the edge transition in the pattern is
+        repeated up to N times. This only applies to 2-step patterns
+        (source -> target) where the edge can be traversed multiple hops.
+        """
+        if len(steps) != 2:
+            # For multi-step patterns with DEPTH, just treat depth as max
+            # path length for the middle segment
+            return self._query_fixed_path(steps, limit, min_confidence)
+
+        source_step = steps[0]
+        target_step = steps[1]
+        edge_filter = source_step.edge_filter or EdgeFilter(wildcard=True)
+        direction = source_step.direction
+
+        # Collect seed and target nodes
+        seeds: list[str] = []
+        targets: set[str] = set()
+        for nid, node in self._data["nodes"].items():
+            if source_step.node_filter.matches(nid, node):
+                seeds.append(nid)
+            if target_step.node_filter.matches(nid, node):
+                targets.add(nid)
+
+        results: list[list[dict[str, Any]]] = []
+
+        for seed in seeds:
+            if len(results) >= limit:
+                break
+
+            # BFS up to max_depth
+            self._bfs_paths(
+                seed, targets, edge_filter, direction,
+                max_depth, results, limit, min_confidence,
+            )
+
+        return results
+
+    def _bfs_paths(
+        self,
+        start: str,
+        targets: set[str],
+        edge_filter: "EdgeFilter",
+        direction: str,
+        max_depth: int,
+        results: list[list[dict[str, Any]]],
+        limit: int,
+        min_confidence: float | None,
+    ) -> None:
+        """BFS path search with depth limit."""
+        from collections import deque
+
+        # queue entries: (current_node, path_so_far, visited_set)
+        queue: deque[tuple[str, list[dict[str, Any]], set[str]]] = deque()
+        queue.append((start, [self._node_dict(start)], {start}))
+
+        while queue and len(results) < limit:
+            current, path, visited = queue.popleft()
+            current_depth = len(path) // 2  # path = [node, edge, node, edge, ...]
+
+            if current_depth > 0 and current in targets:
+                # Apply WHERE filter
+                if min_confidence is not None:
+                    if any(item.get("confidence", 1.0) <= min_confidence for item in path):
+                        continue
+                results.append(list(path))
+                if len(results) >= limit:
+                    return
+
+            if current_depth >= max_depth:
+                continue
+
+            for neighbor, relation, actual_dir in self._get_transitions(
+                current, edge_filter, direction
+            ):
+                if neighbor in visited:
+                    continue
+                if actual_dir == "out":
+                    edge_d = self._edge_dict(current, neighbor, relation)
+                else:
+                    edge_d = self._edge_dict(neighbor, current, relation)
+
+                new_path = path + [edge_d, self._node_dict(neighbor)]
+                queue.append((neighbor, new_path, visited | {neighbor}))
 
     # ------------------------------------------------------------------
     # LLM relation extraction & document ingestion
@@ -3727,7 +5342,7 @@ TEXT:
         current_body_lines: list[str] = []
         heading_stack: list[tuple[int, str]] = []  # (level, heading)
 
-        def _flush_section():
+        def _flush_section() -> None:
             body = "\n".join(current_body_lines).strip()
             if not body and not current_heading:
                 return
@@ -3942,6 +5557,8 @@ TEXT:
         original_path: str | Path | None = None,
         doc_properties: dict[str, Any] | None = None,
         progress_fn: Callable[[dict[str, Any]], None] | None = None,
+        parallel_extractions: int = 1,
+        incremental: bool = False,
     ) -> dict[str, Any]:
         """
         Ingest a markdown document with structure-aware chunking.
@@ -3985,10 +5602,27 @@ TEXT:
                          Triple-level events: "triple_done" (fired for each
                          triple processed, includes section_index/section_total/
                          section_heading for correlation).
+            parallel_extractions: Number of parallel LLM extraction threads.
+                                  When > 1, LLM calls run concurrently in a
+                                  thread pool while graph writes remain serial.
+                                  Defaults to 1 (sequential extraction).
+            incremental: When True and the document has a previous version
+                         with section hashes, skip LLM extraction for sections
+                         whose content has not changed.  Structural nodes and
+                         edges are always created/updated regardless.  This can
+                         dramatically reduce LLM calls when re-ingesting a
+                         document where only a few sections changed.  Requires
+                         ``preserve_source=True`` so that section hashes are
+                         available for comparison.
 
         Returns:
             Aggregate stats dict with per-section breakdown.
+            Includes a ``"diff"`` key with a :class:`GraphDiff` dict
+            summarising changes made during this ingestion.
         """
+        # Capture pre-ingestion state for post-ingestion diff
+        _pre_snapshot = self.snapshot()
+
         aggregate_stats: dict[str, Any] = {
             "doc_id": doc_id,
             "total_sections": 0,
@@ -3999,10 +5633,18 @@ TEXT:
             "total_edges_updated": 0,
             "total_proposals_created": 0,
             "total_proposals_augmented": 0,
+            "sections_skipped_incremental": 0,
             "source": None,
             "sections": [],
             "errors": [],
         }
+
+        # Compute per-section hashes for version tracking
+        section_hashes = compute_section_hashes(
+            text,
+            min_section_chars=min_section_chars,
+            max_section_chars=max_section_chars,
+        )
 
         # Store source file
         ingestion_id = None
@@ -4010,6 +5652,7 @@ TEXT:
         if preserve_source:
             source_result = self.store_source(
                 text, doc_id, original_path=original_path,
+                section_hashes=section_hashes,
             )
             aggregate_stats["source"] = source_result
             ingestion_id = source_result.get("ingestion_id")
@@ -4021,6 +5664,27 @@ TEXT:
                     "Proceeding with ingestion (may create duplicate nodes).",
                     doc_id, source_result["existing_doc_id"],
                 )
+
+            # Log section-level diffs on re-ingestion
+            if source_result.get("is_update") and progress_fn:
+                prev_version = source_result["version"] - 1
+                try:
+                    diff = self.diff_document_versions(
+                        doc_id, prev_version, source_result["version"],
+                    )
+                    progress_fn({
+                        "event": "version_diff",
+                        "doc_id": doc_id,
+                        "version_from": prev_version,
+                        "version_to": source_result["version"],
+                        "sections_added": diff.added,
+                        "sections_removed": diff.removed,
+                        "sections_modified": diff.modified,
+                        "sections_unchanged": diff.unchanged,
+                        "summary": diff.summary,
+                    })
+                except KeyError:
+                    pass  # no section hashes for previous version
 
             # Add source info to doc properties
             if doc_properties is None:
@@ -4044,6 +5708,38 @@ TEXT:
 
         aggregate_stats["ingestion_id"] = ingestion_id
         aggregate_stats["content_hash"] = source_content_hash
+
+        # ── Incremental ingestion: determine unchanged sections ───
+        # When incremental=True and we have a previous version with section
+        # hashes, build a set of section headings whose content has not
+        # changed so we can skip their (expensive) LLM extraction.
+        _unchanged_headings: set[str] = set()
+        if incremental and preserve_source and source_result is not None:
+            prev_version = source_result.get("version", 1) - 1
+            if source_result.get("is_update") and prev_version >= 1:
+                try:
+                    diff = self.diff_document_versions(
+                        doc_id, prev_version, source_result["version"],
+                    )
+                    _unchanged_headings = set(diff.unchanged)
+                    if _unchanged_headings:
+                        logger.info(
+                            "[%s] Incremental mode: %d unchanged sections will "
+                            "skip LLM extraction",
+                            doc_id, len(_unchanged_headings),
+                        )
+                        if progress_fn:
+                            progress_fn({
+                                "event": "incremental_skip_plan",
+                                "doc_id": doc_id,
+                                "unchanged_sections": sorted(_unchanged_headings),
+                                "changed_sections": sorted(
+                                    set(diff.added) | set(diff.modified)
+                                ),
+                                "removed_sections": diff.removed,
+                            })
+                except KeyError:
+                    pass  # no section hashes for previous version
 
         # Parse into sections
         sections = self.parse_markdown_sections(
@@ -4086,9 +5782,14 @@ TEXT:
                 source="markdown_ingest",
             )
 
-        # Track all section node IDs for structural edges
+        # ── Phase 1: Create structural nodes and edges ──────────────
+        # This is fast (no LLM calls) and must be serial because it
+        # mutates the graph.  We also collect the sections that need
+        # LLM extraction for Phase 2.
+
         section_ids: list[str] = []
-        prev_section_id: str | None = None
+        # Each entry: (index, section_dict, section_slug, section_text, heading)
+        extractable: list[tuple[int, dict[str, Any], str, str, str]] = []
 
         for i, section in enumerate(sections):
             heading = section["heading"] or f"Section {i + 1}"
@@ -4183,62 +5884,48 @@ TEXT:
                     })
                 continue
 
-            logger.info(
-                "[%s] [%d/%d] Extracting '%s' (~%s chars)...",
-                doc_id, i + 1, len(sections), heading,
-                f"{section['char_count']:,}",
-            )
-
-            # Notify progress callback before LLM extraction
-            if progress_fn:
-                progress_fn({
-                    "event": "section_start",
-                    "index": i,
-                    "total": len(sections),
+            # Incremental mode: skip LLM extraction for unchanged sections
+            _section_hash_key = heading if heading != f"Section {i + 1}" else "__preamble__"
+            if _unchanged_headings and _section_hash_key in _unchanged_headings:
+                aggregate_stats["sections_skipped_incremental"] += 1
+                skip_info = {
                     "heading": heading,
-                    "char_count": section["char_count"],
-                })
+                    "skipped": True,
+                    "reason": "unchanged",
+                }
+                aggregate_stats["sections"].append(skip_info)
+                if progress_fn:
+                    progress_fn({
+                        "event": "section_skip",
+                        "index": i,
+                        "total": len(sections),
+                        "heading": heading,
+                        "reason": "unchanged",
+                        "char_count": section["char_count"],
+                    })
+                logger.info(
+                    "[%s] [%d/%d] Skipping '%s' (unchanged)",
+                    doc_id, i + 1, len(sections), heading,
+                )
+                continue
 
-            # Run LLM extraction on this section
             section_text = context_prefix + body
-            t0 = time.monotonic()
-            # Build a section-scoped progress callback that injects
-            # section index/total/heading into sub-events so callers can
-            # correlate triple-level progress with the enclosing section.
-            _section_pfn: Callable[[dict[str, Any]], None] | None = None
-            if progress_fn:
-                _sec_i = i
-                _sec_total = len(sections)
-                _sec_heading = heading
+            extractable.append((i, section, section_slug, section_text, heading))
 
-                def _section_pfn(event: dict[str, Any],
-                                 _i: int = _sec_i,
-                                 _t: int = _sec_total,
-                                 _h: str = _sec_heading) -> None:
-                    event.setdefault("section_index", _i)
-                    event.setdefault("section_total", _t)
-                    event.setdefault("section_heading", _h)
-                    progress_fn(event)  # type: ignore[misc]
-
-            section_stats = self.ingest_document(
-                section_text,
-                doc_id=f"{doc_id}::{heading}",
-                llm_extract_fn=llm_extract_fn,
-                max_triples=max_triples_per_section,
-                low_confidence_threshold=low_confidence_threshold,
-                auto_add_doc_node=False,  # we handle doc nodes ourselves
-                ingestion_id=ingestion_id,
-                content_hash=source_content_hash,
-                progress_fn=_section_pfn,
-            )
-            elapsed = time.monotonic() - t0
-
+        # ── Phase 2: LLM extraction + graph writes ────────────────
+        # Helper to process one section's extraction result into the
+        # graph (must be called from a single thread).
+        def _write_section(
+            idx: int, section: dict[str, Any], section_slug: str,
+            section_text: str, heading: str, section_stats: dict[str, Any],
+            elapsed: float,
+        ) -> None:
+            """Apply extraction results to the graph (serial)."""
             # Link extracted entities to the section node
             if add_structure_nodes and add_structure_edges:
                 for nid in list(self._data["nodes"].keys()):
                     node = self._data["nodes"][nid]
                     if node.get("source", "").startswith(f"doc:{doc_id}::"):
-                        # Check this entity was just added (has this section's source tag)
                         if node.get("source") == f"doc:{doc_id}::{heading}":
                             self.add_edge(
                                 nid, section_slug,
@@ -4268,18 +5955,17 @@ TEXT:
             logger.info(
                 "[%s] [%d/%d] Done '%s': %d triples → "
                 "%d nodes, %d edges (%.1fs)",
-                doc_id, i + 1, len(sections), heading,
+                doc_id, idx + 1, len(sections), heading,
                 section_stats["triples_processed"],
                 section_stats["nodes_added"],
                 section_stats["edges_added"],
                 elapsed,
             )
 
-            # Notify progress callback after extraction
             if progress_fn:
                 progress_fn({
                     "event": "section_done",
-                    "index": i,
+                    "index": idx,
                     "total": len(sections),
                     "heading": heading,
                     "char_count": section["char_count"],
@@ -4293,6 +5979,145 @@ TEXT:
                     "proposals_augmented": section_stats["proposals_augmented"],
                     "errors": section_stats["errors"],
                 })
+
+        _parallel = max(1, parallel_extractions)
+
+        if _parallel <= 1:
+            # ── Serial extraction (original behaviour) ─────────
+            for idx, section, section_slug, section_text, heading in extractable:
+                logger.info(
+                    "[%s] [%d/%d] Extracting '%s' (~%s chars)...",
+                    doc_id, idx + 1, len(sections), heading,
+                    f"{section['char_count']:,}",
+                )
+                if progress_fn:
+                    progress_fn({
+                        "event": "section_start",
+                        "index": idx,
+                        "total": len(sections),
+                        "heading": heading,
+                        "char_count": section["char_count"],
+                    })
+
+                t0 = time.monotonic()
+                _section_pfn: Callable[[dict[str, Any]], None] | None = None
+                if progress_fn:
+                    _sec_i = idx
+                    _sec_total = len(sections)
+                    _sec_heading = heading
+
+                    def _section_pfn(event: dict[str, Any],
+                                     _i: int = _sec_i,
+                                     _t: int = _sec_total,
+                                     _h: str = _sec_heading) -> None:
+                        event.setdefault("section_index", _i)
+                        event.setdefault("section_total", _t)
+                        event.setdefault("section_heading", _h)
+                        progress_fn(event)  # type: ignore[misc]
+
+                section_stats = self.ingest_document(
+                    section_text,
+                    doc_id=f"{doc_id}::{heading}",
+                    llm_extract_fn=llm_extract_fn,
+                    max_triples=max_triples_per_section,
+                    low_confidence_threshold=low_confidence_threshold,
+                    auto_add_doc_node=False,
+                    ingestion_id=ingestion_id,
+                    content_hash=source_content_hash,
+                    progress_fn=_section_pfn,
+                )
+                elapsed = time.monotonic() - t0
+                _write_section(idx, section, section_slug, section_text, heading,
+                               section_stats, elapsed)
+
+        else:
+            # ── Parallel extraction, serial graph writes ───────
+            # LLM calls run concurrently in a thread pool.  As each
+            # extraction completes, the triples are written to the
+            # graph serially (from the main thread) to avoid races.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def _llm_extract(
+                idx: int, section: dict[str, Any], section_slug: str,
+                section_text: str, heading: str,
+            ) -> tuple[int, dict[str, Any], str, str, str, list[dict[str, Any]] | None, str | None, float]:
+                """Run LLM extraction for one section (thread-safe)."""
+                t0 = time.monotonic()
+                prompt = self.build_extraction_prompt(
+                    section_text,
+                    max_triples=max_triples_per_section,
+                )
+                if progress_fn:
+                    progress_fn({
+                        "event": "section_start",
+                        "index": idx,
+                        "total": len(sections),
+                        "heading": heading,
+                        "char_count": section["char_count"],
+                    })
+                try:
+                    triples = llm_extract_fn(prompt)
+                except Exception as exc:
+                    return (idx, section, section_slug, section_text, heading,
+                            None, f"LLM extraction failed: {exc}",
+                            time.monotonic() - t0)
+                if progress_fn:
+                    progress_fn({
+                        "event": "extraction_done",
+                        "doc_id": f"{doc_id}::{heading}",
+                        "triples_returned": len(triples) if isinstance(triples, list) else 0,
+                    })
+                return (idx, section, section_slug, section_text, heading,
+                        triples, None, time.monotonic() - t0)
+
+            logger.info(
+                "[%s] Parallel extraction with %d threads for %d sections",
+                doc_id, _parallel, len(extractable),
+            )
+
+            with ThreadPoolExecutor(max_workers=_parallel) as executor:
+                futures = {
+                    executor.submit(_llm_extract, *args): args
+                    for args in extractable
+                }
+
+                for future in as_completed(futures):
+                    (idx, section, section_slug, section_text, heading,
+                     triples, error, elapsed) = future.result()
+
+                    if error:
+                        section_stats: dict[str, Any] = {
+                            "triples_processed": 0, "nodes_added": 0,
+                            "nodes_updated": 0, "edges_added": 0,
+                            "edges_updated": 0, "proposals_created": 0,
+                            "proposals_augmented": 0, "errors": [error],
+                        }
+                        logger.error(
+                            "[%s] [%d/%d] %s",
+                            doc_id, idx + 1, len(sections), error,
+                        )
+                    elif not isinstance(triples, list):
+                        section_stats = {
+                            "triples_processed": 0, "nodes_added": 0,
+                            "nodes_updated": 0, "edges_added": 0,
+                            "edges_updated": 0, "proposals_created": 0,
+                            "proposals_augmented": 0,
+                            "errors": [f"LLM returned non-list: {type(triples)}"],
+                        }
+                    else:
+                        # Serial graph write — safe, no concurrent mutation
+                        section_stats = self.ingest_triples(
+                            triples,
+                            text=section_text,
+                            doc_id=f"{doc_id}::{heading}",
+                            low_confidence_threshold=low_confidence_threshold,
+                            auto_add_doc_node=False,
+                            ingestion_id=ingestion_id,
+                            content_hash=source_content_hash,
+                        )
+
+                    _write_section(idx, section, section_slug, section_text,
+                                   heading, section_stats, elapsed)
 
         # Add links found in the document as lightweight reference edges
         all_links: list[dict[str, str]] = []
@@ -4311,16 +6136,30 @@ TEXT:
                     {"text": text, "url": url} for url, text in unique_urls.items()
                 ]
 
-        logger.info(
-            "Markdown ingest '%s': %d sections, %d triples → "
-            "%d nodes added (%d updated), %d edges added (%d updated)",
-            doc_id, aggregate_stats["total_sections"],
-            aggregate_stats["total_triples"],
-            aggregate_stats["total_nodes_added"],
-            aggregate_stats["total_nodes_updated"],
-            aggregate_stats["total_edges_added"],
-            aggregate_stats["total_edges_updated"],
-        )
+        _skipped_inc = aggregate_stats["sections_skipped_incremental"]
+        if _skipped_inc:
+            logger.info(
+                "Markdown ingest '%s': %d sections (%d skipped, incremental), "
+                "%d triples → %d nodes added (%d updated), "
+                "%d edges added (%d updated)",
+                doc_id, aggregate_stats["total_sections"], _skipped_inc,
+                aggregate_stats["total_triples"],
+                aggregate_stats["total_nodes_added"],
+                aggregate_stats["total_nodes_updated"],
+                aggregate_stats["total_edges_added"],
+                aggregate_stats["total_edges_updated"],
+            )
+        else:
+            logger.info(
+                "Markdown ingest '%s': %d sections, %d triples → "
+                "%d nodes added (%d updated), %d edges added (%d updated)",
+                doc_id, aggregate_stats["total_sections"],
+                aggregate_stats["total_triples"],
+                aggregate_stats["total_nodes_added"],
+                aggregate_stats["total_nodes_updated"],
+                aggregate_stats["total_edges_added"],
+                aggregate_stats["total_edges_updated"],
+            )
 
         # Notify progress callback of document ingestion completion
         if progress_fn:
@@ -4328,6 +6167,7 @@ TEXT:
                 "event": "doc_done",
                 "doc_id": doc_id,
                 "total_sections": aggregate_stats["total_sections"],
+                "sections_skipped_incremental": _skipped_inc,
                 "total_triples": aggregate_stats["total_triples"],
                 "total_nodes_added": aggregate_stats["total_nodes_added"],
                 "total_nodes_updated": aggregate_stats["total_nodes_updated"],
@@ -4336,6 +6176,10 @@ TEXT:
                 "total_proposals_created": aggregate_stats["total_proposals_created"],
                 "total_proposals_augmented": aggregate_stats["total_proposals_augmented"],
             })
+
+        # Compute diff from pre-ingestion snapshot
+        ingestion_diff = self.diff_from_snapshot(_pre_snapshot)
+        aggregate_stats["diff"] = ingestion_diff.to_dict()
 
         return aggregate_stats
 
@@ -4734,6 +6578,290 @@ TEXT:
         return output
 
     # ------------------------------------------------------------------
+    # Document subgraph extract / import (transplant)
+    # ------------------------------------------------------------------
+
+    def extract_document_subgraph(self, doc_id: str) -> dict[str, Any]:
+        """Extract a document and all its associated nodes, edges, source text,
+        and embeddings into a portable dict that can be imported into another
+        graph via :meth:`import_document_subgraph`.
+
+        The subgraph includes:
+        - All nodes whose ``source`` field references this document
+          (``doc:<doc_id>`` or ``doc:<doc_id>::<section>``).
+        - All edges where **both** endpoints are in the extracted node set,
+          or whose ``source_tag`` references this document.
+        - The source manifest entry and the raw source text (if stored).
+        - Embeddings for extracted nodes.
+        - Relation proposals that reference this document.
+
+        Args:
+            doc_id: The document identifier (will be slugified).
+
+        Returns:
+            A dict with keys ``doc_id``, ``nodes``, ``edges``, ``source_info``,
+            ``source_text``, ``embeddings``, ``proposals``,
+            ``origin_graph`` and ``custom_relations``.
+
+        Raises:
+            KeyError: If the document is not found in the graph sources.
+        """
+        doc_slug = slugify(doc_id)
+        manifest = self._data["meta"].get("sources", {})
+        if doc_slug not in manifest:
+            raise KeyError(f"Document '{doc_id}' not found in graph sources")
+
+        # --- Collect nodes attributed to this document --------------------
+        node_ids: set[str] = set()
+        nodes: dict[str, dict] = {}
+        for nid, node in self._data["nodes"].items():
+            src = node.get("source", "")
+            # Match  doc:<slug>  or  doc:<slug>::<section>
+            if src.startswith("doc:"):
+                src_slug = slugify(src.split("::")[0].removeprefix("doc:"))
+                if src_slug == doc_slug:
+                    node_ids.add(nid)
+                    nodes[nid] = deepcopy(node)
+
+        # --- Collect edges ------------------------------------------------
+        edges: list[dict] = []
+        for edge in self._data["edges"]:
+            # Include edge if both endpoints are in the node set
+            in_subgraph = (edge["source"] in node_ids and
+                           edge["target"] in node_ids)
+            # Also include if source_tag references this doc (even if one
+            # endpoint is outside the extracted set — we still carry the edge
+            # so the relationship is preserved on import)
+            tag = edge.get("source_tag", "")
+            tag_match = False
+            if tag.startswith("doc:"):
+                tag_slug = slugify(tag.split("::")[0].removeprefix("doc:"))
+                tag_match = tag_slug == doc_slug
+            if in_subgraph or tag_match:
+                edges.append(deepcopy(edge))
+                # Ensure referenced endpoints are in node_ids so they get
+                # included if they exist (cross-doc shared nodes)
+                for endpoint in ("source", "target"):
+                    eid = edge[endpoint]
+                    if eid not in nodes and eid in self._data["nodes"]:
+                        nodes[eid] = deepcopy(self._data["nodes"][eid])
+                        node_ids.add(eid)
+
+        # --- Source text and manifest entry --------------------------------
+        source_info = deepcopy(manifest[doc_slug])
+        source_text = self.get_source_text(doc_slug)
+
+        # --- Embeddings for extracted nodes --------------------------------
+        embeddings: dict[str, list[float]] = {}
+        for nid in node_ids:
+            if nid in self._embeddings:
+                embeddings[nid] = list(self._embeddings[nid])
+
+        # --- Relation proposals referencing this doc -----------------------
+        proposals: list[dict] = []
+        for p in self._proposals:
+            if doc_slug in p.source_docs:
+                proposals.append({
+                    "name": p.name,
+                    "justification": p.justification,
+                    "examples": deepcopy(p.examples),
+                    "source_docs": list(p.source_docs),
+                    "confidence": p.confidence,
+                    "status": p.status if isinstance(p.status, str) else p.status.value,
+                    "proposed_at": p.proposed_at,
+                    "reviewed_at": p.reviewed_at,
+                    "review_note": p.review_note,
+                })
+
+        # Custom relations used by extracted edges
+        custom_rels = set(self._data["meta"].get("custom_relations", []))
+        used_rels = {e["relation"] for e in edges}
+        relevant_customs = sorted(custom_rels & used_rels)
+
+        origin_graph = str(self.graph_path.stem)
+
+        logger.info(
+            "Extracted subgraph for doc '%s': %d nodes, %d edges, "
+            "%d embeddings, %d proposals",
+            doc_slug, len(nodes), len(edges), len(embeddings), len(proposals),
+        )
+
+        return {
+            "doc_id": doc_slug,
+            "nodes": nodes,
+            "edges": edges,
+            "source_info": source_info,
+            "source_text": source_text,
+            "embeddings": embeddings,
+            "proposals": proposals,
+            "custom_relations": relevant_customs,
+            "origin_graph": origin_graph,
+        }
+
+    def import_document_subgraph(
+        self,
+        subgraph: dict[str, Any],
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, int]:
+        """Import a document subgraph previously extracted with
+        :meth:`extract_document_subgraph` into this graph.
+
+        Nodes are smart-merged (descriptions combined, confidence maximised)
+        when they already exist.  Edges are deduplicated by
+        ``(source, target, relation)``.
+
+        Args:
+            subgraph: The dict returned by ``extract_document_subgraph()``.
+            overwrite: If *True*, overwrite the source entry and text even if
+                the document already exists in this graph.
+
+        Returns:
+            Stats dict with counts of nodes/edges/sources added or updated.
+        """
+        doc_slug = subgraph["doc_id"]
+        stats: dict[str, int] = {
+            "nodes_added": 0,
+            "nodes_updated": 0,
+            "edges_added": 0,
+            "edges_updated": 0,
+            "embeddings_added": 0,
+            "source_stored": 0,
+            "proposals_added": 0,
+        }
+
+        # --- Import nodes (smart-merge) -----------------------------------
+        for nid, node in subgraph["nodes"].items():
+            if nid in self._data["nodes"]:
+                existing = self._data["nodes"][nid]
+                incoming = deepcopy(node)
+                merged_props = {**existing.get("properties", {})}
+                inc_props = incoming.get("properties", {})
+                inc_desc_sources = inc_props.pop("description_sources", [])
+                inc_desc = inc_props.pop("description", None)
+                merged_props.pop("description", None)
+                merged_props.update(inc_props)
+                if inc_desc_sources:
+                    for ds in inc_desc_sources:
+                        _merge_description(
+                            merged_props,
+                            ds["text"],
+                            doc_id=ds.get("doc_id", "unknown"),
+                            confidence=ds.get("confidence", 1.0),
+                        )
+                elif inc_desc:
+                    _merge_description(
+                        merged_props,
+                        inc_desc,
+                        doc_id=incoming.get("source", "unknown"),
+                        confidence=incoming.get("confidence", 1.0),
+                    )
+                existing["properties"] = merged_props
+                existing["confidence"] = max(
+                    existing.get("confidence", 0),
+                    incoming.get("confidence", 0),
+                )
+                if incoming.get("created") and existing.get("created"):
+                    existing["created"] = min(existing["created"], incoming["created"])
+                if incoming.get("updated") and existing.get("updated"):
+                    existing["updated"] = max(existing["updated"], incoming["updated"])
+                elif incoming.get("updated"):
+                    existing["updated"] = incoming["updated"]
+                if incoming.get("confidence", 0) >= existing.get("confidence", 0):
+                    existing["label"] = incoming.get("label", existing.get("label"))
+                    existing["type"] = incoming.get("type", existing.get("type"))
+                stats["nodes_updated"] += 1
+            else:
+                self._data["nodes"][nid] = deepcopy(node)
+                stats["nodes_added"] += 1
+
+        # --- Import edges (dedup) -----------------------------------------
+        existing_edge_keys = {
+            (e["source"], e["target"], e["relation"])
+            for e in self._data["edges"]
+        }
+        for edge in subgraph["edges"]:
+            key = (edge["source"], edge["target"], edge["relation"])
+            if key not in existing_edge_keys:
+                self._data["edges"].append(deepcopy(edge))
+                existing_edge_keys.add(key)
+                stats["edges_added"] += 1
+            else:
+                for e in self._data["edges"]:
+                    if (e["source"], e["target"], e["relation"]) == key:
+                        e["properties"] = {
+                            **e.get("properties", {}),
+                            **edge.get("properties", {}),
+                        }
+                        e["confidence"] = max(
+                            e.get("confidence", 0),
+                            edge.get("confidence", 0),
+                        )
+                        stats["edges_updated"] += 1
+                        break
+
+        # --- Store source text --------------------------------------------
+        manifest = self._data["meta"].setdefault("sources", {})
+        if subgraph.get("source_text") and (doc_slug not in manifest or overwrite):
+            result = self.store_source(subgraph["source_text"], doc_slug)
+            if not result.get("is_duplicate"):
+                stats["source_stored"] = 1
+            # Record transplant provenance
+            entry = manifest.get(doc_slug, {})
+            transplant_history = entry.get("transplanted_from", [])
+            if subgraph.get("origin_graph"):
+                transplant_history.append({
+                    "graph": subgraph["origin_graph"],
+                    "transplanted_at": now_iso(),
+                })
+            entry["transplanted_from"] = transplant_history
+            manifest[doc_slug] = entry
+
+        # --- Import embeddings --------------------------------------------
+        for nid, emb in subgraph.get("embeddings", {}).items():
+            if nid not in self._embeddings:
+                self._embeddings[nid] = emb
+                self._dirty_embeddings = True
+                stats["embeddings_added"] += 1
+
+        # --- Import custom relations --------------------------------------
+        my_customs = set(self._data["meta"].get("custom_relations", []))
+        for rel in subgraph.get("custom_relations", []):
+            my_customs.add(rel)
+        self._data["meta"]["custom_relations"] = sorted(my_customs)
+
+        # --- Import relation proposals ------------------------------------
+        my_proposal_names = {p.name for p in self._proposals}
+        for pd in subgraph.get("proposals", []):
+            if pd["name"] not in my_proposal_names:
+                self._proposals.append(RelationProposal(
+                    name=pd["name"],
+                    justification=pd.get("justification", ""),
+                    examples=pd.get("examples", []),
+                    source_docs=pd.get("source_docs", []),
+                    confidence=pd.get("confidence", 0.5),
+                    status=pd.get("status", ProposalStatus.PENDING.value),
+                    proposed_at=pd.get("proposed_at", now_iso()),
+                    reviewed_at=pd.get("reviewed_at"),
+                    review_note=pd.get("review_note", ""),
+                ))
+                stats["proposals_added"] += 1
+
+        self._rebuild_networkx()
+        self._dirty = True
+
+        logger.info(
+            "Imported subgraph for doc '%s': "
+            "nodes +%d ~%d, edges +%d ~%d, embeddings +%d, source=%d",
+            doc_slug,
+            stats["nodes_added"], stats["nodes_updated"],
+            stats["edges_added"], stats["edges_updated"],
+            stats["embeddings_added"], stats["source_stored"],
+        )
+
+        return stats
+
+    # ------------------------------------------------------------------
     # RAG helpers
     # ------------------------------------------------------------------
 
@@ -4853,6 +6981,387 @@ TEXT:
             "proposals_rejected": len(self.get_proposals(status=ProposalStatus.REJECTED.value)),
             "sources": self.source_stats(),
         }
+
+    def analytics(self) -> dict[str, Any]:
+        """Compute comprehensive quality and structural analytics.
+
+        Returns a dict with sections:
+          - **confidence_distribution**: histogram of node and edge
+            confidences in 10 buckets from [0.0, 0.1) to [0.9, 1.0].
+          - **relation_stats**: per-relation counts, mean/min/max confidence.
+          - **node_type_stats**: per-type counts, mean confidence, embedding
+            coverage.
+          - **hub_nodes**: top-10 nodes by total degree.
+          - **orphan_nodes**: nodes with degree 0 (excluding document/section).
+          - **source_coverage**: per-source-document node and edge counts.
+          - **embedding_coverage**: fraction of embeddable nodes that have
+            embeddings.
+          - **component_sizes**: list of weakly-connected-component sizes.
+          - **quality_score**: composite 0-100 health metric.
+        """
+        nodes = self._data["nodes"]
+        edges = self._data["edges"]
+
+        # -- Confidence distributions ------------------------------------
+        node_buckets = [0] * 10
+        edge_buckets = [0] * 10
+        node_confs: list[float] = []
+        edge_confs: list[float] = []
+
+        for node in nodes.values():
+            c = node.get("confidence", 1.0)
+            node_confs.append(c)
+            idx = min(int(c * 10), 9)
+            node_buckets[idx] += 1
+
+        for edge in edges:
+            c = edge.get("confidence", 1.0)
+            edge_confs.append(c)
+            idx = min(int(c * 10), 9)
+            edge_buckets[idx] += 1
+
+        bucket_labels = [f"{i/10:.1f}-{(i+1)/10:.1f}" for i in range(10)]
+
+        # -- Relation stats -----------------------------------------------
+        rel_data: dict[str, list[float]] = defaultdict(list)
+        for edge in edges:
+            rel = edge.get("relation", "unknown")
+            rel_data[rel].append(edge.get("confidence", 1.0))
+
+        relation_stats = {}
+        for rel, confs in sorted(rel_data.items()):
+            relation_stats[rel] = {
+                "count": len(confs),
+                "mean_confidence": sum(confs) / len(confs),
+                "min_confidence": min(confs),
+                "max_confidence": max(confs),
+            }
+
+        # -- Node type stats -----------------------------------------------
+        type_data: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"count": 0, "confidences": [], "with_embedding": 0}
+        )
+        for nid, node in nodes.items():
+            ntype = node.get("type", "unknown")
+            entry = type_data[ntype]
+            entry["count"] += 1
+            entry["confidences"].append(node.get("confidence", 1.0))
+            if nid in self._embeddings:
+                entry["with_embedding"] += 1
+
+        node_type_stats = {}
+        for ntype, entry in sorted(type_data.items()):
+            confs = entry["confidences"]
+            node_type_stats[ntype] = {
+                "count": entry["count"],
+                "mean_confidence": sum(confs) / len(confs) if confs else 0,
+                "embedding_count": entry["with_embedding"],
+                "embedding_pct": (
+                    entry["with_embedding"] / entry["count"] * 100
+                    if entry["count"] > 0 else 0
+                ),
+            }
+
+        # -- Hub nodes (top 10 by degree) ----------------------------------
+        if self._G.number_of_nodes() > 0:
+            degree_list = sorted(
+                self._G.degree(), key=lambda x: x[1], reverse=True
+            )[:10]
+            hub_nodes = [
+                {
+                    "node_id": nid,
+                    "label": nodes.get(nid, {}).get("label", nid),
+                    "type": nodes.get(nid, {}).get("type", "unknown"),
+                    "degree": deg,
+                    "in_degree": self._G.in_degree(nid),
+                    "out_degree": self._G.out_degree(nid),
+                }
+                for nid, deg in degree_list
+            ]
+        else:
+            hub_nodes = []
+
+        # -- Orphan nodes --------------------------------------------------
+        structural_types = {"document", "section"}
+        orphan_nodes = [
+            {
+                "node_id": nid,
+                "label": nodes[nid].get("label", nid),
+                "type": nodes[nid].get("type", "unknown"),
+            }
+            for nid in nodes
+            if self._G.degree(nid) == 0
+            and nodes[nid].get("type") not in structural_types
+        ]
+
+        # -- Source coverage ------------------------------------------------
+        source_node_counts: dict[str, int] = defaultdict(int)
+        source_edge_counts: dict[str, int] = defaultdict(int)
+        for node in nodes.values():
+            src = node.get("source", "")
+            if src.startswith("doc:"):
+                doc_key = src.split("::")[0].removeprefix("doc:")
+                source_node_counts[doc_key] += 1
+        for edge in edges:
+            src_tag = edge.get("source_tag", "")
+            if src_tag.startswith("doc:"):
+                doc_key = src_tag.split("::")[0].removeprefix("doc:")
+                source_edge_counts[doc_key] += 1
+
+        manifest = self._data["meta"].get("sources", {})
+        source_coverage = []
+        for doc_id, info in sorted(manifest.items()):
+            source_coverage.append({
+                "doc_id": doc_id,
+                "node_count": source_node_counts.get(doc_id, 0),
+                "edge_count": source_edge_counts.get(doc_id, 0),
+                "char_count": info.get("char_count", 0),
+                "version": info.get("version", 1),
+            })
+
+        # -- Embedding coverage ---------------------------------------------
+        embeddable = {
+            nid for nid, node in nodes.items()
+            if node.get("type") not in structural_types
+        }
+        embedded = embeddable & set(self._embeddings.keys())
+        embed_pct = len(embedded) / len(embeddable) * 100 if embeddable else 0
+
+        # -- Component sizes ------------------------------------------------
+        comp_sizes = sorted(
+            [len(c) for c in nx.weakly_connected_components(self._G)],
+            reverse=True,
+        )
+
+        # -- Quality score (0-100) ------------------------------------------
+        # Composite metric:
+        #   40% embedding coverage
+        #   30% average confidence (nodes + edges)
+        #   20% connectivity (1 - orphan_ratio)
+        #   10% source coverage (nodes that trace back to a document)
+        avg_conf = 0.0
+        if node_confs or edge_confs:
+            all_confs = node_confs + edge_confs
+            avg_conf = sum(all_confs) / len(all_confs)
+
+        orphan_ratio = len(orphan_nodes) / len(nodes) if nodes else 0
+        sourced_nodes = sum(
+            1 for n in nodes.values() if n.get("source", "").startswith("doc:")
+        )
+        source_ratio = sourced_nodes / len(nodes) if nodes else 0
+
+        quality_score = round(
+            (embed_pct / 100) * 40
+            + avg_conf * 30
+            + (1 - orphan_ratio) * 20
+            + source_ratio * 10,
+            1,
+        )
+
+        return {
+            "confidence_distribution": {
+                "buckets": bucket_labels,
+                "node_counts": node_buckets,
+                "edge_counts": edge_buckets,
+                "node_mean": sum(node_confs) / len(node_confs) if node_confs else 0,
+                "edge_mean": sum(edge_confs) / len(edge_confs) if edge_confs else 0,
+            },
+            "relation_stats": relation_stats,
+            "node_type_stats": node_type_stats,
+            "hub_nodes": hub_nodes,
+            "orphan_nodes": orphan_nodes,
+            "source_coverage": source_coverage,
+            "embedding_coverage": {
+                "embeddable": len(embeddable),
+                "embedded": len(embedded),
+                "pct": round(embed_pct, 1),
+            },
+            "component_sizes": comp_sizes,
+            "quality_score": quality_score,
+        }
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def validate(self) -> "ValidationReport":
+        """Run consistency checks on the graph. Read-only — never mutates.
+
+        Checks performed:
+          - **Dangling edges** (error): edges referencing non-existent nodes.
+          - **Taxonomic cycles** (error): cycles in is_a / subclass_of /
+            instance_of / part_of subgraph.
+          - **Contradictory edges** (warning): pairs like A is_a B and
+            B is_a A, or A supersedes B and B supersedes A.
+          - **Orphan nodes** (warning): nodes with no edges (degree 0),
+            excluding document nodes.
+          - **Zero-confidence items** (warning): nodes or edges with
+            confidence == 0.
+          - **Missing embeddings** (info): entity/concept nodes that
+            lack an embedding vector.
+        """
+        report = ValidationReport()
+        node_ids = set(self._data["nodes"].keys())
+
+        # -- Dangling edges --------------------------------------------------
+        for i, edge in enumerate(self._data["edges"]):
+            src, tgt = edge.get("source"), edge.get("target")
+            if src not in node_ids:
+                report.errors.append(
+                    f"Edge [{i}] references non-existent source node '{src}' "
+                    f"(relation: {edge.get('relation')}, target: {tgt})"
+                )
+            if tgt not in node_ids:
+                report.errors.append(
+                    f"Edge [{i}] references non-existent target node '{tgt}' "
+                    f"(relation: {edge.get('relation')}, source: {src})"
+                )
+
+        # -- Taxonomic cycles ------------------------------------------------
+        tax_graph = nx.DiGraph()
+        for edge in self._data["edges"]:
+            rel = edge.get("relation", "")
+            if rel in TAXONOMIC_RELATIONS:
+                src, tgt = edge["source"], edge["target"]
+                if src in node_ids and tgt in node_ids:
+                    tax_graph.add_edge(src, tgt, relation=rel)
+        try:
+            cycles = list(nx.simple_cycles(tax_graph))
+            for cycle in cycles:
+                path_str = " -> ".join(cycle + [cycle[0]])
+                report.errors.append(
+                    f"Taxonomic cycle detected: {path_str}"
+                )
+        except nx.NetworkXError:
+            pass  # empty graph
+
+        # -- Contradictory edges ---------------------------------------------
+        # Build a lookup: (src, tgt) -> set of relations
+        pair_rels: dict[tuple[str, str], set[str]] = defaultdict(set)
+        for edge in self._data["edges"]:
+            src, tgt = edge.get("source", ""), edge.get("target", "")
+            rel = edge.get("relation", "")
+            pair_rels[(src, tgt)].add(rel)
+
+        # Check for same-direction contradictions
+        for (src, tgt), rels in pair_rels.items():
+            for rel_a, rel_b in CONTRADICTORY_PAIRS:
+                if rel_a in rels and rel_b in rels:
+                    report.warnings.append(
+                        f"Contradictory edges on ({src}, {tgt}): "
+                        f"'{rel_a}' and '{rel_b}' both present"
+                    )
+
+        # Check for reflexive contradictions (A rel B and B rel A for
+        # relations that form contradictory inverse pairs)
+        checked_pairs: set[tuple[str, str]] = set()
+        for (src, tgt), rels in pair_rels.items():
+            if (tgt, src) in checked_pairs:
+                continue
+            reverse_rels = pair_rels.get((tgt, src), set())
+            if not reverse_rels:
+                continue
+            for rel in rels:
+                # Self-contradictory: A rel B and B rel A for hierarchical rels
+                if rel in TAXONOMIC_RELATIONS and rel in reverse_rels:
+                    report.warnings.append(
+                        f"Reflexive contradiction: '{src}' {rel} '{tgt}' "
+                        f"and '{tgt}' {rel} '{src}'"
+                    )
+                # Cross-contradictory: A supersedes B and B supersedes A
+                for rel_a, rel_b in CONTRADICTORY_PAIRS:
+                    if rel == rel_a and rel_b in reverse_rels:
+                        report.warnings.append(
+                            f"Contradictory pair: '{src}' {rel_a} '{tgt}' "
+                            f"and '{tgt}' {rel_b} '{src}'"
+                        )
+            checked_pairs.add((src, tgt))
+
+        # -- Orphan nodes ----------------------------------------------------
+        structural_types = {"document", "section"}
+        orphans = []
+        for nid in node_ids:
+            if self._G.degree(nid) == 0:
+                ntype = self._data["nodes"][nid].get("type", "unknown")
+                if ntype not in structural_types:
+                    orphans.append(nid)
+        if orphans:
+            if len(orphans) <= 10:
+                report.warnings.append(
+                    f"{len(orphans)} orphan node(s) with no edges: "
+                    + ", ".join(f"'{n}'" for n in orphans)
+                )
+            else:
+                report.warnings.append(
+                    f"{len(orphans)} orphan node(s) with no edges "
+                    f"(showing first 10): "
+                    + ", ".join(f"'{n}'" for n in orphans[:10])
+                    + ", ..."
+                )
+
+        # -- Zero-confidence items -------------------------------------------
+        zero_conf_nodes = [
+            nid for nid, node in self._data["nodes"].items()
+            if node.get("confidence", 1.0) == 0
+        ]
+        if zero_conf_nodes:
+            report.warnings.append(
+                f"{len(zero_conf_nodes)} node(s) with confidence=0: "
+                + ", ".join(f"'{n}'" for n in zero_conf_nodes[:5])
+                + ("..." if len(zero_conf_nodes) > 5 else "")
+            )
+
+        zero_conf_edges = []
+        for i, edge in enumerate(self._data["edges"]):
+            if edge.get("confidence", 1.0) == 0:
+                zero_conf_edges.append(
+                    f"{edge.get('source')}-[{edge.get('relation')}]->{edge.get('target')}"
+                )
+        if zero_conf_edges:
+            report.warnings.append(
+                f"{len(zero_conf_edges)} edge(s) with confidence=0: "
+                + ", ".join(zero_conf_edges[:5])
+                + ("..." if len(zero_conf_edges) > 5 else "")
+            )
+
+        # -- Missing embeddings (info) ---------------------------------------
+        embeddable_types = node_ids - {
+            nid for nid, node in self._data["nodes"].items()
+            if node.get("type") in structural_types
+        }
+        missing_embeds = embeddable_types - set(self._embeddings.keys())
+        if missing_embeds and self._embeddings:
+            pct = len(missing_embeds) / len(embeddable_types) * 100 if embeddable_types else 0
+            report.info.append(
+                f"{len(missing_embeds)} of {len(embeddable_types)} "
+                f"embeddable nodes ({pct:.0f}%) lack embeddings"
+            )
+
+        # -- NetworkX / dict sync check (info) -------------------------------
+        nx_nodes = set(self._G.nodes())
+        dict_nodes = node_ids
+        if nx_nodes != dict_nodes:
+            only_nx = nx_nodes - dict_nodes
+            only_dict = dict_nodes - nx_nodes
+            if only_nx:
+                report.errors.append(
+                    f"Nodes in NetworkX but not in data dict: {sorted(only_nx)[:5]}"
+                )
+            if only_dict:
+                report.errors.append(
+                    f"Nodes in data dict but not in NetworkX: {sorted(only_dict)[:5]}"
+                )
+
+        # -- Summary info -----------------------------------------------------
+        if report.is_valid and not report.warnings:
+            report.info.append("All validation checks passed.")
+        else:
+            report.info.append(
+                f"Validation complete: {len(report.errors)} error(s), "
+                f"{len(report.warnings)} warning(s)."
+            )
+
+        return report
 
     def __repr__(self) -> str:
         pending = len(self.get_proposals(status=ProposalStatus.PENDING.value))
@@ -6280,7 +8789,513 @@ def _salvage_truncated_json(raw: str) -> list[dict[str, Any]] | None:
 # CLI for quick inspection
 # ---------------------------------------------------------------------------
 
-def main():
+def _cmd_preview_md(args: Any, kg: "KnowledgeGraph") -> None:
+    """Handle --preview-md: show section breakdown of a markdown file."""
+    from pathlib import Path as _P
+
+    md_path = _P(args.preview_md)
+    if not md_path.exists():
+        print(f"File not found: {md_path}")
+        return
+
+    text = md_path.read_text(encoding="utf-8")
+    sections = KnowledgeGraph.parse_markdown_sections(text)
+    print(f"\nMarkdown: {md_path.name}")
+    print(f"  Total characters: {len(text):,}")
+    print(f"  Sections parsed: {len(sections)}")
+    print()
+    for i, sec in enumerate(sections):
+        prefix = "  " * sec["level"] if sec["level"] > 0 else ""
+        heading = sec["heading"] or "(preamble)"
+        flags = []
+        if sec["has_code"]:
+            flags.append("code")
+        if sec["has_table"]:
+            flags.append("table")
+        if sec["has_list"]:
+            flags.append("list")
+        if sec["links"]:
+            flags.append(f"{len(sec['links'])} links")
+        flag_str = f"  [{', '.join(flags)}]" if flags else ""
+        print(f"  {prefix}{'#' * sec['level']} {heading}  "
+              f"({sec['char_count']:,} chars){flag_str}")
+        if args.sections:
+            preview = sec["body"][:200].replace("\n", " ")
+            if len(sec["body"]) > 200:
+                preview += "..."
+            print(f"  {prefix}  → {preview}")
+    print(f"\n  To ingest, run: --ingest-md {args.preview_md}")
+
+
+def _make_progress_callback(
+    *, quiet: bool, verbose: bool,
+) -> Callable[[dict[str, Any]], None]:
+    """Build the CLI progress callback for ingestion and embedding events."""
+
+    def _progress(event: dict[str, Any]) -> None:
+        if quiet:
+            return
+        ev = event["event"]
+        idx = event.get("index", 0)
+        total = event.get("total", 0)
+        heading = event.get("heading", "?")
+        chars = event.get("char_count", 0)
+        tag = f"[{idx + 1}/{total}]"
+
+        if ev == "doc_start":
+            doc = event.get("doc_id", "?")
+            secs = event.get("total_sections", 0)
+            ccount = event.get("char_count", 0)
+            print(f"  Document: \"{doc}\" ({ccount:,} chars, {secs} sections)")
+        elif ev == "section_skip":
+            print(f"  {tag} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
+        elif ev == "section_start":
+            print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars)...", end="", flush=True)
+        elif ev == "extraction_done":
+            n = event.get("triples_returned", 0)
+            if verbose:
+                print(f" {n} triples returned, processing...", end="", flush=True)
+        elif ev == "triple_done":
+            if verbose:
+                ti = event.get("index", 0)
+                tt = event.get("total", 0)
+                if tt > 5 and (ti + 1) % 5 == 0:
+                    print(".", end="", flush=True)
+        elif ev == "section_done":
+            elapsed = event.get("elapsed_seconds", 0)
+            triples = event.get("triples", 0)
+            nodes_added = event.get("nodes_added", 0)
+            nodes_updated = event.get("nodes_updated", 0)
+            edges_added = event.get("edges_added", 0)
+            edges_updated = event.get("edges_updated", 0)
+            errors = event.get("errors", [])
+            parts = []
+            if nodes_added:
+                parts.append(f"{nodes_added} new")
+            if nodes_updated:
+                parts.append(f"{nodes_updated} updated")
+            node_summary = "+".join(parts) + " nodes" if parts else "0 nodes"
+            edge_parts = []
+            if edges_added:
+                edge_parts.append(f"{edges_added} new")
+            if edges_updated:
+                edge_parts.append(f"{edges_updated} updated")
+            edge_summary = ("+".join(edge_parts) + " edges") if edge_parts else ""
+            result_str = node_summary
+            if edge_summary:
+                result_str += f", {edge_summary}"
+            if errors:
+                print(f" {triples} triples → {result_str} ({len(errors)} errors, {elapsed}s)")
+                if verbose:
+                    for err in errors[:5]:
+                        print(f"         {err}")
+                    if len(errors) > 5:
+                        print(f"         ... and {len(errors) - 5} more")
+            else:
+                print(f" {triples} triples → {result_str} ({elapsed}s)")
+        elif ev == "incremental_skip_plan":
+            unchanged = event.get("unchanged_sections", [])
+            changed = event.get("changed_sections", [])
+            removed = event.get("removed_sections", [])
+            print(f"  Incremental: {len(unchanged)} unchanged, "
+                  f"{len(changed)} changed, {len(removed)} removed")
+            if verbose:
+                for s in unchanged[:10]:
+                    print(f"    skip: {s}")
+                if len(unchanged) > 10:
+                    print(f"    ... and {len(unchanged) - 10} more")
+        elif ev == "version_diff":
+            summary = event.get("summary", "")
+            if verbose:
+                print(f"  Version diff (v{event.get('version_from')}→v{event.get('version_to')}): {summary}")
+        elif ev == "doc_done":
+            if verbose:
+                secs = event.get("total_sections", 0)
+                triples = event.get("total_triples", 0)
+                na = event.get("total_nodes_added", 0)
+                ea = event.get("total_edges_added", 0)
+                skipped_inc = event.get("sections_skipped_incremental", 0)
+                inc_note = f", {skipped_inc} skipped (unchanged)" if skipped_inc else ""
+                print(f"  Document complete: {secs} sections{inc_note}, "
+                      f"{triples} triples, {na} nodes, {ea} edges")
+        elif ev == "embed_start":
+            tn = event.get("total_nodes", 0)
+            sk = event.get("nodes_skipped", 0)
+            print(f"  Embedding {tn} nodes ({sk} skipped)...", end="", flush=True)
+        elif ev == "embed_batch_done":
+            b = event.get("batch", 0)
+            tb = event.get("total_batches", 0)
+            ne = event.get("nodes_embedded", 0)
+            tn = event.get("total_nodes", 0)
+            if verbose:
+                print(f" batch {b}/{tb} ({ne}/{tn})", end="", flush=True)
+        elif ev == "embed_done":
+            ne = event.get("nodes_embedded", 0)
+            nb = event.get("batches", 0)
+            print(f" {ne} nodes embedded in {nb} batches")
+
+    return _progress
+
+
+def _print_file_summary(
+    stats: dict[str, Any],
+    md_path: "Path",
+    elapsed: float,
+    kg: "KnowledgeGraph",
+    embed_stats: dict[str, Any] | None,
+    *,
+    verbose: bool,
+    auto_accept: bool,
+) -> None:
+    """Print the per-file ingestion summary."""
+    graph_stats = kg.stats()
+    print(f"\nIngested: {md_path.name}")
+    print(f"  Document ID: {stats['doc_id']}")
+    _skipped_inc = stats.get("sections_skipped_incremental", 0)
+    if _skipped_inc:
+        print(f"  Sections: {stats['total_sections']} ({_skipped_inc} skipped, unchanged)")
+    else:
+        print(f"  Sections: {stats['total_sections']}")
+    print(f"  Triples extracted: {stats['total_triples']}")
+    _n_added = stats["total_nodes_added"]
+    _n_updated = stats["total_nodes_updated"]
+    _e_added = stats["total_edges_added"]
+    _e_updated = stats["total_edges_updated"]
+    node_str = f"{_n_added} added"
+    if _n_updated:
+        node_str += f", {_n_updated} updated"
+    edge_str = f"{_e_added} added"
+    if _e_updated:
+        edge_str += f", {_e_updated} updated"
+    print(f"  Nodes: {node_str}")
+    print(f"  Edges: {edge_str}")
+    print(f"  Total time: {elapsed:.1f}s")
+    print(f"  Graph totals: {graph_stats['num_nodes']} nodes, "
+          f"{graph_stats['num_edges']} edges")
+    if embed_stats and embed_stats["nodes_embedded"]:
+        print(f"  Nodes embedded: {embed_stats['nodes_embedded']} "
+              f"(skipped {embed_stats['nodes_skipped']})")
+    if stats.get("total_proposals_created"):
+        print(f"  New relation proposals: {stats['total_proposals_created']}")
+        if auto_accept:
+            print(f"  Auto-accepted {stats['total_proposals_created']} proposal(s)")
+    if stats.get("source"):
+        src = stats["source"]
+        if src.get("is_duplicate"):
+            print(f"  Warning: duplicate content (matches '{src['existing_doc_id']}')")
+        elif src.get("is_update"):
+            print(f"  Source updated: v{src['version']} ({src['stored_path']})")
+        else:
+            ver = src.get("version", 1)
+            if ver > 1:
+                print(f"  Source unchanged: v{ver} ({src['stored_path']})")
+            else:
+                print(f"  Source stored: v{ver} ({src['stored_path']})")
+
+    if verbose:
+        print("\n  Section details:")
+        for sec_stat in stats.get("sections", []):
+            _heading = sec_stat.get("heading", "?")
+            sec_elapsed = sec_stat.get("elapsed_seconds", "")
+            elapsed_str = f", {sec_elapsed}s" if sec_elapsed else ""
+            if sec_stat.get("skipped"):
+                print(f"    [skip] {_heading} ({sec_stat.get('reason', '')})")
+            else:
+                triples_info = ""
+                n_triples = sec_stat.get("triples_processed", 0)
+                n_nodes = sec_stat.get("nodes_added", 0)
+                n_nodes_upd = sec_stat.get("nodes_updated", 0)
+                n_edges = sec_stat.get("edges_added", 0)
+                n_edges_upd = sec_stat.get("edges_updated", 0)
+                n_errors = len(sec_stat.get("errors", []))
+                if n_triples:
+                    triples_info = f", {n_triples} triples"
+                if n_nodes:
+                    triples_info += f", {n_nodes} new nodes"
+                if n_nodes_upd:
+                    triples_info += f", {n_nodes_upd} updated nodes"
+                if n_edges:
+                    triples_info += f", {n_edges} new edges"
+                if n_edges_upd:
+                    triples_info += f", {n_edges_upd} updated edges"
+                if n_triples and n_nodes == 0 and n_nodes_upd == 0 and n_errors:
+                    sec_tag = "WARN"
+                    triples_info += f", {n_errors} errors"
+                else:
+                    sec_tag = "ok"
+                print(f"    [{sec_tag}]   {_heading} "
+                      f"({sec_stat.get('char_count', 0):,} chars{triples_info}{elapsed_str})")
+
+    if stats["errors"]:
+        print(f"\n  Errors ({len(stats['errors'])}):")
+        for err in stats["errors"]:
+            print(f"    - {err}")
+
+
+def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
+    """Handle --ingest-md: ingest markdown files into the graph."""
+    from pathlib import Path as _P
+
+    _quiet = args.quiet
+    _verbose = args.verbose
+
+    # Resolve which model to use for extraction
+    _has_model = args.query_model or args.extract_model
+    if _has_model:
+        _extract_model = args.extract_model or args.query_model
+        _provider = args.provider
+        _temperature = args.temperature if args.temperature is not None else 0.1
+        _thinking_budget = args.thinking_budget
+        _no_think = args.no_think
+
+        _extra_info: list[str] = []
+        if args.temperature is not None:
+            _extra_info.append(f"temperature={_temperature}")
+        if _thinking_budget > 0:
+            _extra_info.append(f"thinking_budget={_thinking_budget}")
+        if _no_think:
+            _extra_info.append("no_think")
+        _extra_str = f" ({', '.join(_extra_info)})" if _extra_info else ""
+
+        if _provider == "anthropic":
+            _api_key = _get_anthropic_api_key()
+            extract_fn: Callable[[str], list[dict[str, Any]]] = (
+                lambda prompt: claude_extract(
+                    prompt, model=_extract_model, api_key=_api_key,
+                    temperature=_temperature, thinking_budget=_thinking_budget,
+                )
+            )
+            print(f"  Using model: {_extract_model} (provider: anthropic){_extra_str}")
+        elif _provider == "bedrock":
+            _bedrock_region = args.bedrock_region
+            _bedrock_profile = args.bedrock_profile
+            extract_fn = (
+                lambda prompt: bedrock_extract(
+                    prompt, model=_extract_model,
+                    region=_bedrock_region, profile=_bedrock_profile,
+                    temperature=_temperature,
+                )
+            )
+            print(f"  Using model: {_extract_model} (provider: bedrock, "
+                  f"region: {_bedrock_region or 'default'}, profile: {_bedrock_profile or 'default'}){_extra_str}")
+        else:
+            _extract_url = args.ollama_url.rstrip("/")
+            extract_fn = (
+                lambda prompt: local_extract(
+                    prompt, model=_extract_model, url=_extract_url,
+                    temperature=_temperature, no_think=_no_think,
+                )
+            )
+            print(f"  Using model: {_extract_model} at {_extract_url}{_extra_str}")
+    else:
+        extract_fn = lambda _text: []
+
+    if args.parallel > 1 and not _quiet:
+        print(f"  Parallel extractions: {args.parallel} threads")
+    if args.incremental and not _quiet:
+        print("  Incremental mode: unchanged sections will skip LLM extraction")
+
+    _progress = _make_progress_callback(quiet=_quiet, verbose=_verbose)
+
+    # Resolve embed model once (shared across all files)
+    _embed_model = None
+    _embed_url = None
+    if _has_model:
+        if args.embed_model is not None:
+            _embed_model = args.embed_model
+        elif kg.embed_model:
+            _embed_model = kg.embed_model
+            if not _quiet:
+                print(f"  Using embed model '{_embed_model}' from graph metadata")
+        else:
+            _embed_model = "qwen3-embedding"
+        _embed_url = args.embed_url.rstrip("/")
+
+    _all_stats: list[dict[str, Any]] = []
+    _batch_t0 = time.monotonic()
+
+    for md_file_arg in args.ingest_md:
+        md_path = _P(md_file_arg)
+        if not md_path.exists():
+            print(f"File not found: {md_path}")
+            continue
+
+        text = md_path.read_text(encoding="utf-8")
+        doc_id = md_path.stem
+        file_path = md_path.resolve()
+
+        if not _quiet and len(args.ingest_md) > 1:
+            print(f"\n{'='*60}")
+            print(f"  File: {md_path.name}")
+            print(f"{'='*60}")
+
+        _ingest_t0 = time.monotonic()
+
+        stats = kg.ingest_markdown(
+            text,
+            doc_id=doc_id,
+            llm_extract_fn=extract_fn,
+            original_path=file_path,
+            doc_properties={
+                "file_path": str(md_path),
+                "file_size": md_path.stat().st_size,
+            },
+            progress_fn=_progress,
+            parallel_extractions=args.parallel,
+            incremental=args.incremental,
+        )
+        _total_elapsed = time.monotonic() - _ingest_t0
+
+        # Embed nodes if an embedding model is configured
+        _embed_stats = None
+        if _embed_model:
+            if args.provider == "bedrock" and args.embed_model is not None:
+                _br = args.bedrock_region
+                _bp = args.bedrock_profile
+                def _embed_fn(batch: list[str]) -> list[list[float]]:
+                    return bedrock_embed(batch, model=_embed_model, region=_br, profile=_bp)
+                if not _quiet:
+                    print(f"  Embed config: model='{_embed_model}' (bedrock, "
+                          f"region={_br or 'default'}, profile={_bp or 'default'})")
+            else:
+                def _embed_fn(batch: list[str]) -> list[list[float]]:
+                    return ollama_embed(batch, model=_embed_model, url=_embed_url)
+                if not _quiet:
+                    print(f"  Embed config: model='{_embed_model}' url='{_embed_url}'")
+
+            _embed_t0 = time.monotonic()
+            _embed_stats = kg.embed_nodes(
+                _embed_fn, skip_existing=True, model_name=_embed_model,
+                progress_fn=_progress,
+            )
+            _embed_elapsed = time.monotonic() - _embed_t0
+
+        kg.save_all()
+
+        # Auto-accept proposals after each file
+        if stats.get("total_proposals_created") and args.auto_accept:
+            pending = kg.get_proposals()
+            for p in pending:
+                kg.accept_proposal(p.name)
+            if pending:
+                kg.save()
+
+        _all_stats.append({
+            "stats": stats,
+            "embed_stats": _embed_stats,
+            "elapsed": _total_elapsed,
+            "md_path": md_path,
+        })
+
+        _print_file_summary(
+            stats, md_path, _total_elapsed, kg, _embed_stats,
+            verbose=_verbose, auto_accept=args.auto_accept,
+        )
+
+    # Batch summary for multi-file ingestion
+    if len(_all_stats) > 1:
+        _batch_elapsed = time.monotonic() - _batch_t0
+        total_triples = sum(s["stats"]["total_triples"] for s in _all_stats)
+        total_nodes_added = sum(s["stats"]["total_nodes_added"] for s in _all_stats)
+        total_nodes_updated = sum(s["stats"]["total_nodes_updated"] for s in _all_stats)
+        total_edges_added = sum(s["stats"]["total_edges_added"] for s in _all_stats)
+        total_edges_updated = sum(s["stats"]["total_edges_updated"] for s in _all_stats)
+        graph_stats = kg.stats()
+        print(f"\n{'='*60}")
+        print(f"  Batch complete: {len(_all_stats)} files ingested")
+        print(f"  Total triples: {total_triples}")
+        _bn = f"{total_nodes_added} added"
+        if total_nodes_updated:
+            _bn += f", {total_nodes_updated} updated"
+        _be = f"{total_edges_added} added"
+        if total_edges_updated:
+            _be += f", {total_edges_updated} updated"
+        print(f"  Total nodes: {_bn}")
+        print(f"  Total edges: {_be}")
+        print(f"  Graph totals: {graph_stats['num_nodes']} nodes, "
+              f"{graph_stats['num_edges']} edges")
+        print(f"  Total time: {_batch_elapsed:.1f}s")
+        print(f"{'='*60}")
+
+    if _all_stats:
+        print(f"\n  Graph saved to {kg.graph_path}")
+
+        # Auto-export visualizations (once at the end)
+        if not args.no_viz:
+            graph_dir = kg.graph_path.parent
+            base_name = kg.graph_path.stem
+
+            cyto_path = graph_dir / f"{base_name}_cytoscape.html"
+            try:
+                kg.export_cytoscape(cyto_path)
+                print(f"  Cytoscape visualization: {cyto_path}")
+            except (OSError, ValueError) as e:
+                logger.error("Cytoscape export failed: %s", e)
+
+            try:
+                pyvis_path = graph_dir / f"{base_name}_pyvis.html"
+                kg.export_pyvis(pyvis_path)
+                print(f"  Pyvis visualization: {pyvis_path}")
+            except (ImportError, OSError, ValueError) as e:
+                logger.error("Pyvis export skipped: %s", e)
+
+
+def _cmd_verify_embeddings(kg: "KnowledgeGraph") -> None:
+    """Handle --verify-embeddings: check embedding integrity."""
+    emb_count = len(kg._embeddings)
+    if emb_count == 0:
+        print("No embeddings found.")
+        return
+
+    model = kg.embed_model or "(unknown)"
+    dim = kg.embed_dim
+    missing = kg.nodes_without_embeddings()
+
+    zero_vectors: list[str] = []
+    dim_mismatches: list[tuple[str, int]] = []
+    first_dim: int | None = None
+    for nid, vec in kg._embeddings.items():
+        if first_dim is None:
+            first_dim = len(vec)
+        if all(v == 0.0 for v in vec):
+            zero_vectors.append(nid)
+        if len(vec) != first_dim:
+            dim_mismatches.append((nid, len(vec)))
+
+    print(f"  Embeddings: {emb_count}")
+    print(f"  Model: {model}")
+    print(f"  Dimension: {dim or first_dim}")
+    print(f"  Nodes without embeddings: {len(missing)}")
+    if missing and len(missing) <= 10:
+        for nid in missing:
+            print(f"    - {nid}")
+    elif missing:
+        for nid in missing[:5]:
+            print(f"    - {nid}")
+        print(f"    ... and {len(missing) - 5} more")
+
+    if zero_vectors:
+        print(f"  WARNING: {len(zero_vectors)} zero vector(s) detected "
+              "(embedding may have failed):")
+        for nid in zero_vectors[:5]:
+            print(f"    - {nid}")
+        if len(zero_vectors) > 5:
+            print(f"    ... and {len(zero_vectors) - 5} more")
+
+    if dim_mismatches:
+        print(f"  WARNING: {len(dim_mismatches)} dimension mismatch(es):")
+        for nid, d in dim_mismatches[:5]:
+            print(f"    - {nid}: {d} (expected {first_dim})")
+
+    if not zero_vectors and not dim_mismatches:
+        sample_nid = next(iter(kg._embeddings))
+        sample_vec = kg._embeddings[sample_nid]
+        preview = ", ".join(f"{v:.4f}" for v in sample_vec[:5])
+        print(f"  Sample ({sample_nid}): [{preview}, ...] (len={len(sample_vec)})")
+        print("  OK — all embeddings look valid.")
+
+
+def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Knowledge Graph Inspector")
@@ -6333,14 +9348,55 @@ def main():
                              "Useful for using a fast model (e.g. Haiku) for extraction.")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip automatic visualization export after ingestion")
+    parser.add_argument("-j", "--parallel", type=int, default=1, metavar="N",
+                        dest="parallel",
+                        help="Number of parallel LLM extraction threads during ingestion. "
+                             "LLM calls run concurrently while graph writes remain serial. "
+                             "(default: 1, sequential)")
+    parser.add_argument("--incremental", action="store_true",
+                        help="Skip LLM extraction for sections unchanged since the last "
+                             "ingestion. Uses section-level content hashes to detect changes. "
+                             "Structural nodes/edges are always updated. Dramatically reduces "
+                             "LLM calls when re-ingesting documents with minor edits.")
+    parser.add_argument("--temperature", type=float, default=None, metavar="T",
+                        help="Sampling temperature for LLM extraction (0.0–2.0, default 0.1). "
+                             "Lower values produce more deterministic output; higher values "
+                             "increase diversity. Ignored when --thinking-budget is set with "
+                             "the anthropic provider (requires temperature=1).")
+    parser.add_argument("--thinking-budget", type=int, default=0, metavar="TOKENS",
+                        dest="thinking_budget",
+                        help="Enable extended thinking for Claude models with this token budget. "
+                             "Only effective with --provider anthropic. When set, temperature "
+                             "is forced to 1.0 as required by the API. Set to 0 to disable "
+                             "(default: 0).")
+    parser.add_argument("--no-think", action="store_true", dest="no_think",
+                        help="Disable thinking/reasoning mode for models that support it "
+                             "(e.g. Qwen3, DeepSeek-R1). Sends chat_template_kwargs with "
+                             "enable_thinking=false to the server. Only effective with "
+                             "--provider local. Saves tokens and inference time by skipping "
+                             "chain-of-thought reasoning.")
     parser.add_argument("--auto-accept", action="store_true",
                         help="Automatically accept all new relation proposals created during ingestion")
+    parser.add_argument("--doc-history", metavar="DOC_ID",
+                        help="Show version history for a document")
     parser.add_argument("--sources", action="store_true",
                         help="List all stored source files")
     parser.add_argument("--check-sources", action="store_true",
                         help="Verify integrity of stored source files")
     parser.add_argument("--verify-embeddings", action="store_true",
                         help="Check embedding integrity: dimensions, zero vectors, coverage")
+    parser.add_argument("--validate", action="store_true",
+                        help="Run consistency checks: dangling edges, taxonomic cycles, "
+                             "contradictions, orphan nodes, confidence anomalies")
+    parser.add_argument("--analytics", action="store_true",
+                        help="Show quality analytics: confidence distributions, hub nodes, "
+                             "orphan detection, embedding coverage, quality score")
+    parser.add_argument("--diff", metavar="OTHER_GRAPH",
+                        help="Diff this graph against another graph file and show changes")
+    parser.add_argument("--query", metavar="PATTERN",
+                        help="Run a pattern query: "
+                             '\'(type:concept) -[is_a]-> (*)\' or '
+                             '\'(*) -[*]-> (*) WHERE confidence > 0.7\'')
     parser.add_argument("--list-models", action="store_true",
                         help="List models available on the API server and exit")
     parser.add_argument("--merge", nargs="+", metavar="GRAPH",
@@ -6486,376 +9542,39 @@ def main():
         print(f"Cytoscape visualization: {path}")
 
     if args.preview_md:
-        from pathlib import Path as _P
-        md_path = _P(args.preview_md)
-        if not md_path.exists():
-            print(f"File not found: {md_path}")
-        else:
-            text = md_path.read_text(encoding="utf-8")
-            sections = KnowledgeGraph.parse_markdown_sections(text)
-            print(f"\nMarkdown: {md_path.name}")
-            print(f"  Total characters: {len(text):,}")
-            print(f"  Sections parsed: {len(sections)}")
-            print()
-            for i, sec in enumerate(sections):
-                prefix = "  " * sec["level"] if sec["level"] > 0 else ""
-                heading = sec["heading"] or "(preamble)"
-                flags = []
-                if sec["has_code"]:
-                    flags.append("code")
-                if sec["has_table"]:
-                    flags.append("table")
-                if sec["has_list"]:
-                    flags.append("list")
-                if sec["links"]:
-                    flags.append(f"{len(sec['links'])} links")
-                flag_str = f"  [{', '.join(flags)}]" if flags else ""
-                print(f"  {prefix}{'#' * sec['level']} {heading}  "
-                      f"({sec['char_count']:,} chars){flag_str}")
-                if args.sections:
-                    # Show first 200 chars of body
-                    preview = sec["body"][:200].replace("\n", " ")
-                    if len(sec["body"]) > 200:
-                        preview += "..."
-                    print(f"  {prefix}  → {preview}")
-            print(f"\n  To ingest, run: --ingest-md {args.preview_md}")
+        _cmd_preview_md(args, kg)
 
     if args.ingest_md:
-        from pathlib import Path as _P
+        _cmd_ingest_md(args, kg)
 
-        # Build the LLM extraction function (shared across all files)
-        _quiet = args.quiet
-        _verbose = args.verbose
-
-        # Resolve which model to use for extraction
-        _has_model = args.query_model or args.extract_model
-        if _has_model:
-            _extract_model = args.extract_model or args.query_model
-            _provider = args.provider
-
-            if _provider == "anthropic":
-                _api_key = _get_anthropic_api_key()
-                extract_fn: Callable[[str], list[dict[str, Any]]] = (
-                    lambda prompt: claude_extract(prompt, model=_extract_model, api_key=_api_key)
-                )
-                print(f"  Using model: {_extract_model} (provider: anthropic)")
-            elif _provider == "bedrock":
-                _bedrock_region = args.bedrock_region
-                _bedrock_profile = args.bedrock_profile
-                extract_fn = (
-                    lambda prompt: bedrock_extract(prompt, model=_extract_model, region=_bedrock_region, profile=_bedrock_profile)
-                )
-                print(f"  Using model: {_extract_model} (provider: bedrock, region: {_bedrock_region or 'default'}, profile: {_bedrock_profile or 'default'})")
-            else:
-                _extract_url = args.ollama_url.rstrip("/")
-                extract_fn = (
-                    lambda prompt: local_extract(prompt, model=_extract_model, url=_extract_url)
-                )
-                print(f"  Using model: {_extract_model} at {_extract_url}")
+    if args.doc_history:
+        history = kg.get_document_history(args.doc_history)
+        if not history:
+            print(f"No history found for document '{args.doc_history}'.")
         else:
-            # Structure-only ingestion: no LLM, build document/section
-            # nodes and store the source. Entity extraction is skipped.
-            extract_fn = lambda _text: []
-
-        def _progress(event: dict[str, Any]) -> None:
-            if _quiet:
-                return
-            ev = event["event"]
-            idx = event.get("index", 0)
-            total = event.get("total", 0)
-            heading = event.get("heading", "?")
-            chars = event.get("char_count", 0)
-            tag = f"[{idx + 1}/{total}]"
-
-            if ev == "doc_start":
-                doc = event.get("doc_id", "?")
-                secs = event.get("total_sections", 0)
-                ccount = event.get("char_count", 0)
-                print(f"  Document: \"{doc}\" ({ccount:,} chars, {secs} sections)")
-            elif ev == "section_skip":
-                print(f"  {tag} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
-            elif ev == "section_start":
-                print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars)...", end="", flush=True)
-            elif ev == "extraction_done":
-                n = event.get("triples_returned", 0)
-                if _verbose:
-                    print(f" {n} triples returned, processing...", end="", flush=True)
-            elif ev == "triple_done":
-                if _verbose:
-                    ti = event.get("index", 0)
-                    tt = event.get("total", 0)
-                    # Print a dot every 5 triples to show progress
-                    if tt > 5 and (ti + 1) % 5 == 0:
-                        print(".", end="", flush=True)
-            elif ev == "section_done":
-                elapsed = event.get("elapsed_seconds", 0)
-                triples = event.get("triples", 0)
-                nodes_added = event.get("nodes_added", 0)
-                nodes_updated = event.get("nodes_updated", 0)
-                edges_added = event.get("edges_added", 0)
-                edges_updated = event.get("edges_updated", 0)
-                errors = event.get("errors", [])
-                # Build concise node/edge summary
-                parts = []
-                if nodes_added:
-                    parts.append(f"{nodes_added} new")
-                if nodes_updated:
-                    parts.append(f"{nodes_updated} updated")
-                node_summary = "+".join(parts) + " nodes" if parts else "0 nodes"
-                edge_parts = []
-                if edges_added:
-                    edge_parts.append(f"{edges_added} new")
-                if edges_updated:
-                    edge_parts.append(f"{edges_updated} updated")
-                edge_summary = ("+".join(edge_parts) + " edges") if edge_parts else ""
-
-                result_str = node_summary
-                if edge_summary:
-                    result_str += f", {edge_summary}"
-
-                if errors:
-                    print(f" {triples} triples → {result_str} ({len(errors)} errors, {elapsed}s)")
-                    if _verbose:
-                        for err in errors[:5]:
-                            print(f"         {err}")
-                        if len(errors) > 5:
-                            print(f"         ... and {len(errors) - 5} more")
-                else:
-                    print(f" {triples} triples → {result_str} ({elapsed}s)")
-            elif ev == "doc_done":
-                if _verbose:
-                    secs = event.get("total_sections", 0)
-                    triples = event.get("total_triples", 0)
-                    na = event.get("total_nodes_added", 0)
-                    ea = event.get("total_edges_added", 0)
-                    print(f"  Document complete: {secs} sections, {triples} triples, {na} nodes, {ea} edges")
-            elif ev == "embed_start":
-                tn = event.get("total_nodes", 0)
-                sk = event.get("nodes_skipped", 0)
-                print(f"  Embedding {tn} nodes ({sk} skipped)...", end="", flush=True)
-            elif ev == "embed_batch_done":
-                b = event.get("batch", 0)
-                tb = event.get("total_batches", 0)
-                ne = event.get("nodes_embedded", 0)
-                tn = event.get("total_nodes", 0)
-                if _verbose:
-                    print(f" batch {b}/{tb} ({ne}/{tn})", end="", flush=True)
-            elif ev == "embed_done":
-                ne = event.get("nodes_embedded", 0)
-                nb = event.get("batches", 0)
-                print(f" {ne} nodes embedded in {nb} batches")
-
-        # Resolve embed model once (shared across all files)
-        _embed_model = None
-        _embed_url = None
-        if _has_model:
-            if args.embed_model is not None:
-                _embed_model = args.embed_model
-            elif kg.embed_model:
-                _embed_model = kg.embed_model
-                if not _quiet:
-                    print(f"  Using embed model '{_embed_model}' from graph metadata")
-            else:
-                _embed_model = "qwen3-embedding"
-            _embed_url = args.embed_url.rstrip("/")
-
-        _all_stats: list[dict[str, Any]] = []
-        _batch_t0 = time.monotonic()
-
-        for md_file_arg in args.ingest_md:
-            md_path = _P(md_file_arg)
-            if not md_path.exists():
-                print(f"File not found: {md_path}")
-                continue
-
-            text = md_path.read_text(encoding="utf-8")
-            doc_id = md_path.stem
-            file_path = md_path.resolve()
-
-            if not _quiet and len(args.ingest_md) > 1:
-                print(f"\n{'='*60}")
-                print(f"  File: {md_path.name}")
-                print(f"{'='*60}")
-
-            _ingest_t0 = time.monotonic()
-
-            stats = kg.ingest_markdown(
-                text,
-                doc_id=doc_id,
-                llm_extract_fn=extract_fn,
-                original_path=file_path,
-                doc_properties={
-                    "file_path": str(md_path),
-                    "file_size": md_path.stat().st_size,
-                },
-                progress_fn=_progress,
-            )
-            _total_elapsed = time.monotonic() - _ingest_t0
-
-            # Embed nodes if an embedding model is configured
-            _embed_stats = None
-            if _embed_model:
-                if args.provider == "bedrock" and args.embed_model is not None:
-                    _br = args.bedrock_region
-                    _bp = args.bedrock_profile
-                    def _embed_fn(batch: list[str]) -> list[list[float]]:
-                        return bedrock_embed(batch, model=_embed_model, region=_br, profile=_bp)
-                    if not _quiet:
-                        print(f"  Embed config: model='{_embed_model}' (bedrock, region={_br or 'default'}, profile={_bp or 'default'})")
-                else:
-                    def _embed_fn(batch: list[str]) -> list[list[float]]:
-                        return ollama_embed(batch, model=_embed_model, url=_embed_url)
-                    if not _quiet:
-                        print(f"  Embed config: model='{_embed_model}' url='{_embed_url}'")
-
-                _embed_t0 = time.monotonic()
-                _embed_stats = kg.embed_nodes(
-                    _embed_fn, skip_existing=True, model_name=_embed_model,
-                    progress_fn=_progress,
-                )
-                _embed_elapsed = time.monotonic() - _embed_t0
-
-            kg.save_all()
-
-            # Auto-accept proposals after each file
-            if stats.get("total_proposals_created") and args.auto_accept:
-                pending = kg.get_proposals()
-                for p in pending:
-                    kg.accept_proposal(p.name)
-                if pending:
-                    kg.save()
-
-            _all_stats.append({
-                "stats": stats,
-                "embed_stats": _embed_stats,
-                "elapsed": _total_elapsed,
-                "md_path": md_path,
-            })
-
-            # Print per-file summary
-            graph_stats = kg.stats()
-            print(f"\nIngested: {md_path.name}")
-            print(f"  Document ID: {stats['doc_id']}")
-            print(f"  Sections: {stats['total_sections']}")
-            print(f"  Triples extracted: {stats['total_triples']}")
-            _n_added = stats['total_nodes_added']
-            _n_updated = stats['total_nodes_updated']
-            _e_added = stats['total_edges_added']
-            _e_updated = stats['total_edges_updated']
-            node_str = f"{_n_added} added"
-            if _n_updated:
-                node_str += f", {_n_updated} updated"
-            edge_str = f"{_e_added} added"
-            if _e_updated:
-                edge_str += f", {_e_updated} updated"
-            print(f"  Nodes: {node_str}")
-            print(f"  Edges: {edge_str}")
-            print(f"  Total time: {_total_elapsed:.1f}s")
-            print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
-            if _embed_stats and _embed_stats["nodes_embedded"]:
-                print(f"  Nodes embedded: {_embed_stats['nodes_embedded']} "
-                      f"(skipped {_embed_stats['nodes_skipped']})")
-            if stats.get("total_proposals_created"):
-                print(f"  New relation proposals: {stats['total_proposals_created']}")
-                if args.auto_accept:
-                    print(f"  Auto-accepted {stats['total_proposals_created']} proposal(s)")
-            if stats.get("source"):
-                src = stats["source"]
-                if src.get("is_duplicate"):
-                    print(f"  Warning: duplicate content (matches '{src['existing_doc_id']}')")
-                elif src.get("is_update"):
-                    print(f"  Source updated: v{src['version']} ({src['stored_path']})")
-                else:
-                    ver = src.get("version", 1)
-                    if ver > 1:
-                        print(f"  Source unchanged: v{ver} ({src['stored_path']})")
-                    else:
-                        print(f"  Source stored: v{ver} ({src['stored_path']})")
-
-            # Show section breakdown (verbose only)
-            if _verbose:
-                print("\n  Section details:")
-                for sec_stat in stats.get("sections", []):
-                    heading = sec_stat.get("heading", "?")
-                    elapsed = sec_stat.get("elapsed_seconds", "")
-                    elapsed_str = f", {elapsed}s" if elapsed else ""
-                    if sec_stat.get("skipped"):
-                        print(f"    [skip] {heading} ({sec_stat.get('reason', '')})")
-                    else:
-                        triples_info = ""
-                        n_triples = sec_stat.get("triples_processed", 0)
-                        n_nodes = sec_stat.get("nodes_added", 0)
-                        n_nodes_upd = sec_stat.get("nodes_updated", 0)
-                        n_edges = sec_stat.get("edges_added", 0)
-                        n_edges_upd = sec_stat.get("edges_updated", 0)
-                        n_errors = len(sec_stat.get("errors", []))
-                        if n_triples:
-                            triples_info = f", {n_triples} triples"
-                        if n_nodes:
-                            triples_info += f", {n_nodes} new nodes"
-                        if n_nodes_upd:
-                            triples_info += f", {n_nodes_upd} updated nodes"
-                        if n_edges:
-                            triples_info += f", {n_edges} new edges"
-                        if n_edges_upd:
-                            triples_info += f", {n_edges_upd} updated edges"
-                        if n_triples and n_nodes == 0 and n_nodes_upd == 0 and n_errors:
-                            tag = "WARN"
-                            triples_info += f", {n_errors} errors"
-                        else:
-                            tag = "ok"
-                        print(f"    [{tag}]   {heading} ({sec_stat.get('char_count', 0):,} chars{triples_info}{elapsed_str})")
-
-            if stats["errors"]:
-                print(f"\n  Errors ({len(stats['errors'])}):")
-                for err in stats["errors"]:
-                    print(f"    - {err}")
-
-        # Batch summary for multi-file ingestion
-        if len(_all_stats) > 1:
-            _batch_elapsed = time.monotonic() - _batch_t0
-            total_triples = sum(s["stats"]["total_triples"] for s in _all_stats)
-            total_nodes_added = sum(s["stats"]["total_nodes_added"] for s in _all_stats)
-            total_nodes_updated = sum(s["stats"]["total_nodes_updated"] for s in _all_stats)
-            total_edges_added = sum(s["stats"]["total_edges_added"] for s in _all_stats)
-            total_edges_updated = sum(s["stats"]["total_edges_updated"] for s in _all_stats)
-            graph_stats = kg.stats()
-            print(f"\n{'='*60}")
-            print(f"  Batch complete: {len(_all_stats)} files ingested")
-            print(f"  Total triples: {total_triples}")
-            _bn = f"{total_nodes_added} added"
-            if total_nodes_updated:
-                _bn += f", {total_nodes_updated} updated"
-            _be = f"{total_edges_added} added"
-            if total_edges_updated:
-                _be += f", {total_edges_updated} updated"
-            print(f"  Total nodes: {_bn}"  )
-            print(f"  Total edges: {_be}")
-            print(f"  Graph totals: {graph_stats['num_nodes']} nodes, {graph_stats['num_edges']} edges")
-            print(f"  Total time: {_batch_elapsed:.1f}s")
-            print(f"{'='*60}")
-
-        if _all_stats:
-            print(f"\n  Graph saved to {kg.graph_path}")
-
-            # Auto-export visualizations (once at the end)
-            if not args.no_viz:
-                graph_dir = kg.graph_path.parent
-                base_name = kg.graph_path.stem
-
-                cyto_path = graph_dir / f"{base_name}_cytoscape.html"
-                try:
-                    kg.export_cytoscape(cyto_path)
-                    print(f"  Cytoscape visualization: {cyto_path}")
-                except Exception as e:
-                    logger.error("Cytoscape export failed: %s", e)
-
-                try:
-                    pyvis_path = graph_dir / f"{base_name}_pyvis.html"
-                    kg.export_pyvis(pyvis_path)
-                    print(f"  Pyvis visualization: {pyvis_path}")
-                except Exception as e:
-                    logger.error("Pyvis export skipped: %s", e)
+            print(f"\nVersion history for '{args.doc_history}' "
+                  f"({len(history)} version(s)):\n")
+            for v in history:
+                current = " (current)" if v.get("is_current") else ""
+                print(f"  v{v['version']}{current}  {v.get('stored_at', '')[:10]}")
+                print(f"      hash: {v.get('content_hash', '')}  |  "
+                      f"{v.get('char_count', 0):,} chars  |  "
+                      f"{v.get('section_count', 0)} sections")
+                print(f"      nodes: {v.get('node_count', 0)}  |  "
+                      f"edges: {v.get('edge_count', 0)}")
+                if v.get("diff") and v["diff"].get("has_changes"):
+                    d = v["diff"]
+                    print(f"      diff: {d['summary']}")
+                    if d.get("added"):
+                        for s in d["added"]:
+                            print(f"        + {s}")
+                    if d.get("removed"):
+                        for s in d["removed"]:
+                            print(f"        - {s}")
+                    if d.get("modified"):
+                        for s in d["modified"]:
+                            print(f"        ~ {s}")
+                print()
 
     if args.sources:
         sources = kg.list_sources()
@@ -6889,67 +9608,156 @@ def main():
                         print(f"    {k}: {v}")
 
     if args.verify_embeddings:
-        emb_count = len(kg._embeddings)
-        if emb_count == 0:
-            print("No embeddings found.")
+        _cmd_verify_embeddings(kg)
+
+    if args.validate:
+        report = kg.validate()
+        if report.errors:
+            print(f"\n  ERRORS ({len(report.errors)}):")
+            for msg in report.errors:
+                print(f"    [ERROR] {msg}")
+        if report.warnings:
+            print(f"\n  WARNINGS ({len(report.warnings)}):")
+            for msg in report.warnings:
+                print(f"    [WARN]  {msg}")
+        if report.info:
+            print(f"\n  INFO ({len(report.info)}):")
+            for msg in report.info:
+                print(f"    [INFO]  {msg}")
+        if report.is_valid:
+            print(f"\n  Result: VALID ({report.total_issues} warning(s))")
         else:
-            model = kg.embed_model or "(unknown)"
-            dim = kg.embed_dim
-            missing = kg.nodes_without_embeddings()
-            # Check for issues
-            zero_vectors = []
-            dim_mismatches = []
-            first_dim = None
-            for nid, vec in kg._embeddings.items():
-                if first_dim is None:
-                    first_dim = len(vec)
-                if all(v == 0.0 for v in vec):
-                    zero_vectors.append(nid)
-                if len(vec) != first_dim:
-                    dim_mismatches.append((nid, len(vec)))
+            print(f"\n  Result: INVALID ({len(report.errors)} error(s), "
+                  f"{len(report.warnings)} warning(s))")
 
-            print(f"  Embeddings: {emb_count}")
-            print(f"  Model: {model}")
-            print(f"  Dimension: {dim or first_dim}")
-            print(f"  Nodes without embeddings: {len(missing)}")
-            if missing and len(missing) <= 10:
-                for nid in missing:
-                    print(f"    - {nid}")
-            elif missing:
-                for nid in missing[:5]:
-                    print(f"    - {nid}")
-                print(f"    ... and {len(missing) - 5} more")
+    if args.analytics:
+        a = kg.analytics()
+        print(f"\n  Quality Score: {a['quality_score']}/100")
 
-            if zero_vectors:
-                print(f"  WARNING: {len(zero_vectors)} zero vector(s) detected (embedding may have failed):")
-                for nid in zero_vectors[:5]:
-                    print(f"    - {nid}")
-                if len(zero_vectors) > 5:
-                    print(f"    ... and {len(zero_vectors) - 5} more")
+        cd = a["confidence_distribution"]
+        print(f"\n  Confidence Distribution (nodes mean={cd['node_mean']:.2f}, "
+              f"edges mean={cd['edge_mean']:.2f}):")
+        print(f"    {'Bucket':<10} {'Nodes':>6} {'Edges':>6}")
+        for label, nc, ec in zip(cd["buckets"], cd["node_counts"], cd["edge_counts"]):
+            bar_n = "#" * min(nc, 40)
+            print(f"    {label:<10} {nc:>6} {ec:>6}  {bar_n}")
 
-            if dim_mismatches:
-                print(f"  WARNING: {len(dim_mismatches)} dimension mismatch(es):")
-                for nid, d in dim_mismatches[:5]:
-                    print(f"    - {nid}: {d} (expected {first_dim})")
+        print(f"\n  Hub Nodes (top {len(a['hub_nodes'])}):")
+        for h in a["hub_nodes"]:
+            print(f"    {h['label']:<30} type={h['type']:<12} "
+                  f"degree={h['degree']} (in={h['in_degree']}, out={h['out_degree']})")
 
-            if not zero_vectors and not dim_mismatches:
-                # Show a sample embedding to confirm non-trivial values
-                sample_nid = next(iter(kg._embeddings))
-                sample_vec = kg._embeddings[sample_nid]
-                preview = ", ".join(f"{v:.4f}" for v in sample_vec[:5])
-                print(f"  Sample ({sample_nid}): [{preview}, ...] (len={len(sample_vec)})")
-                print("  OK — all embeddings look valid.")
+        print(f"\n  Relation Types ({len(a['relation_stats'])}):")
+        for rel, rs in a["relation_stats"].items():
+            print(f"    {rel:<25} count={rs['count']:>4}  "
+                  f"conf={rs['mean_confidence']:.2f} "
+                  f"[{rs['min_confidence']:.2f}-{rs['max_confidence']:.2f}]")
+
+        ec = a["embedding_coverage"]
+        print(f"\n  Embedding Coverage: {ec['embedded']}/{ec['embeddable']} ({ec['pct']:.1f}%)")
+
+        print(f"\n  Components: {len(a['component_sizes'])} "
+              f"(sizes: {a['component_sizes'][:10]}{'...' if len(a['component_sizes']) > 10 else ''})")
+
+        if a["orphan_nodes"]:
+            print(f"\n  Orphan Nodes ({len(a['orphan_nodes'])}):")
+            for o in a["orphan_nodes"][:10]:
+                print(f"    {o['node_id']:<30} type={o['type']}")
+            if len(a["orphan_nodes"]) > 10:
+                print(f"    ... and {len(a['orphan_nodes']) - 10} more")
+
+    if args.diff:
+        other_path = Path(args.diff)
+        if not other_path.exists():
+            print(f"Error: '{args.diff}' not found.")
+        else:
+            diff = kg.diff_from_file(other_path)
+            if not diff.has_changes:
+                print("\n  No changes between the two graphs.")
+            else:
+                print(f"\n  Graph Diff: {kg.graph_path} vs {other_path}")
+                print(f"  Summary: {diff.summary}\n")
+                if diff.nodes_added:
+                    print(f"  Nodes Added ({len(diff.nodes_added)}):")
+                    for n in diff.nodes_added[:20]:
+                        print(f"    + {n.get('node_id', '?')}: "
+                              f"{n.get('label', '')} ({n.get('type', '?')})")
+                    if len(diff.nodes_added) > 20:
+                        print(f"    ... and {len(diff.nodes_added) - 20} more")
+                if diff.nodes_removed:
+                    print(f"  Nodes Removed ({len(diff.nodes_removed)}):")
+                    for n in diff.nodes_removed[:20]:
+                        print(f"    - {n.get('node_id', '?')}: "
+                              f"{n.get('label', '')} ({n.get('type', '?')})")
+                    if len(diff.nodes_removed) > 20:
+                        print(f"    ... and {len(diff.nodes_removed) - 20} more")
+                if diff.nodes_modified:
+                    print(f"  Nodes Modified ({len(diff.nodes_modified)}):")
+                    for n in diff.nodes_modified[:20]:
+                        fields = ", ".join(n.get("changes", {}).keys())
+                        print(f"    ~ {n.get('node_id', '?')}: {fields}")
+                    if len(diff.nodes_modified) > 20:
+                        print(f"    ... and {len(diff.nodes_modified) - 20} more")
+                if diff.edges_added:
+                    print(f"  Edges Added ({len(diff.edges_added)}):")
+                    for e in diff.edges_added[:20]:
+                        print(f"    + {e.get('source', '?')} "
+                              f"-[{e.get('relation', '?')}]-> {e.get('target', '?')}")
+                    if len(diff.edges_added) > 20:
+                        print(f"    ... and {len(diff.edges_added) - 20} more")
+                if diff.edges_removed:
+                    print(f"  Edges Removed ({len(diff.edges_removed)}):")
+                    for e in diff.edges_removed[:20]:
+                        print(f"    - {e.get('source', '?')} "
+                              f"-[{e.get('relation', '?')}]-> {e.get('target', '?')}")
+                    if len(diff.edges_removed) > 20:
+                        print(f"    ... and {len(diff.edges_removed) - 20} more")
+                if diff.edges_modified:
+                    print(f"  Edges Modified ({len(diff.edges_modified)}):")
+                    for e in diff.edges_modified[:20]:
+                        fields = ", ".join(e.get("changes", {}).keys())
+                        print(f"    ~ {e.get('source', '?')} "
+                              f"-[{e.get('relation', '?')}]-> {e.get('target', '?')}: {fields}")
+                    if len(diff.edges_modified) > 20:
+                        print(f"    ... and {len(diff.edges_modified) - 20} more")
+                if diff.proposals_added:
+                    print(f"  Proposals Added ({len(diff.proposals_added)}):")
+                    for p in diff.proposals_added:
+                        print(f"    + {p.get('name', '?')} "
+                              f"(confidence: {p.get('confidence', '?')})")
+                if diff.proposals_changed:
+                    print(f"  Proposals Changed ({len(diff.proposals_changed)}):")
+                    for p in diff.proposals_changed:
+                        print(f"    ~ {p.get('name', '?')}: "
+                              f"{p.get('old_status', '?')} -> {p.get('new_status', '?')}")
+
+    if args.query:
+        paths = kg.graph_query(args.query)
+        if not paths:
+            print("No matching paths found.")
+        else:
+            print(f"\n  {len(paths)} matching path(s):\n")
+            for i, path in enumerate(paths, 1):
+                parts: list[str] = []
+                for item in path:
+                    if "node_id" in item:
+                        parts.append(f"({item['label']})")
+                    elif "relation" in item:
+                        parts.append(f"-[{item['relation']}]->")
+                print(f"  {i}. {' '.join(parts)}")
 
     if not any([args.stats, args.node, args.neighbors, args.split,
                 args.proposals, args.accept, args.accept_all, args.reject,
                 args.patterns, args.pyvis, args.cytoscape,
                 args.preview_md, args.ingest_md,
-                args.sources, args.check_sources, args.verify_embeddings]):
+                args.doc_history,
+                args.sources, args.check_sources, args.verify_embeddings,
+                args.validate, args.analytics, args.diff, args.query]):
         print(kg)
         print(f"\nUse --stats, --node, --neighbors, --split, --proposals, "
               f"--accept, --accept-all, --reject, --patterns, --pyvis, --cytoscape, "
-              f"--preview-md, --ingest-md, --sources, --check-sources, "
-              f"--verify-embeddings for details.")
+              f"--preview-md, --ingest-md, --doc-history, --sources, --check-sources, "
+              f"--verify-embeddings, --validate, --analytics, --diff, --query for details.")
 
 
 if __name__ == "__main__":

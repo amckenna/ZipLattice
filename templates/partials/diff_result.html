@@ -1,0 +1,217 @@
+{% if error %}
+<div class="border border-red-900 bg-red-950 p-4 text-sm mt-4">
+  <span class="text-red-400 font-bold">Diff Error:</span> {{ error }}
+</div>
+{% endif %}
+
+<!-- Graph selector form -->
+<div class="border border-gray-800 p-4 mt-4 space-y-3">
+  <h3 class="text-sm font-bold">Compare Against</h3>
+  <form class="flex items-center gap-3">
+    <input type="hidden" name="dummy" value="">
+    <select name="against" class="bg-black border border-gray-700 px-3 py-1.5 text-sm">
+      <option value="">Select a graph...</option>
+      {% for g in available_graphs %}
+      <option value="{{ g }}" {% if against_name is defined and against_name == g %}selected{% endif %}>{{ g }}</option>
+      {% endfor %}
+    </select>
+    <a id="diff-go-btn" href="#" onclick="var s=this.closest('form').querySelector('select');if(s.value)window.location='/graphs/{{ graph_name }}/diff?against='+s.value;return false;"
+       class="inline-block border border-white px-4 py-1.5 text-sm hover:bg-white hover:text-black transition-colors">
+      Compare
+    </a>
+  </form>
+</div>
+
+{% if diff %}
+<div class="border border-gray-800 p-4 mt-4 space-y-4">
+  <div class="flex items-center justify-between">
+    <h3 class="text-sm font-bold">
+      Diff: <span class="text-gray-400">{{ graph_name }}</span>
+      <span class="text-gray-600 mx-1">vs</span>
+      <span class="text-gray-400">{{ against_name }}</span>
+    </h3>
+    {% if not diff.has_changes %}
+    <span class="text-xs text-gray-500">No changes</span>
+    {% endif %}
+  </div>
+
+  {% if diff.has_changes %}
+  <!-- Summary badges -->
+  <div class="flex flex-wrap gap-2 text-xs">
+    {% if diff.counts.nodes_added %}<span class="px-2 py-0.5 bg-green-950 text-green-400 border border-green-900">+{{ diff.counts.nodes_added }} nodes</span>{% endif %}
+    {% if diff.counts.nodes_removed %}<span class="px-2 py-0.5 bg-red-950 text-red-400 border border-red-900">-{{ diff.counts.nodes_removed }} nodes</span>{% endif %}
+    {% if diff.counts.nodes_modified %}<span class="px-2 py-0.5 bg-yellow-950 text-yellow-400 border border-yellow-900">~{{ diff.counts.nodes_modified }} nodes</span>{% endif %}
+    {% if diff.counts.edges_added %}<span class="px-2 py-0.5 bg-green-950 text-green-400 border border-green-900">+{{ diff.counts.edges_added }} edges</span>{% endif %}
+    {% if diff.counts.edges_removed %}<span class="px-2 py-0.5 bg-red-950 text-red-400 border border-red-900">-{{ diff.counts.edges_removed }} edges</span>{% endif %}
+    {% if diff.counts.edges_modified %}<span class="px-2 py-0.5 bg-yellow-950 text-yellow-400 border border-yellow-900">~{{ diff.counts.edges_modified }} edges</span>{% endif %}
+    {% if diff.counts.proposals_added %}<span class="px-2 py-0.5 bg-blue-950 text-blue-400 border border-blue-900">+{{ diff.counts.proposals_added }} proposals</span>{% endif %}
+    {% if diff.counts.proposals_changed %}<span class="px-2 py-0.5 bg-yellow-950 text-yellow-400 border border-yellow-900">~{{ diff.counts.proposals_changed }} proposals</span>{% endif %}
+  </div>
+
+  <!-- Nodes Added -->
+  {% if diff.nodes_added %}
+  <details>
+    <summary class="cursor-pointer text-sm text-green-400 hover:text-green-300">
+      Nodes Added ({{ diff.counts.nodes_added }})
+    </summary>
+    <table class="w-full text-xs mt-2">
+      <thead><tr class="border-b border-gray-800 text-gray-500 text-left"><th class="pb-1 font-normal">ID</th><th class="pb-1 font-normal">Label</th><th class="pb-1 font-normal">Type</th><th class="pb-1 font-normal text-right">Confidence</th></tr></thead>
+      <tbody>
+        {% for n in diff.nodes_added[:50] %}
+        <tr class="border-b border-gray-900">
+          <td class="py-0.5 text-green-400">{{ n.node_id }}</td>
+          <td class="py-0.5">{{ n.get("label", "") }}</td>
+          <td class="py-0.5 text-gray-400">{{ n.get("type", "") }}</td>
+          <td class="py-0.5 text-right text-gray-400">{{ "%.2f"|format(n.get("confidence", 0)) }}</td>
+        </tr>
+        {% endfor %}
+        {% if diff.nodes_added|length > 50 %}
+        <tr><td colspan="4" class="py-1 text-gray-500 text-xs">... and {{ diff.nodes_added|length - 50 }} more</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+
+  <!-- Nodes Removed -->
+  {% if diff.nodes_removed %}
+  <details>
+    <summary class="cursor-pointer text-sm text-red-400 hover:text-red-300">
+      Nodes Removed ({{ diff.counts.nodes_removed }})
+    </summary>
+    <table class="w-full text-xs mt-2">
+      <thead><tr class="border-b border-gray-800 text-gray-500 text-left"><th class="pb-1 font-normal">ID</th><th class="pb-1 font-normal">Label</th><th class="pb-1 font-normal">Type</th></tr></thead>
+      <tbody>
+        {% for n in diff.nodes_removed[:50] %}
+        <tr class="border-b border-gray-900">
+          <td class="py-0.5 text-red-400">{{ n.node_id }}</td>
+          <td class="py-0.5">{{ n.get("label", "") }}</td>
+          <td class="py-0.5 text-gray-400">{{ n.get("type", "") }}</td>
+        </tr>
+        {% endfor %}
+        {% if diff.nodes_removed|length > 50 %}
+        <tr><td colspan="3" class="py-1 text-gray-500 text-xs">... and {{ diff.nodes_removed|length - 50 }} more</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+
+  <!-- Nodes Modified -->
+  {% if diff.nodes_modified %}
+  <details>
+    <summary class="cursor-pointer text-sm text-yellow-400 hover:text-yellow-300">
+      Nodes Modified ({{ diff.counts.nodes_modified }})
+    </summary>
+    <table class="w-full text-xs mt-2">
+      <thead><tr class="border-b border-gray-800 text-gray-500 text-left"><th class="pb-1 font-normal">ID</th><th class="pb-1 font-normal">Label</th><th class="pb-1 font-normal">Changed Fields</th></tr></thead>
+      <tbody>
+        {% for n in diff.nodes_modified[:50] %}
+        <tr class="border-b border-gray-900">
+          <td class="py-0.5 text-yellow-400">{{ n.node_id }}</td>
+          <td class="py-0.5">{{ n.get("label", "") }}</td>
+          <td class="py-0.5 text-gray-400">{{ n.get("changes", {}).keys()|join(", ") }}</td>
+        </tr>
+        {% endfor %}
+        {% if diff.nodes_modified|length > 50 %}
+        <tr><td colspan="3" class="py-1 text-gray-500 text-xs">... and {{ diff.nodes_modified|length - 50 }} more</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+
+  <!-- Edges Added -->
+  {% if diff.edges_added %}
+  <details>
+    <summary class="cursor-pointer text-sm text-green-400 hover:text-green-300">
+      Edges Added ({{ diff.counts.edges_added }})
+    </summary>
+    <table class="w-full text-xs mt-2">
+      <thead><tr class="border-b border-gray-800 text-gray-500 text-left"><th class="pb-1 font-normal">Source</th><th class="pb-1 font-normal">Relation</th><th class="pb-1 font-normal">Target</th><th class="pb-1 font-normal text-right">Confidence</th></tr></thead>
+      <tbody>
+        {% for e in diff.edges_added[:50] %}
+        <tr class="border-b border-gray-900">
+          <td class="py-0.5 text-green-400">{{ e.get("source", "") }}</td>
+          <td class="py-0.5 text-gray-400">{{ e.get("relation", "") }}</td>
+          <td class="py-0.5">{{ e.get("target", "") }}</td>
+          <td class="py-0.5 text-right text-gray-400">{{ "%.2f"|format(e.get("confidence", 0)) }}</td>
+        </tr>
+        {% endfor %}
+        {% if diff.edges_added|length > 50 %}
+        <tr><td colspan="4" class="py-1 text-gray-500 text-xs">... and {{ diff.edges_added|length - 50 }} more</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+
+  <!-- Edges Removed -->
+  {% if diff.edges_removed %}
+  <details>
+    <summary class="cursor-pointer text-sm text-red-400 hover:text-red-300">
+      Edges Removed ({{ diff.counts.edges_removed }})
+    </summary>
+    <table class="w-full text-xs mt-2">
+      <thead><tr class="border-b border-gray-800 text-gray-500 text-left"><th class="pb-1 font-normal">Source</th><th class="pb-1 font-normal">Relation</th><th class="pb-1 font-normal">Target</th></tr></thead>
+      <tbody>
+        {% for e in diff.edges_removed[:50] %}
+        <tr class="border-b border-gray-900">
+          <td class="py-0.5 text-red-400">{{ e.get("source", "") }}</td>
+          <td class="py-0.5 text-gray-400">{{ e.get("relation", "") }}</td>
+          <td class="py-0.5">{{ e.get("target", "") }}</td>
+        </tr>
+        {% endfor %}
+        {% if diff.edges_removed|length > 50 %}
+        <tr><td colspan="3" class="py-1 text-gray-500 text-xs">... and {{ diff.edges_removed|length - 50 }} more</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+
+  <!-- Edges Modified -->
+  {% if diff.edges_modified %}
+  <details>
+    <summary class="cursor-pointer text-sm text-yellow-400 hover:text-yellow-300">
+      Edges Modified ({{ diff.counts.edges_modified }})
+    </summary>
+    <table class="w-full text-xs mt-2">
+      <thead><tr class="border-b border-gray-800 text-gray-500 text-left"><th class="pb-1 font-normal">Source</th><th class="pb-1 font-normal">Relation</th><th class="pb-1 font-normal">Target</th><th class="pb-1 font-normal">Changed Fields</th></tr></thead>
+      <tbody>
+        {% for e in diff.edges_modified[:50] %}
+        <tr class="border-b border-gray-900">
+          <td class="py-0.5 text-yellow-400">{{ e.get("source", "") }}</td>
+          <td class="py-0.5 text-gray-400">{{ e.get("relation", "") }}</td>
+          <td class="py-0.5">{{ e.get("target", "") }}</td>
+          <td class="py-0.5 text-gray-400">{{ e.get("changes", {}).keys()|join(", ") }}</td>
+        </tr>
+        {% endfor %}
+        {% if diff.edges_modified|length > 50 %}
+        <tr><td colspan="4" class="py-1 text-gray-500 text-xs">... and {{ diff.edges_modified|length - 50 }} more</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+
+  <!-- Proposals -->
+  {% if diff.proposals_added or diff.proposals_changed %}
+  <details>
+    <summary class="cursor-pointer text-sm text-blue-400 hover:text-blue-300">
+      Proposal Changes ({{ diff.counts.proposals_added + diff.counts.proposals_changed }})
+    </summary>
+    <div class="mt-2 text-xs space-y-1">
+      {% for p in diff.proposals_added %}
+      <div class="text-green-400">+ {{ p.get("name", "?") }} (confidence: {{ "%.2f"|format(p.get("confidence", 0)) }})</div>
+      {% endfor %}
+      {% for p in diff.proposals_changed %}
+      <div class="text-yellow-400">~ {{ p.get("name", "?") }}: {{ p.get("old_status", "?") }} &rarr; {{ p.get("new_status", "?") }}</div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+
+  {% endif %}{# has_changes #}
+</div>
+{% endif %}{# diff #}

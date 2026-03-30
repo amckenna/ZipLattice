@@ -70,7 +70,7 @@ def _get_graph(graph_path: str) -> KnowledgeGraph:
         logger.info("Loading graph: %s", graph_path)
         try:
             _graph_cache[graph_path] = KnowledgeGraph(graph_path)
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.error("Failed to load graph '%s': %s", graph_path, exc)
             raise
     return _graph_cache[graph_path]
@@ -440,6 +440,37 @@ def graph_stats(graph_path: str) -> str:
 
 
 @mcp.tool()
+def graph_analytics(graph_path: str) -> str:
+    """Get comprehensive quality analytics for a knowledge graph.
+
+    Returns confidence distributions, relation/type stats, hub nodes,
+    orphan nodes, embedding coverage, component sizes, and a composite
+    quality score (0-100).
+
+    Args:
+        graph_path: Path to the knowledge graph JSON file.
+    """
+    kg = _get_graph(graph_path)
+    return _json(kg.analytics())
+
+
+@mcp.tool()
+def validate_graph(graph_path: str) -> str:
+    """Run consistency checks on the knowledge graph.
+
+    Detects dangling edges, taxonomic cycles, contradictory edge pairs,
+    orphan nodes, zero-confidence items, and missing embeddings.
+    Returns a structured report with errors, warnings, and info.
+
+    Args:
+        graph_path: Path to the knowledge graph JSON file.
+    """
+    kg = _get_graph(graph_path)
+    report = kg.validate()
+    return _json(report.to_dict())
+
+
+@mcp.tool()
 def save_graph(graph_path: str) -> str:
     """Explicitly save the knowledge graph to disk.
 
@@ -520,6 +551,80 @@ def reject_proposal(
     return _json({"rejected": rejected, "relation": name})
 
 
+@mcp.tool()
+def bulk_manage_proposals(
+    graph_path: str,
+    action: str,
+    names: list[str],
+    review_note: str = "",
+    auto_save: bool = True,
+) -> str:
+    """Accept or reject multiple proposals at once.
+
+    For merging, pass action="merge" and the first name in the list
+    will be the target that survives.
+
+    Args:
+        graph_path: Path to the knowledge graph JSON file.
+        action: One of "accept", "reject", or "merge".
+        names: List of proposal names to act on.
+        review_note: Optional review note (for accept/reject).
+        auto_save: Save after changes (default True).
+    """
+    kg = _get_graph(graph_path)
+    if action == "accept":
+        result = kg.bulk_accept_proposals(names, review_note=review_note)
+    elif action == "reject":
+        result = kg.bulk_reject_proposals(names, review_note=review_note)
+    elif action == "merge":
+        if len(names) < 2:
+            return _json({"error": "Need at least 2 proposals to merge"})
+        target = names[0]
+        merged = kg.merge_proposals(names, target_name=target)
+        if auto_save:
+            kg.save()
+        return _json({
+            "action": "merge",
+            "target": target,
+            "merged_names": names,
+            "examples": len(merged.examples),
+            "confidence": merged.confidence,
+        })
+    else:
+        return _json({"error": f"Unknown action: {action}"})
+    if auto_save and result:
+        kg.save()
+    return _json({"action": action, "processed": result, "count": len(result)})
+
+
+@mcp.tool()
+def auto_accept_proposals(
+    graph_path: str,
+    min_confidence: float = 0.7,
+    min_examples: int = 2,
+    max_accept: int = 0,
+    auto_save: bool = True,
+) -> str:
+    """Auto-accept proposals that meet confidence and example thresholds.
+
+    Args:
+        graph_path: Path to the knowledge graph JSON file.
+        min_confidence: Minimum confidence score (0-1).
+        min_examples: Minimum number of supporting examples.
+        max_accept: Safety cap on number to accept (0 = unlimited).
+        auto_save: Save after acceptance (default True).
+    """
+    kg = _get_graph(graph_path)
+    accepted = kg.accept_all_proposals(
+        min_confidence=min_confidence,
+        min_examples=min_examples,
+        max_accept=max_accept,
+    )
+    if auto_save and accepted:
+        kg.save()
+    return _json({"accepted": accepted, "count": len(accepted)})
+
+
 # =========================================================================
 # Embedding tools (still uses ollama backend)
 # =========================================================================
@@ -566,23 +671,29 @@ def semantic_search(
     top_k: int = 10,
     node_types: list[str] | None = None,
     expand_depth: int = 1,
+    search_mode: str = "semantic",
+    alpha: float = 0.7,
 ) -> str:
-    """Semantic search over the knowledge graph using embeddings.
+    """Search over the knowledge graph.
 
-    Requires pre-computed embeddings (see embed_nodes) and a running
-    embedding server for the query vector.
+    Supports three modes: ``semantic`` (embedding similarity, requires
+    pre-computed embeddings and a running embedding server), ``bm25``
+    (keyword search, no embeddings needed), and ``hybrid`` (blended).
 
     Args:
         graph_path: Path to the knowledge graph JSON file.
         query: Natural-language search query.
-        embed_model: Embedding model name.
+        embed_model: Embedding model name (for semantic/hybrid modes).
         api_url: Base URL of the embedding server.
         top_k: Number of results.
         node_types: Filter by node types.
         expand_depth: Neighborhood expansion depth.
+        search_mode: ``"semantic"``, ``"bm25"``, or ``"hybrid"``.
+        alpha: Hybrid blending weight (0 = pure BM25, 1 = pure semantic).
     """
     kg = _get_graph(graph_path)
-    logger.info("semantic_search: query=%r model=%s top_k=%d", query[:80], embed_model, top_k)
+    logger.info("semantic_search: query=%r mode=%s model=%s top_k=%d",
+                query[:80], search_mode, embed_model, top_k)
 
     def embed_fn(texts: list[str]) -> list[list[float]]:
         return ollama_embed(texts, model=embed_model, url=api_url)
@@ -590,9 +701,44 @@ def semantic_search(
     results = kg.search(
         query, embed_fn, top_k=top_k,
         node_types=node_types, expand_depth=expand_depth,
+        mode=search_mode, alpha=alpha,
     )
     logger.info("semantic_search: returned %d results", len(results))
     return _json(results)
+
+
+@mcp.tool()
+def pattern_query(
+    graph_path: str,
+    pattern: str,
+    limit: int = 50,
+) -> str:
+    """Execute a structural pattern query against the knowledge graph.
+
+    Finds paths matching a graph pattern using node type/label filters,
+    edge relation filters, and optional WHERE and DEPTH modifiers.
+
+    Syntax examples::
+
+        (type:technology) -[depends_on]-> (*)
+        (label:~"SAR*") -[*]-> (*) WHERE confidence > 0.7
+        (*) -[is_a]-> (id:"python") DEPTH 2
+        (*) -[depends_on|uses]-> (type:library)
+
+    Node filters: ``type:X``, ``label:X``, ``label:~"glob"``, ``id:X``, ``*``
+    Edge filters: ``[relation]``, ``[rel1|rel2]``, ``[*]``
+    Arrows: ``->`` (forward), ``<-`` (backward), ``--`` (any direction)
+
+    Args:
+        graph_path: Path to the knowledge graph JSON file.
+        pattern: Pattern query string.
+        limit: Maximum number of matching paths to return.
+    """
+    kg = _get_graph(graph_path)
+    logger.info("pattern_query: pattern=%r limit=%d", pattern[:80], limit)
+    paths = kg.graph_query(pattern, limit=limit)
+    logger.info("pattern_query: returned %d paths", len(paths))
+    return _json(paths)
 
 
 @mcp.tool()
@@ -624,6 +770,51 @@ def merge_graphs(
     # Cache the new graph
     _graph_cache[str(Path(output_path).resolve())] = merged
     return _json(merged.stats())
+
+
+@mcp.tool()
+def document_history(
+    graph_path: str,
+    doc_id: str,
+) -> str:
+    """Get version history for a document with section-level diffs.
+
+    Returns a timeline of all versions including section counts,
+    node/edge counts per ingestion, and diffs between consecutive
+    versions showing which sections were added, removed, or modified.
+
+    Args:
+        graph_path: Path to the graph JSON file.
+        doc_id: The document identifier (slug or original name).
+    """
+    logger.info("document_history: graph=%s doc=%s", graph_path, doc_id)
+    kg = _get_graph(graph_path)
+    history = kg.get_document_history(doc_id)
+    if not history:
+        return _json({"error": f"No history found for document '{doc_id}'"})
+    return _json(history)
+
+
+@mcp.tool()
+def diff_graphs(
+    graph_path: str,
+    other_graph_path: str,
+) -> str:
+    """Compare two knowledge graphs and return a structured diff.
+
+    Shows nodes added/removed/modified, edges added/removed/modified,
+    and proposal changes between the two graphs.  The first graph is
+    treated as the older state and the second as the newer state.
+
+    Args:
+        graph_path: Path to the base (older) graph JSON file.
+        other_graph_path: Path to the other (newer) graph JSON file.
+    """
+    logger.info("diff_graphs: %s vs %s", graph_path, other_graph_path)
+    kg = _get_graph(graph_path)
+    other = _get_graph(other_graph_path)
+    diff_result = kg.diff(other)
+    return _json(diff_result.to_dict())
 
 
 # =========================================================================

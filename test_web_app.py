@@ -326,11 +326,34 @@ def test_build_extract_fn_anthropic():
     assert callable(fn)
 
 
+def test_build_extract_fn_local_no_think():
+    """_build_extract_fn passes no_think to local provider partial."""
+    from web_app import _build_extract_fn
+    fn = _build_extract_fn("local", "test-model", "http://localhost:11434", no_think=True)
+    assert callable(fn)
+    assert fn.keywords.get("no_think") is True
+
+
+def test_build_extract_fn_local_no_think_default():
+    """_build_extract_fn defaults no_think to False."""
+    from web_app import _build_extract_fn
+    fn = _build_extract_fn("local", "test-model", "http://localhost:11434")
+    assert fn.keywords.get("no_think", False) is False
+
+
 def test_build_llm_fn_local():
     """_build_llm_fn returns a callable for local provider."""
     from web_app import _build_llm_fn
     fn = _build_llm_fn("local", "test-model", "http://localhost:11434")
     assert callable(fn)
+
+
+def test_build_llm_fn_local_no_think():
+    """_build_llm_fn passes no_think to local provider partial."""
+    from web_app import _build_llm_fn
+    fn = _build_llm_fn("local", "test-model", "http://localhost:11434", no_think=True)
+    assert callable(fn)
+    assert fn.keywords.get("no_think") is True
 
 
 def test_build_llm_fn_anthropic():
@@ -715,3 +738,273 @@ def test_download_markdown_zip_not_found():
     """GET /download-markdown-zip with invalid batch returns 404."""
     resp = client.get("/download-markdown-zip/nonexistent")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Documents page and transplant tests
+# ---------------------------------------------------------------------------
+
+
+def _create_graph_with_doc(name: str, doc_id: str, text: str) -> None:
+    """Create a graph with an ingested document and stored source."""
+    graph_dir = GRAPHS_DIR / name
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    kg = KnowledgeGraph(graph_dir / f"{name}.json")
+    kg.store_source(text, doc_id)
+    triples = [
+        {"source": "NodeA", "target": "NodeB", "relation": "related_to",
+         "confidence": 0.9, "context": text},
+    ]
+    kg.ingest_document(text, doc_id=doc_id, llm_extract_fn=lambda _: triples)
+    kg.save()
+
+
+def test_documents_page_empty():
+    """GET /documents with no graphs shows empty state."""
+    resp = client.get("/documents")
+    assert resp.status_code == 200
+    assert "Documents" in resp.text
+    assert "No documents found" in resp.text
+
+
+def test_documents_page_with_docs():
+    """GET /documents lists documents from all graphs."""
+    _create_graph_with_doc("graph-a", "doc-one", "Hello world document text.")
+    _create_graph_with_doc("graph-b", "doc-two", "Another document for testing.")
+    resp = client.get("/documents")
+    assert resp.status_code == 200
+    assert "doc-one" in resp.text
+    assert "doc-two" in resp.text
+    assert "graph-a" in resp.text
+    assert "graph-b" in resp.text
+
+
+def test_documents_page_search():
+    """GET /documents?q= filters documents by name."""
+    _create_graph_with_doc("graph-s", "alpha-doc", "Alpha document.")
+    _create_graph_with_doc("graph-s2", "beta-doc", "Beta document.")
+    resp = client.get("/documents?q=alpha")
+    assert resp.status_code == 200
+    assert "alpha-doc" in resp.text
+    assert "beta-doc" not in resp.text
+
+
+def test_extract_document_api():
+    """GET /graphs/{name}/documents/{doc_id}/extract returns JSON subgraph."""
+    _create_graph_with_doc("graph-ext", "ext-doc", "Extraction test.")
+    resp = client.get("/graphs/graph-ext/documents/ext-doc/extract")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["doc_id"] == "ext-doc"
+    assert "nodes" in data
+    assert "edges" in data
+    assert data["source_text"] is not None
+
+
+def test_extract_document_api_not_found():
+    """GET extract for missing doc returns 404."""
+    _create_graph("graph-noext")
+    resp = client.get("/graphs/graph-noext/documents/nonexistent/extract")
+    assert resp.status_code == 404
+
+
+def test_document_history_api():
+    """GET /graphs/{name}/documents/{doc_id}/history returns version timeline."""
+    _create_graph_with_doc("graph-hist", "hist-doc", "# Intro\n\nFirst version text.\n")
+    resp = client.get("/graphs/graph-hist/documents/hist-doc/history")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert isinstance(data, list)
+    assert len(data) >= 1
+    assert data[-1]["is_current"] is True
+    assert "section_count" in data[-1]
+    assert "node_count" in data[-1]
+
+
+def test_document_history_api_not_found():
+    """GET history for missing doc returns 404."""
+    _create_graph("graph-nohist")
+    resp = client.get("/graphs/graph-nohist/documents/nonexistent/history")
+    assert resp.status_code == 404
+
+
+def test_transplant_document():
+    """POST /transplant moves a document subgraph between graphs."""
+    _create_graph_with_doc("src-graph", "transplant-doc", "Transplant test content.")
+    _create_graph("dst-graph")
+    resp = client.post("/transplant", data={
+        "source_graph": "src-graph",
+        "doc_id": "transplant-doc",
+        "target_graph": "dst-graph",
+    })
+    assert resp.status_code == 200
+    assert "Transplanted" in resp.text
+    assert "transplant-doc" in resp.text
+
+    # Verify the doc now exists in the target graph
+    dst_kg = KnowledgeGraph(GRAPHS_DIR / "dst-graph" / "dst-graph.json")
+    assert dst_kg.has_source("transplant-doc")
+
+
+def test_transplant_same_graph():
+    """POST /transplant with same source and target returns error."""
+    _create_graph_with_doc("same-graph", "some-doc", "Content.")
+    resp = client.post("/transplant", data={
+        "source_graph": "same-graph",
+        "doc_id": "some-doc",
+        "target_graph": "same-graph",
+    })
+    assert resp.status_code == 200
+    assert "Error" in resp.text
+
+
+def test_transplant_missing_doc():
+    """POST /transplant with missing document returns error."""
+    _create_graph("src-empty")
+    _create_graph("dst-empty")
+    resp = client.post("/transplant", data={
+        "source_graph": "src-empty",
+        "doc_id": "nonexistent",
+        "target_graph": "dst-empty",
+    })
+    assert resp.status_code == 200
+    assert "Error" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Graph diff endpoints
+# ---------------------------------------------------------------------------
+
+
+def _create_graph_with_nodes(name: str, nodes: list[tuple[str, str]]) -> None:
+    """Create a graph with specific nodes for diff testing."""
+    graph_dir = GRAPHS_DIR / name
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    kg = KnowledgeGraph(graph_dir / f"{name}.json")
+    for nid, label in nodes:
+        kg.add_node(nid, label=label, type="concept")
+    kg.save()
+
+
+def test_diff_page_no_against():
+    """GET /graphs/{name}/diff without against shows form."""
+    _create_graph("diff-base")
+    resp = client.get("/graphs/diff-base/diff")
+    assert resp.status_code == 200
+    assert "Compare Against" in resp.text
+
+
+def test_diff_page_with_against():
+    """GET /graphs/{name}/diff?against={other} shows diff result."""
+    _create_graph_with_nodes("diff-a", [("x", "X"), ("y", "Y")])
+    _create_graph_with_nodes("diff-b", [("x", "X"), ("z", "Z")])
+    resp = client.get("/graphs/diff-a/diff?against=diff-b")
+    assert resp.status_code == 200
+    assert "Diff" in resp.text
+
+
+def test_diff_api_endpoint():
+    """GET /api/graphs/{name}/diff returns JSON diff."""
+    _create_graph_with_nodes("api-a", [("n1", "N1")])
+    _create_graph_with_nodes("api-b", [("n1", "N1"), ("n2", "N2")])
+    resp = client.get("/api/graphs/api-a/diff?against=api-b")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["has_changes"] is True
+    assert data["counts"]["nodes_added"] >= 1
+
+
+def test_diff_api_missing_graph():
+    """GET /api/graphs/{name}/diff with missing graph returns 404."""
+    _create_graph("exists-only")
+    resp = client.get("/api/graphs/exists-only/diff?against=nonexistent")
+    assert resp.status_code == 404
+
+
+def test_diff_page_missing_against_graph():
+    """GET /graphs/{name}/diff?against=nonexistent shows error."""
+    _create_graph("diff-ok")
+    resp = client.get("/graphs/diff-ok/diff?against=nonexistent")
+    assert resp.status_code == 200
+    assert "not found" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Proposals management (Item 9)
+# ---------------------------------------------------------------------------
+
+
+def _create_graph_with_proposals(name: str) -> None:
+    """Create a graph with some relation proposals."""
+    graph_dir = GRAPHS_DIR / name
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    kg = KnowledgeGraph(graph_dir / f"{name}.json")
+    kg.propose_relation("validates", justification="X validates Y",
+                        source_entity="a", target_entity="b")
+    kg.propose_relation("monitors", justification="A monitors B",
+                        source_entity="c", target_entity="d")
+    kg.propose_relation("validates", source_entity="e", target_entity="f")
+    kg.propose_relation("validates", source_entity="g", target_entity="h")
+    kg.save()
+
+
+def test_proposals_page():
+    """GET /graphs/{name}/proposals returns the proposals page."""
+    _create_graph_with_proposals("prop-test")
+    resp = client.get("/graphs/prop-test/proposals")
+    assert resp.status_code == 200
+    assert "validates" in resp.text
+    assert "monitors" in resp.text
+
+
+def test_proposals_page_not_found():
+    """GET /graphs/{name}/proposals returns 404 for nonexistent graph."""
+    resp = client.get("/graphs/nonexistent/proposals")
+    assert resp.status_code == 404
+
+
+def test_api_proposals():
+    """GET /api/graphs/{name}/proposals returns JSON."""
+    _create_graph_with_proposals("prop-api")
+    resp = client.get("/api/graphs/prop-api/proposals")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert isinstance(data, list)
+    names = [p["name"] for p in data]
+    assert "validates" in names
+    assert "monitors" in names
+
+
+def test_bulk_accept_proposals():
+    """POST /graphs/{name}/proposals/bulk with action=accept."""
+    _create_graph_with_proposals("prop-bulk-accept")
+    resp = client.post("/graphs/prop-bulk-accept/proposals/bulk", data={
+        "action": "accept",
+        "names": ["validates"],
+        "review_note": "test accept",
+    })
+    assert resp.status_code == 200
+    assert "Accept" in resp.text or "accepted" in resp.text.lower()
+
+
+def test_bulk_reject_proposals():
+    """POST /graphs/{name}/proposals/bulk with action=reject."""
+    _create_graph_with_proposals("prop-bulk-reject")
+    resp = client.post("/graphs/prop-bulk-reject/proposals/bulk", data={
+        "action": "reject",
+        "names": ["monitors"],
+        "review_note": "not useful",
+    })
+    assert resp.status_code == 200
+
+
+def test_auto_accept_proposals():
+    """POST /graphs/{name}/proposals/auto-accept."""
+    _create_graph_with_proposals("prop-auto")
+    resp = client.post("/graphs/prop-auto/proposals/auto-accept", data={
+        "min_confidence": "0.0",
+        "min_examples": "1",
+        "max_accept": "0",
+    })
+    assert resp.status_code == 200
+    assert "Auto-accepted" in resp.text or "auto-accept" in resp.text.lower()

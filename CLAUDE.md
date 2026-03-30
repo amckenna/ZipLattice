@@ -19,6 +19,8 @@ templates/               # Jinja2 HTML templates for the web frontend
   graph_detail.html      #   Graph detail — Cytoscape.js visualization
   upload.html            #   File upload form
   query.html             #   Query form (search, context, ask)
+  analytics.html         #   Quality analytics dashboard
+  documents.html         #   Cross-graph document browser & transplant
   partials/              #   HTMX partial response fragments
 test_knowledge_graph.py  # Tests for knowledge_graph.py
 test_query_graph.py      # Tests for query_graph.py
@@ -54,20 +56,39 @@ knowledge_graph/                  # dedicated graph directory
 - **Optional (for Bedrock provider):** `boto3`
 - Cytoscape.js is loaded from CDN in exported HTML files and does not need a local install
 
-## Key classes
+## Key classes and functions
 
-- `KnowledgeGraph` (line ~611) -- Primary class. Manages nodes, edges, embeddings, relation proposals, persistence, search, and visualization.
-- `CoreRelation` (line ~401) -- Enum of 25+ built-in relation types (taxonomic, dependency, associative, documentation, functional, contextual).
-- `RelationProposal` (line ~566) -- Dataclass tracking proposed new relation types with examples and confidence scores.
-- `ProposalStatus` (line ~559) -- Enum: PENDING, ACCEPTED, REJECTED.
-- `GraphEncoder` (line ~521) -- Custom JSON encoder for datetime, set, Enum, and Path objects.
-- `ollama_embed()` (module-level) -- Calls OpenAI-compatible `/v1/embeddings` endpoint. Works with Ollama, llama.cpp, vLLM, LocalAI, etc. Used during ingestion and by `query_graph.py` at query time.
-- `claude_chat()` (module-level) -- Calls the Anthropic Messages API for chat/query. Used when `--provider anthropic` is set.
-- `claude_extract()` (module-level) -- Calls the Anthropic Messages API for JSON entity/relation extraction during ingestion. Same three-tier JSON recovery as the local path.
-- `bedrock_chat()` (module-level) -- Calls the AWS Bedrock Converse API for chat/query. Used when `--provider bedrock` is set.
-- `bedrock_extract()` (module-level) -- Calls the AWS Bedrock Converse API for JSON entity/relation extraction. Same three-tier JSON recovery as the local path.
-- `bedrock_embed()` (module-level) -- Calls AWS Bedrock for embeddings. Supports Titan (`invoke_model`) and Cohere (batched) embedding models.
+- `KnowledgeGraph` -- Primary class. Manages nodes, edges, embeddings, relation proposals, persistence, search, and visualization.
+- `CoreRelation` -- Enum of 25+ built-in relation types (taxonomic, dependency, associative, documentation, functional, contextual).
+- `RelationProposal` -- Dataclass tracking proposed new relation types with examples and confidence scores.
+- `ProposalStatus` -- Enum: PENDING, ACCEPTED, REJECTED.
+- `GraphEncoder` -- Custom JSON encoder for datetime, set, Enum, and Path objects.
+- `ollama_embed()` -- Calls OpenAI-compatible `/v1/embeddings` endpoint. Works with Ollama, llama.cpp, vLLM, LocalAI, etc. Used during ingestion and by `query_graph.py` at query time.
+- `claude_chat()` -- Calls the Anthropic Messages API for chat/query. Used when `--provider anthropic` is set.
+- `claude_extract()` -- Calls the Anthropic Messages API for JSON entity/relation extraction during ingestion. Same three-tier JSON recovery as the local path. Accepts `temperature` (default 0.1) and `thinking_budget` (default 0, disabled) for extended thinking.
+- `bedrock_chat()` -- Calls the AWS Bedrock Converse API for chat/query. Used when `--provider bedrock` is set.
+- `bedrock_extract()` -- Calls the AWS Bedrock Converse API for JSON entity/relation extraction. Same three-tier JSON recovery as the local path.
+- `bedrock_embed()` -- Calls AWS Bedrock for embeddings. Supports Titan (`invoke_model`) and Cohere (batched) embedding models.
+- `read_http_error_detail()` -- Shared utility for safely extracting response body text from `urllib.error.HTTPError` exceptions.
 - `KnowledgeGraph.ingest_triples()` -- Public method that accepts pre-extracted triples directly (no LLM call). Enables the orchestrator-as-extractor pattern used by the MCP server.
+- `KnowledgeGraph.extract_document_subgraph()` -- Extracts a document and all its associated nodes, edges, source text, embeddings, and proposals into a portable dict. Used for transplanting documents between graphs.
+- `KnowledgeGraph.import_document_subgraph()` -- Imports a previously extracted document subgraph into this graph with smart-merge semantics (descriptions combined, confidence maximised, edges deduplicated). Records transplant provenance.
+- `KnowledgeGraph.validate()` -- Runs read-only consistency checks on the graph. Returns a `ValidationReport` with errors (dangling edges, taxonomic cycles, sync issues), warnings (contradictory edges, orphan nodes, zero-confidence items), and info (missing embeddings). Available via CLI (`--validate`), web API (`GET /graphs/{name}/validate`), and MCP tool (`validate_graph`).
+- `ValidationReport` -- Dataclass returned by `validate()` with `errors`, `warnings`, `info` lists and helper properties `is_valid` and `total_issues`.
+- `DocumentDiff` -- Dataclass returned by `diff_document_versions()` with `added`, `removed`, `modified`, `unchanged` section lists and `has_changes`/`summary` helpers.
+- `compute_section_hashes()` -- Module-level function that computes per-section SHA-256 hashes from a markdown document. Maps section heading to 12-char hash. Used during ingestion and stored in the source manifest for version comparison.
+- `KnowledgeGraph.diff_document_versions()` -- Compares two versions of a document at section level using stored `section_hashes`. Returns a `DocumentDiff` identifying added/removed/modified/unchanged sections.
+- `KnowledgeGraph.get_document_history()` -- Returns a rich version timeline for a document: version metadata, section counts, node/edge counts per ingestion, and diffs between consecutive versions. Available via CLI (`--doc-history`), web API (`GET /graphs/{name}/documents/{doc_id}/history`), and MCP tool (`document_history`).
+- `KnowledgeGraph.analytics()` -- Computes comprehensive quality analytics: confidence distributions (10-bucket histograms for nodes/edges), per-relation and per-type stats, hub nodes (top-10 by degree), orphan nodes, source document coverage, embedding coverage, component sizes, and a composite quality score (0-100). Available via CLI (`--analytics`), web page (`GET /graphs/{name}/analytics`), JSON API (`GET /api/graphs/{name}/analytics`), and MCP tool (`graph_analytics`).
+- `KnowledgeGraph._build_bm25_index()` -- Builds an in-memory BM25 inverted index from node labels, descriptions, body text, and properties. Uses standard BM25 parameters (k1=1.2, b=0.75). Lazily built, auto-invalidated when graph is dirty.
+- `KnowledgeGraph.bm25_search()` -- Pure Python BM25 keyword search over node text. Tokenises query (lowercase, stopword removal), scores against inverted index, returns ranked `(node_id, score)` tuples.
+- `KnowledgeGraph.hybrid_search()` -- Blends BM25 and semantic similarity with configurable alpha weight (0=pure BM25, 1=pure semantic, default 0.7). Normalises both score sets to [0,1] before combining.
+- `KnowledgeGraph.search()` -- Now accepts `mode` parameter: `"semantic"` (default, embedding similarity), `"bm25"` (keyword), or `"hybrid"` (blended). Also accepts `alpha` for hybrid blending weight. Available via CLI (`--search-mode`), web UI (search mode radio buttons), and MCP tool (`semantic_search` with `search_mode` parameter).
+- `GraphDiff` -- Dataclass returned by `diff()` with `nodes_added`, `nodes_removed`, `nodes_modified`, `edges_added`, `edges_removed`, `edges_modified`, `proposals_added`, `proposals_changed` lists and `has_changes`/`summary`/`to_dict()` helpers. Includes `counts` dict in serialized form.
+- `KnowledgeGraph.snapshot()` -- Deep-copies the current graph state (data + proposals) for later comparison via `diff_from_snapshot()`.
+- `KnowledgeGraph.diff(other)` -- Compares this graph (older) against another graph (newer) and returns a `GraphDiff` with field-level node/edge changes and proposal tracking.
+- `KnowledgeGraph.diff_from_snapshot(snap)` -- Compares a previously captured snapshot against the current state. Used internally by `ingest_markdown()` to attach a diff summary to aggregate stats.
+- `KnowledgeGraph.diff_from_file(path)` -- Loads a graph from a file and diffs it against the current state. Available via CLI (`--diff`), web API (`GET /graphs/{name}/diff?against={other}` and `GET /api/graphs/{name}/diff?against={other}`), and MCP tool (`diff_graphs`).
 
 ## How to run
 
@@ -84,10 +105,22 @@ python knowledge_graph.py <path-to-graph.json> --node <id>
 python knowledge_graph.py <path-to-graph.json> --neighbors <id> --depth 2
 python knowledge_graph.py <path-to-graph.json> --pyvis output.html
 python knowledge_graph.py <path-to-graph.json> --cytoscape output.html
+python knowledge_graph.py <path-to-graph.json> --validate
+python knowledge_graph.py <path-to-graph.json> --diff <other-graph.json>
+python knowledge_graph.py <path-to-graph.json> --analytics
+python knowledge_graph.py <path-to-graph.json> --doc-history <doc-id>
 python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
 python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b --embed-model qwen3-embedding
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --api-url http://exo:11434
+# Parallel ingestion: 4 concurrent LLM extraction threads, serial graph writes
+python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b -j 4
+# Incremental ingestion: only re-extract sections that changed since last ingestion
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --incremental
+# Custom temperature (0=deterministic, higher=more diverse)
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --temperature 0.0
+# Claude with extended thinking (forces temperature=1)
+python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-sonnet-4-6 --thinking-budget 10000
 
 # Ingest with Claude API (Haiku for fast extraction, local embeddings)
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-haiku-4-5 --embed-model qwen3-embedding
@@ -101,7 +134,10 @@ python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider bed
 
 # Query graph CLI
 python query_graph.py <path-to-graph.json> search "synthetic aperture radar"
+python query_graph.py <path-to-graph.json> search "radar detection" --search-mode bm25
+python query_graph.py <path-to-graph.json> search "radar detection" --search-mode hybrid --alpha 0.5
 python query_graph.py <path-to-graph.json> context "how does SAR work?"
+python query_graph.py <path-to-graph.json> context "how does SAR work?" --search-mode hybrid
 python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-model qwen3-coder:30b
 python query_graph.py <path-to-graph.json> ask "how does SAR work?" --query-model qwen3-coder:30b --api-url http://exo:11434
 
@@ -121,6 +157,12 @@ python benchmark_models.py docs/*.md --models modelA modelB --api-url http://exo
 python benchmark_models.py doc.md --models modelA modelB --json
 python benchmark_models.py doc.md --models modelA modelB --max-sections 5  # quick test
 python benchmark_models.py doc.md --models claude-haiku-4-5 claude-sonnet-4-6 --provider anthropic
+# Benchmark with custom temperature
+python benchmark_models.py doc.md --models qwen3-coder:30b --temperature 0.0
+# Benchmark with Claude extended thinking
+python benchmark_models.py doc.md --models claude-sonnet-4-6 --provider anthropic --thinking-budget 10000
+# Benchmark with Bedrock
+python benchmark_models.py doc.md --models us.anthropic.claude-haiku-4-5-20251001-v1:0 --provider bedrock
 
 # Document converter CLI
 python convert_to_markdown.py document.pdf -o document.md
@@ -177,6 +219,9 @@ python -c "from query_graph import search_nodes, build_context, ask"
 - **LLM provider abstraction:** Chat/extraction functions accept callables (`llm_fn`, `llm_extract_fn`), making the core logic provider-agnostic. The `--provider` flag selects between `local` (OpenAI-compatible servers), `anthropic` (Claude API via `ANTHROPIC_API_KEY` env var), and `bedrock` (AWS Bedrock via `boto3` and standard AWS credentials). The Bedrock provider uses the Converse API for chat/extraction and `invoke_model` for embeddings (Titan and Cohere models). By default, embeddings use a local server unless `--embed-model` is explicitly set with the `bedrock` provider.
 - **MCP server / orchestrator-as-extractor:** `mcp_server.py` exposes graph operations as MCP tools via FastMCP. The key insight is that the calling orchestrator (e.g. Claude Code) *is* an LLM, so it can perform entity extraction itself using `build_extraction_prompt` and pass structured triples to `ingest_triples`, eliminating the need for a second LLM backend. The `ingest_triples()` method on `KnowledgeGraph` is the public API for this pattern — it accepts pre-extracted triples and handles all validation, node/edge creation, and proposal management.
 - **Pre-computed graph layout:** Cytoscape.js visualizations use server-side layout pre-computation via `nx.spring_layout()` (Fruchterman-Reingold). Node x/y positions are embedded in the Cytoscape element JSON and rendered with the `preset` layout, which is instant (no client-side force simulation). The `_compute_layout_positions()` static method handles this for both `cytoscape_elements()` (web frontend) and `export_cytoscape()` (standalone HTML export). Users can still switch to other layout algorithms (cose, circle, breadthfirst, grid, concentric) interactively.
+- **Parallel extraction:** `ingest_markdown()` supports a `parallel_extractions` parameter (CLI: `-j N`, web UI: "Parallel Extraction Threads" field). When > 1, LLM extraction calls run concurrently in a `ThreadPoolExecutor` while graph writes (`ingest_triples`, `add_node`, `add_edge`) remain serial on the main thread. Phase 1 creates all structural nodes/edges (fast, serial), Phase 2 dispatches LLM calls in parallel and applies results serially as they complete. This is safe because `build_extraction_prompt()` only reads graph state and `llm_extract_fn` is a pure network call with no graph mutations.
+- **Incremental ingestion:** `ingest_markdown()` supports an `incremental` parameter (CLI: `--incremental`, web UI: "Incremental" checkbox). When enabled and the document has a previous version with section hashes, `diff_document_versions()` identifies which sections are unchanged. Unchanged sections skip LLM extraction entirely — structural nodes and edges are still created/updated (cheap), but the expensive LLM extraction call is avoided. This dramatically reduces LLM costs when re-ingesting documents where only a few sections changed. The aggregate stats include a `sections_skipped_incremental` counter. Requires `preserve_source=True` so that section hashes from the previous version are available for comparison.
+- **Document subgraph transplant:** `extract_document_subgraph()` extracts a document and all its associated nodes, edges, source text, embeddings, and relation proposals into a portable dict. `import_document_subgraph()` imports that dict into another graph with smart-merge semantics (same as merge). Transplant provenance is recorded in the source manifest as `transplanted_from` entries. The web UI at `/documents` provides a cross-graph document browser showing which graphs each document belongs to (primary vs transplanted) with node/edge counts, search, and one-click transplant.
 
 ## Common patterns when modifying this code
 

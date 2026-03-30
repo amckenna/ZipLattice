@@ -41,7 +41,7 @@ def _markdownify(html: str, **kwargs) -> str:
         )
 
     class _Converter(MarkdownConverter):
-        def convert_img(self, el, text, *args, **kwargs):
+        def convert_img(self, el, text, *args, **kwargs) -> str:
             src = el.get("src", "")
             if src.startswith("data:"):
                 return ""
