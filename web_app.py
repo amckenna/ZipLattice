@@ -402,11 +402,14 @@ def _format_ingest_event(
                 lines.append(f"    warning: {err}")
         return "\n".join(lines)
     if evt == "doc_done":
+        elapsed = ev.get("elapsed_seconds", 0)
+        extraction = ev.get("extraction_seconds", 0)
+        timing = f" ({elapsed}s total, {extraction}s extraction)" if elapsed else ""
         if verbose:
             return (f"  Document complete: {ev.get('total_triples', 0)} triples, "
                     f"{ev.get('total_nodes_added', 0)} nodes, "
-                    f"{ev.get('total_edges_added', 0)} edges")
-        return None
+                    f"{ev.get('total_edges_added', 0)} edges{timing}")
+        return f"  Document complete{timing}" if elapsed else None
     if evt == "section_skip":
         return (f"  section {idx}/{total}: {heading} "
                 f"(skipped: {ev.get('reason', '')})")

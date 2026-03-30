@@ -5619,9 +5619,16 @@ TEXT:
             Aggregate stats dict with per-section breakdown.
             Includes a ``"diff"`` key with a :class:`GraphDiff` dict
             summarising changes made during this ingestion.
+            Timing metrics: ``"elapsed_seconds"`` (wall-clock time for
+            the entire ingestion) and ``"extraction_seconds"``
+            (cumulative time spent on LLM extraction across all
+            sections).  Each section record also has its own
+            ``"elapsed_seconds"``.
         """
         # Capture pre-ingestion state for post-ingestion diff
         _pre_snapshot = self.snapshot()
+        _ingest_t0 = time.monotonic()
+        _extraction_seconds = 0.0  # cumulative LLM extraction time
 
         aggregate_stats: dict[str, Any] = {
             "doc_id": doc_id,
@@ -5921,6 +5928,8 @@ TEXT:
             elapsed: float,
         ) -> None:
             """Apply extraction results to the graph (serial)."""
+            nonlocal _extraction_seconds
+            _extraction_seconds += elapsed
             # Link extracted entities to the section node
             if add_structure_nodes and add_structure_edges:
                 for nid in list(self._data["nodes"].keys()):
@@ -6136,29 +6145,37 @@ TEXT:
                     {"text": text, "url": url} for url, text in unique_urls.items()
                 ]
 
+        # Compute timing metrics
+        _total_elapsed = time.monotonic() - _ingest_t0
+        aggregate_stats["elapsed_seconds"] = round(_total_elapsed, 1)
+        aggregate_stats["extraction_seconds"] = round(_extraction_seconds, 1)
+
         _skipped_inc = aggregate_stats["sections_skipped_incremental"]
         if _skipped_inc:
             logger.info(
                 "Markdown ingest '%s': %d sections (%d skipped, incremental), "
                 "%d triples → %d nodes added (%d updated), "
-                "%d edges added (%d updated)",
+                "%d edges added (%d updated) [%.1fs total, %.1fs extraction]",
                 doc_id, aggregate_stats["total_sections"], _skipped_inc,
                 aggregate_stats["total_triples"],
                 aggregate_stats["total_nodes_added"],
                 aggregate_stats["total_nodes_updated"],
                 aggregate_stats["total_edges_added"],
                 aggregate_stats["total_edges_updated"],
+                _total_elapsed, _extraction_seconds,
             )
         else:
             logger.info(
                 "Markdown ingest '%s': %d sections, %d triples → "
-                "%d nodes added (%d updated), %d edges added (%d updated)",
+                "%d nodes added (%d updated), %d edges added (%d updated) "
+                "[%.1fs total, %.1fs extraction]",
                 doc_id, aggregate_stats["total_sections"],
                 aggregate_stats["total_triples"],
                 aggregate_stats["total_nodes_added"],
                 aggregate_stats["total_nodes_updated"],
                 aggregate_stats["total_edges_added"],
                 aggregate_stats["total_edges_updated"],
+                _total_elapsed, _extraction_seconds,
             )
 
         # Notify progress callback of document ingestion completion
@@ -6175,6 +6192,8 @@ TEXT:
                 "total_edges_updated": aggregate_stats["total_edges_updated"],
                 "total_proposals_created": aggregate_stats["total_proposals_created"],
                 "total_proposals_augmented": aggregate_stats["total_proposals_augmented"],
+                "elapsed_seconds": aggregate_stats["elapsed_seconds"],
+                "extraction_seconds": aggregate_stats["extraction_seconds"],
             })
 
         # Compute diff from pre-ingestion snapshot
