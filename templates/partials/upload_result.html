@@ -118,7 +118,7 @@
 
         <!-- Anthropic provider config (disabled by default so fields don't submit) -->
         <div id="ingest-anthropic-cfg" class="hidden grid grid-cols-2 gap-3">
-          <div class="space-y-1">
+          <div class="space-y-1 col-span-2">
             <label class="block text-xs text-gray-400">Extraction Model</label>
             <select name="extract_model" disabled
                     class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
@@ -129,14 +129,21 @@
           </div>
           <div class="space-y-1">
             <label class="block text-xs text-gray-400">Embed URL</label>
-            <input type="text" name="embed_url" value="http://localhost:11434" disabled
-                   placeholder="Local embed server"
-                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            <div class="flex gap-1">
+              <input type="text" name="embed_url" id="anthropic-embed-url" value="http://localhost:11434" disabled
+                     placeholder="Local embed server"
+                     class="flex-1 bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+              <button type="button" onclick="fetchModels('anthropic-embed')"
+                      class="border border-gray-800 px-2 py-1 text-xs text-gray-400 hover:text-white hover:border-white transition-colors whitespace-nowrap"
+                      id="fetch-anthropic-embed-models-btn">Fetch Models</button>
+            </div>
           </div>
-          <div class="space-y-1 col-span-2">
+          <div class="space-y-1">
             <label class="block text-xs text-gray-400">Embed Model</label>
-            <input type="text" name="embed_model" value="qwen3-embedding" disabled
-                   class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+            <select name="embed_model" id="anthropic-embed-model" disabled
+                    class="w-full bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
+              <option value="qwen3-embedding" selected>qwen3-embedding</option>
+            </select>
           </div>
           <p class="text-xs text-gray-600 col-span-2">API key is read from the ANTHROPIC_API_KEY environment variable. Embeddings always use a local server.</p>
         </div>
@@ -208,18 +215,18 @@
           </div>
         </div>
         <!-- Extended thinking (Anthropic only) -->
-        <div class="space-y-1" id="thinking-budget-section">
+        <div class="hidden space-y-1" id="thinking-budget-section">
           <label class="block text-xs text-gray-400">Extended Thinking Budget (tokens)</label>
           <input type="number" name="thinking_budget" value="0" min="0" max="128000" step="1000"
                  class="w-32 bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
-          <span class="text-xs text-gray-600 ml-1">Anthropic only. 0 = disabled. Forces temperature=1 when active.</span>
+          <span class="text-xs text-gray-600 ml-1">0 = disabled. Forces temperature=1 when active.</span>
         </div>
         <!-- No-think mode (local provider only) -->
         <div class="flex items-center gap-2 pt-1" id="no-think-section">
           <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
             <input type="checkbox" name="no_think" value="1" class="accent-white"> Disable thinking mode
           </label>
-          <span class="text-xs text-gray-600">Local only. Skips chain-of-thought for Qwen3, DeepSeek-R1, etc.</span>
+          <span class="text-xs text-gray-600">Skips chain-of-thought for Qwen3, DeepSeek-R1, etc.</span>
         </div>
         <!-- Verbose logging -->
         <div class="flex items-center gap-2 pt-1">
@@ -264,6 +271,18 @@
         panel.querySelectorAll('input, select').forEach(function(el) { el.disabled = true; });
       }
     });
+    // Show thinking budget only for Anthropic
+    var thinkSec = document.getElementById('thinking-budget-section');
+    if (thinkSec) {
+      if (provider === 'anthropic') { thinkSec.classList.remove('hidden'); }
+      else { thinkSec.classList.add('hidden'); }
+    }
+    // Show no-think only for Local
+    var noThinkSec = document.getElementById('no-think-section');
+    if (noThinkSec) {
+      if (provider === 'local') { noThinkSec.classList.remove('hidden'); }
+      else { noThinkSec.classList.add('hidden'); }
+    }
   }
 
   function toggleBedrockEmbed() {
@@ -289,6 +308,10 @@
       urlInput = document.getElementById('ingest-api-url');
       selectId = 'ingest-query-model';
       btn = document.getElementById('fetch-api-models-btn');
+    } else if (target === 'anthropic-embed') {
+      urlInput = document.getElementById('anthropic-embed-url');
+      selectId = 'anthropic-embed-model';
+      btn = document.getElementById('fetch-anthropic-embed-models-btn');
     } else {
       urlInput = document.getElementById('ingest-embed-url');
       selectId = 'ingest-embed-model';
