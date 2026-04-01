@@ -418,7 +418,7 @@ def _format_ingest_event(
 def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
     """Convert an uploaded file to markdown. Returns (markdown, error)."""
     ext = Path(filename).suffix.lower()
-    if ext == ".md":
+    if ext in (".md", ".txt"):
         return content.decode("utf-8", errors="replace"), None
 
     try:

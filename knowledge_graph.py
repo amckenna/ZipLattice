@@ -9313,9 +9313,9 @@ def main() -> None:
     parser.add_argument("--cytoscape", nargs="?", const="graph_cytoscape.html",
                         help="Export Cytoscape visualization (optionally specify output path)")
     parser.add_argument("--center", help="Center visualization on this node (use with --pyvis/--cytoscape)")
-    parser.add_argument("--preview-md", help="Preview section breakdown of a markdown file (dry run)")
+    parser.add_argument("--preview-md", help="Preview section breakdown of a markdown or text file (dry run)")
     parser.add_argument("--ingest-md", nargs="+", metavar="FILE",
-                        help="Ingest one or more markdown files into the graph (supports globs)")
+                        help="Ingest one or more markdown or text files into the graph (supports globs)")
     parser.add_argument("--sections", action="store_true",
                         help="Show full section details when used with --preview-md or --ingest-md")
     parser.add_argument("--query-model", "--ollama", nargs="?", const="qwen3-coder:30b",

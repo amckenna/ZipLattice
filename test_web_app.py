@@ -143,6 +143,21 @@ def test_upload_md_file():
     assert "OK" in resp.text
 
 
+def test_upload_txt_file():
+    """Upload a .txt file and verify it gets processed."""
+    _create_graph("upload-txt-test")
+
+    txt_content = b"This is a plain text document.\nIt has multiple lines.\n"
+    resp = client.post(
+        "/upload",
+        data={"graph_name": "upload-txt-test", "new_graph_name": ""},
+        files=[("files", ("notes.txt", txt_content, "text/plain"))],
+    )
+    assert resp.status_code == 200
+    assert "notes.txt" in resp.text
+    assert "OK" in resp.text
+
+
 def test_upload_creates_new_graph():
     """Upload with a new graph name creates the graph."""
     md_content = b"# Doc\n\nContent here.\n"

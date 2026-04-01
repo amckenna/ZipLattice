@@ -111,6 +111,7 @@ python knowledge_graph.py <path-to-graph.json> --analytics
 python knowledge_graph.py <path-to-graph.json> --doc-history <doc-id>
 python knowledge_graph.py <path-to-graph.json> --preview-md doc.md --sections
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md
+python knowledge_graph.py <path-to-graph.json> --ingest-md notes.txt --query-model qwen3-coder:30b
 python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-model qwen3-coder:30b --embed-model qwen3-embedding
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --api-url http://exo:11434
 # Parallel ingestion: 4 concurrent LLM extraction threads, serial graph writes
