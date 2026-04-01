@@ -65,7 +65,7 @@ knowledge_graph/                  # dedicated graph directory
 - `GraphEncoder` -- Custom JSON encoder for datetime, set, Enum, and Path objects.
 - `ollama_embed()` -- Calls OpenAI-compatible `/v1/embeddings` endpoint. Works with Ollama, llama.cpp, vLLM, LocalAI, etc. Used during ingestion and by `query_graph.py` at query time.
 - `claude_chat()` -- Calls the Anthropic Messages API for chat/query. Used when `--provider anthropic` is set.
-- `claude_extract()` -- Calls the Anthropic Messages API for JSON entity/relation extraction during ingestion. Same three-tier JSON recovery as the local path. Accepts `temperature` (default 0.1) and `thinking_budget` (default 0, disabled) for extended thinking.
+- `claude_extract()` -- Calls the Anthropic Messages API for JSON entity/relation extraction during ingestion. Same three-tier JSON recovery as the local path. Accepts `temperature` (default 0.1).
 - `bedrock_chat()` -- Calls the AWS Bedrock Converse API for chat/query. Used when `--provider bedrock` is set.
 - `bedrock_extract()` -- Calls the AWS Bedrock Converse API for JSON entity/relation extraction. Same three-tier JSON recovery as the local path.
 - `bedrock_embed()` -- Calls AWS Bedrock for embeddings. Supports Titan (`invoke_model`) and Cohere (batched) embedding models.
@@ -119,9 +119,6 @@ python knowledge_graph.py <path-to-graph.json> --ingest-md docs/*.md --query-mod
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --incremental
 # Custom temperature (0=deterministic, higher=more diverse)
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --query-model qwen3-coder:30b --temperature 0.0
-# Claude with extended thinking (forces temperature=1)
-python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-sonnet-4-6 --thinking-budget 10000
-
 # Ingest with Claude API (Haiku for fast extraction, local embeddings)
 python knowledge_graph.py <path-to-graph.json> --ingest-md doc.md --provider anthropic --extract-model claude-haiku-4-5 --embed-model qwen3-embedding
 
@@ -159,8 +156,6 @@ python benchmark_models.py doc.md --models modelA modelB --max-sections 5  # qui
 python benchmark_models.py doc.md --models claude-haiku-4-5 claude-sonnet-4-6 --provider anthropic
 # Benchmark with custom temperature
 python benchmark_models.py doc.md --models qwen3-coder:30b --temperature 0.0
-# Benchmark with Claude extended thinking
-python benchmark_models.py doc.md --models claude-sonnet-4-6 --provider anthropic --thinking-budget 10000
 # Benchmark with Bedrock
 python benchmark_models.py doc.md --models us.anthropic.claude-haiku-4-5-20251001-v1:0 --provider bedrock
 
