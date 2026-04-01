@@ -108,9 +108,10 @@ def build_extraction_prompt(
         max_triples: Maximum triples to request.
     """
     kg = _get_graph(graph_path)
-    return kg.build_extraction_prompt(
+    system, user = kg.build_extraction_prompt(
         text, focus_entities=focus_entities, max_triples=max_triples,
     )
+    return system + "\n\n" + user
 
 
 @mcp.tool()
