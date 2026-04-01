@@ -214,13 +214,6 @@
             <span class="text-xs text-gray-600 ml-1">LLM calls run concurrently; graph writes remain serial</span>
           </div>
         </div>
-        <!-- Extended thinking (Anthropic only) -->
-        <div class="hidden space-y-1" id="thinking-budget-section">
-          <label class="block text-xs text-gray-400">Extended Thinking Budget (tokens)</label>
-          <input type="number" name="thinking_budget" value="0" min="0" max="128000" step="1000"
-                 class="w-32 bg-black border border-gray-800 px-2 py-1 text-xs focus:outline-none focus:border-white">
-          <span class="text-xs text-gray-600 ml-1">0 = disabled. Forces temperature=1 when active.</span>
-        </div>
         <!-- No-think mode (local provider only) -->
         <div class="flex items-center gap-2 pt-1" id="no-think-section">
           <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
@@ -271,12 +264,6 @@
         panel.querySelectorAll('input, select').forEach(function(el) { el.disabled = true; });
       }
     });
-    // Show thinking budget only for Anthropic
-    var thinkSec = document.getElementById('thinking-budget-section');
-    if (thinkSec) {
-      if (provider === 'anthropic') { thinkSec.classList.remove('hidden'); }
-      else { thinkSec.classList.add('hidden'); }
-    }
     // Show no-think only for Local
     var noThinkSec = document.getElementById('no-think-section');
     if (noThinkSec) {

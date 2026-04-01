@@ -423,7 +423,6 @@ def claude_extract(
     model: str,
     api_key: str | None = None,
     temperature: float = 0.1,
-    thinking_budget: int = 0,
 ) -> list[dict[str, Any]]:
     """Call the Anthropic Messages API for JSON extraction.
 
@@ -436,13 +435,6 @@ def claude_extract(
         model: Anthropic model ID (e.g. ``claude-haiku-4-5``).
         api_key: API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
         temperature: Sampling temperature (0.0–1.0, default 0.1).
-            Ignored when *thinking_budget* > 0 (Anthropic requires
-            ``temperature=1`` for extended thinking).
-        thinking_budget: When > 0, enable Claude's extended thinking with
-            this many tokens as the ``budget_tokens``.  The API requires
-            ``temperature=1`` when thinking is enabled, so the
-            *temperature* parameter is overridden automatically.
-            Set to 0 (default) to disable extended thinking.
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
@@ -455,17 +447,8 @@ def claude_extract(
         "max_tokens": 32768,
         "system": _EXTRACTION_SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
     }
-
-    if thinking_budget > 0:
-        # Extended thinking requires temperature=1 and the thinking block
-        payload["temperature"] = 1
-        payload["thinking"] = {
-            "type": "enabled",
-            "budget_tokens": thinking_budget,
-        }
-    else:
-        payload["temperature"] = temperature
 
     t0 = time.monotonic()
     body = _anthropic_request(
@@ -476,16 +459,12 @@ def claude_extract(
         return []
 
     elapsed = time.monotonic() - t0
-    # When extended thinking is enabled, the response contains
-    # [{"type": "thinking", ...}, {"type": "text", ...}].
-    # Extract the text block.
     raw = ""
     for block in body.get("content", []):
         if block.get("type") == "text":
             raw = block.get("text", "").strip()
             break
     if not raw and body.get("content"):
-        # Fallback: first block's text (non-thinking responses)
         raw = body["content"][0].get("text", "").strip()
 
     logger.debug("claude_extract: raw response=%d chars (%.1fs)", len(raw), elapsed)
@@ -5619,9 +5598,16 @@ TEXT:
             Aggregate stats dict with per-section breakdown.
             Includes a ``"diff"`` key with a :class:`GraphDiff` dict
             summarising changes made during this ingestion.
+            Timing metrics: ``"elapsed_seconds"`` (wall-clock time for
+            the entire ingestion) and ``"extraction_seconds"``
+            (cumulative time spent on LLM extraction across all
+            sections).  Each section record also has its own
+            ``"elapsed_seconds"``.
         """
         # Capture pre-ingestion state for post-ingestion diff
         _pre_snapshot = self.snapshot()
+        _ingest_t0 = time.monotonic()
+        _extraction_seconds = 0.0  # cumulative LLM extraction time
 
         aggregate_stats: dict[str, Any] = {
             "doc_id": doc_id,
@@ -5921,6 +5907,8 @@ TEXT:
             elapsed: float,
         ) -> None:
             """Apply extraction results to the graph (serial)."""
+            nonlocal _extraction_seconds
+            _extraction_seconds += elapsed
             # Link extracted entities to the section node
             if add_structure_nodes and add_structure_edges:
                 for nid in list(self._data["nodes"].keys()):
@@ -6136,29 +6124,37 @@ TEXT:
                     {"text": text, "url": url} for url, text in unique_urls.items()
                 ]
 
+        # Compute timing metrics
+        _total_elapsed = time.monotonic() - _ingest_t0
+        aggregate_stats["elapsed_seconds"] = round(_total_elapsed, 1)
+        aggregate_stats["extraction_seconds"] = round(_extraction_seconds, 1)
+
         _skipped_inc = aggregate_stats["sections_skipped_incremental"]
         if _skipped_inc:
             logger.info(
                 "Markdown ingest '%s': %d sections (%d skipped, incremental), "
                 "%d triples → %d nodes added (%d updated), "
-                "%d edges added (%d updated)",
+                "%d edges added (%d updated) [%.1fs total, %.1fs extraction]",
                 doc_id, aggregate_stats["total_sections"], _skipped_inc,
                 aggregate_stats["total_triples"],
                 aggregate_stats["total_nodes_added"],
                 aggregate_stats["total_nodes_updated"],
                 aggregate_stats["total_edges_added"],
                 aggregate_stats["total_edges_updated"],
+                _total_elapsed, _extraction_seconds,
             )
         else:
             logger.info(
                 "Markdown ingest '%s': %d sections, %d triples → "
-                "%d nodes added (%d updated), %d edges added (%d updated)",
+                "%d nodes added (%d updated), %d edges added (%d updated) "
+                "[%.1fs total, %.1fs extraction]",
                 doc_id, aggregate_stats["total_sections"],
                 aggregate_stats["total_triples"],
                 aggregate_stats["total_nodes_added"],
                 aggregate_stats["total_nodes_updated"],
                 aggregate_stats["total_edges_added"],
                 aggregate_stats["total_edges_updated"],
+                _total_elapsed, _extraction_seconds,
             )
 
         # Notify progress callback of document ingestion completion
@@ -6175,6 +6171,8 @@ TEXT:
                 "total_edges_updated": aggregate_stats["total_edges_updated"],
                 "total_proposals_created": aggregate_stats["total_proposals_created"],
                 "total_proposals_augmented": aggregate_stats["total_proposals_augmented"],
+                "elapsed_seconds": aggregate_stats["elapsed_seconds"],
+                "extraction_seconds": aggregate_stats["extraction_seconds"],
             })
 
         # Compute diff from pre-ingestion snapshot
@@ -9045,14 +9043,11 @@ def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
         _extract_model = args.extract_model or args.query_model
         _provider = args.provider
         _temperature = args.temperature if args.temperature is not None else 0.1
-        _thinking_budget = args.thinking_budget
         _no_think = args.no_think
 
         _extra_info: list[str] = []
         if args.temperature is not None:
             _extra_info.append(f"temperature={_temperature}")
-        if _thinking_budget > 0:
-            _extra_info.append(f"thinking_budget={_thinking_budget}")
         if _no_think:
             _extra_info.append("no_think")
         _extra_str = f" ({', '.join(_extra_info)})" if _extra_info else ""
@@ -9062,7 +9057,7 @@ def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
             extract_fn: Callable[[str], list[dict[str, Any]]] = (
                 lambda prompt: claude_extract(
                     prompt, model=_extract_model, api_key=_api_key,
-                    temperature=_temperature, thinking_budget=_thinking_budget,
+                    temperature=_temperature,
                 )
             )
             print(f"  Using model: {_extract_model} (provider: anthropic){_extra_str}")
@@ -9318,9 +9313,9 @@ def main() -> None:
     parser.add_argument("--cytoscape", nargs="?", const="graph_cytoscape.html",
                         help="Export Cytoscape visualization (optionally specify output path)")
     parser.add_argument("--center", help="Center visualization on this node (use with --pyvis/--cytoscape)")
-    parser.add_argument("--preview-md", help="Preview section breakdown of a markdown file (dry run)")
+    parser.add_argument("--preview-md", help="Preview section breakdown of a markdown or text file (dry run)")
     parser.add_argument("--ingest-md", nargs="+", metavar="FILE",
-                        help="Ingest one or more markdown files into the graph (supports globs)")
+                        help="Ingest one or more markdown or text files into the graph (supports globs)")
     parser.add_argument("--sections", action="store_true",
                         help="Show full section details when used with --preview-md or --ingest-md")
     parser.add_argument("--query-model", "--ollama", nargs="?", const="qwen3-coder:30b",
@@ -9361,14 +9356,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=None, metavar="T",
                         help="Sampling temperature for LLM extraction (0.0–2.0, default 0.1). "
                              "Lower values produce more deterministic output; higher values "
-                             "increase diversity. Ignored when --thinking-budget is set with "
-                             "the anthropic provider (requires temperature=1).")
-    parser.add_argument("--thinking-budget", type=int, default=0, metavar="TOKENS",
-                        dest="thinking_budget",
-                        help="Enable extended thinking for Claude models with this token budget. "
-                             "Only effective with --provider anthropic. When set, temperature "
-                             "is forced to 1.0 as required by the API. Set to 0 to disable "
-                             "(default: 0).")
+                             "increase diversity.")
     parser.add_argument("--no-think", action="store_true", dest="no_think",
                         help="Disable thinking/reasoning mode for models that support it "
                              "(e.g. Qwen3, DeepSeek-R1). Sends chat_template_kwargs with "

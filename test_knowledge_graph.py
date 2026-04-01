@@ -2095,6 +2095,38 @@ def test_ingest_markdown_includes_diff(tmp_path):
     assert diff["counts"]["nodes_added"] > 0
 
 
+def test_ingest_markdown_timing_metrics(tmp_path):
+    """ingest_markdown() aggregate stats include timing metrics."""
+    kg = KnowledgeGraph(tmp_path / "a.json")
+
+    def mock_extract(prompt):
+        return [
+            {"source": "Radar", "target": "Radio waves",
+             "relation": "uses", "confidence": 0.9,
+             "context": "Radar uses radio waves."},
+        ]
+
+    md = _long_section("Radar Basics",
+                       "Radar uses radio waves for detection and ranging.")
+    stats = kg.ingest_markdown(md, "test-doc", llm_extract_fn=mock_extract)
+
+    # Overall timing
+    assert "elapsed_seconds" in stats
+    assert isinstance(stats["elapsed_seconds"], float)
+    assert stats["elapsed_seconds"] >= 0
+
+    # Extraction timing
+    assert "extraction_seconds" in stats
+    assert isinstance(stats["extraction_seconds"], float)
+    assert stats["extraction_seconds"] >= 0
+    assert stats["extraction_seconds"] <= stats["elapsed_seconds"]
+
+    # Per-section timing
+    for section in stats["sections"]:
+        assert "elapsed_seconds" in section
+        assert section["elapsed_seconds"] >= 0
+
+
 # ---------------------------------------------------------------------------
 # BM25 & Hybrid search
 # ---------------------------------------------------------------------------

@@ -28,11 +28,6 @@ Usage:
     python benchmark_models.py doc.md \
         --models qwen3-coder:30b --temperature 0.0
 
-    # Claude with extended thinking enabled
-    python benchmark_models.py doc.md \
-        --models claude-sonnet-4-6 --provider anthropic \
-        --thinking-budget 10000
-
     # AWS Bedrock provider
     python benchmark_models.py doc.md \
         --models us.anthropic.claude-haiku-4-5-20251001-v1:0 \
@@ -66,7 +61,6 @@ def _make_extract_fn(
     verbose: bool = False,
     provider: str = "local",
     temperature: float = 0.1,
-    thinking_budget: int = 0,
     bedrock_region: str | None = None,
     bedrock_profile: str | None = None,
 ) -> Callable[[str], list[dict[str, Any]]]:
@@ -83,7 +77,6 @@ def _make_extract_fn(
         verbose: Enable verbose logging.
         provider: ``"local"``, ``"anthropic"``, or ``"bedrock"``.
         temperature: Sampling temperature (0.0–2.0, default 0.1).
-        thinking_budget: Token budget for Claude extended thinking (0=disabled).
         bedrock_region: AWS region for Bedrock provider.
         bedrock_profile: AWS profile for Bedrock provider.
     """
@@ -91,7 +84,7 @@ def _make_extract_fn(
         api_key = _get_anthropic_api_key()
         return lambda prompt: claude_extract(
             prompt, model=model, api_key=api_key,
-            temperature=temperature, thinking_budget=thinking_budget,
+            temperature=temperature,
         )
     if provider == "bedrock":
         return lambda prompt: bedrock_extract(
@@ -112,7 +105,6 @@ def run_benchmark(
     quiet: bool = False,
     provider: str = "local",
     temperature: float = 0.1,
-    thinking_budget: int = 0,
     bedrock_region: str | None = None,
     bedrock_profile: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -142,7 +134,7 @@ def run_benchmark(
 
         extract_fn = _make_extract_fn(
             model, ollama_url, verbose=verbose, provider=provider,
-            temperature=temperature, thinking_budget=thinking_budget,
+            temperature=temperature,
             bedrock_region=bedrock_region, bedrock_profile=bedrock_profile,
         )
 
@@ -150,7 +142,6 @@ def run_benchmark(
             "model": model,
             "provider": provider,
             "temperature": temperature,
-            "thinking_budget": thinking_budget,
             "files": [],
             "total_sections": 0,
             "total_triples": 0,
@@ -317,9 +308,6 @@ def print_comparison(results: list[dict[str, Any]], total_chars: int) -> None:
     _temp = results[0].get("temperature", 0.1)
     if _temp != 0.1:
         _settings.append(f"temperature={_temp}")
-    _tb = results[0].get("thinking_budget", 0)
-    if _tb > 0:
-        _settings.append(f"thinking_budget={_tb}")
     _prov = results[0].get("provider", "local")
     if _prov != "local":
         _settings.append(f"provider={_prov}")
@@ -422,11 +410,6 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.1, metavar="T",
                         help="Sampling temperature for extraction (0.0–2.0, default: 0.1). "
                              "Lower = more deterministic, higher = more diverse.")
-    parser.add_argument("--thinking-budget", type=int, default=0, metavar="TOKENS",
-                        dest="thinking_budget",
-                        help="Enable Claude extended thinking with this token budget. "
-                             "Only effective with --provider anthropic. Forces temperature=1. "
-                             "(default: 0, disabled)")
     parser.add_argument("--bedrock-region", default=None, metavar="REGION",
                         help="AWS region for Bedrock (default: AWS_DEFAULT_REGION or us-east-1)")
     parser.add_argument("--bedrock-profile", default=None, metavar="PROFILE",
@@ -464,8 +447,6 @@ def main():
         if args.provider == "local":
             print(f"  Server: {args.ollama_url}")
         print(f"  Temperature: {args.temperature}")
-        if args.thinking_budget > 0:
-            print(f"  Thinking budget: {args.thinking_budget} tokens")
         if args.max_sections:
             print(f"  Max sections per file: {args.max_sections}")
 
@@ -491,7 +472,6 @@ def main():
             quiet=args.quiet,
             provider=args.provider,
             temperature=args.temperature,
-            thinking_budget=args.thinking_budget,
             bedrock_region=args.bedrock_region,
             bedrock_profile=args.bedrock_profile,
         )

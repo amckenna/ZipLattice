@@ -211,7 +211,6 @@ def _build_extract_fn(
     bedrock_region: str = "",
     bedrock_profile: str = "",
     temperature: float = 0.1,
-    thinking_budget: int = 0,
     no_think: bool = False,
 ) -> ExtractFn:
     """Build an extraction callable for the given provider."""
@@ -220,7 +219,7 @@ def _build_extract_fn(
     if cfg.provider == "anthropic":
         api_key = _get_anthropic_api_key()
         return partial(claude_extract, model=cfg.model, api_key=api_key,
-                       temperature=temperature, thinking_budget=thinking_budget)
+                       temperature=temperature)
     if cfg.provider == "bedrock":
         return partial(bedrock_extract, model=cfg.model, region=cfg.region, profile=cfg.profile,
                        temperature=temperature)
@@ -402,11 +401,14 @@ def _format_ingest_event(
                 lines.append(f"    warning: {err}")
         return "\n".join(lines)
     if evt == "doc_done":
+        elapsed = ev.get("elapsed_seconds", 0)
+        extraction = ev.get("extraction_seconds", 0)
+        timing = f" ({elapsed}s total, {extraction}s extraction)" if elapsed else ""
         if verbose:
             return (f"  Document complete: {ev.get('total_triples', 0)} triples, "
                     f"{ev.get('total_nodes_added', 0)} nodes, "
-                    f"{ev.get('total_edges_added', 0)} edges")
-        return None
+                    f"{ev.get('total_edges_added', 0)} edges{timing}")
+        return f"  Document complete{timing}" if elapsed else None
     if evt == "section_skip":
         return (f"  section {idx}/{total}: {heading} "
                 f"(skipped: {ev.get('reason', '')})")
@@ -416,7 +418,7 @@ def _format_ingest_event(
 def _convert_file(filename: str, content: bytes) -> tuple[str, str | None]:
     """Convert an uploaded file to markdown. Returns (markdown, error)."""
     ext = Path(filename).suffix.lower()
-    if ext == ".md":
+    if ext in (".md", ".txt"):
         return content.decode("utf-8", errors="replace"), None
 
     try:
@@ -845,7 +847,6 @@ async def ingest_documents(
     parallel: str = Form("1"),
     incremental: str = Form(""),
     temperature: str = Form("0.1"),
-    thinking_budget: str = Form("0"),
     no_think: str = Form(""),
 ) -> Response:
     """Run LLM ingestion with streaming progress log."""
@@ -860,15 +861,11 @@ async def ingest_documents(
         _temperature = max(0.0, min(2.0, float(temperature.strip() or "0.1")))
     except (ValueError, TypeError):
         _temperature = 0.1
-    try:
-        _thinking_budget = max(0, int(thinking_budget.strip() or "0"))
-    except (ValueError, TypeError):
-        _thinking_budget = 0
     logger.info(
-        "POST /ingest graph=%s batch=%s provider=%s model=%s embed=%s verbose=%s parallel=%d temp=%.2f thinking=%d no_think=%s",
+        "POST /ingest graph=%s batch=%s provider=%s model=%s embed=%s verbose=%s parallel=%d temp=%.2f no_think=%s",
         graph_name, batch_id, provider,
         extract_model.strip() or query_model, embed_model, _verbose, _parallel,
-        _temperature, _thinking_budget, _no_think,
+        _temperature, _no_think,
     )
 
     batch_entry = _upload_batches.pop(batch_id, None)
@@ -917,7 +914,6 @@ async def ingest_documents(
                                        bedrock_region=bedrock_region,
                                        bedrock_profile=bedrock_profile,
                                        temperature=_temperature,
-                                       thinking_budget=_thinking_budget,
                                        no_think=_no_think)
         results = []
         total_docs = len(batch)

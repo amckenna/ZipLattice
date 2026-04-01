@@ -250,7 +250,9 @@
       .then(r => r.json())
       .then(data => {
         let html = '';
-        if (data.is_valid && data.summary.warning_count === 0) {
+        if (data.error) {
+          html = '<span style="color:#ef4444;">Validation failed: ' + data.error.replace(/</g,'&lt;') + '</span>';
+        } else if (data.is_valid && data.summary.warning_count === 0) {
           html = '<span style="color:#10b981;">&#10003; All checks passed</span>';
         } else {
           const parts = [];
@@ -272,7 +274,7 @@
             html += '</ul></details>';
           }
         }
-        if (data.info.length > 0) {
+        if (data.info && data.info.length > 0) {
           html += '<details class="mt-2"><summary class="cursor-pointer text-xs text-gray-400">Info</summary><ul class="mt-1 text-xs text-gray-500">';
           data.info.forEach(i => { html += '<li class="mt-1">' + i.replace(/</g,'&lt;') + '</li>'; });
           html += '</ul></details>';
