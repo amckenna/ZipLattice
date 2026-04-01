@@ -208,6 +208,7 @@ def local_extract(
     url: str = "http://localhost:11434",
     temperature: float = 0.1,
     no_think: bool = False,
+    system_prompt: str | None = None,
 ) -> list[dict[str, Any]]:
     """Call an OpenAI-compatible ``/v1/chat/completions`` endpoint for extraction.
 
@@ -224,6 +225,10 @@ def local_extract(
             ``chat_template_kwargs: {"enable_thinking": false}`` in the
             request payload.  This avoids wasting tokens on chain-of-thought
             reasoning that will be stripped anyway.
+        system_prompt: Optional system prompt override.  When provided,
+            this replaces the default ``_EXTRACTION_SYSTEM_PROMPT`` in the
+            ``system`` role of the chat messages.  Use the *system* part
+            returned by ``build_extraction_prompt()`` for best results.
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
@@ -232,7 +237,7 @@ def local_extract(
     body: dict[str, Any] = {
         "model": model,
         "messages": [
-            {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt or _EXTRACTION_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
         "stream": False,
@@ -423,6 +428,7 @@ def claude_extract(
     model: str,
     api_key: str | None = None,
     temperature: float = 0.1,
+    system_prompt: str | None = None,
 ) -> list[dict[str, Any]]:
     """Call the Anthropic Messages API for JSON extraction.
 
@@ -435,6 +441,10 @@ def claude_extract(
         model: Anthropic model ID (e.g. ``claude-haiku-4-5``).
         api_key: API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
         temperature: Sampling temperature (0.0–1.0, default 0.1).
+        system_prompt: Optional system prompt override.  When provided,
+            this replaces the default ``_EXTRACTION_SYSTEM_PROMPT`` in the
+            ``system`` field.  Use the *system* part returned by
+            ``build_extraction_prompt()`` for best results.
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
@@ -445,7 +455,7 @@ def claude_extract(
     payload: dict[str, Any] = {
         "model": model,
         "max_tokens": 32768,
-        "system": _EXTRACTION_SYSTEM_PROMPT,
+        "system": system_prompt or _EXTRACTION_SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
     }
@@ -662,6 +672,7 @@ def bedrock_extract(
     region: str | None = None,
     profile: str | None = None,
     temperature: float = 0.1,
+    system_prompt: str | None = None,
 ) -> list[dict[str, Any]]:
     """Call AWS Bedrock Converse API for JSON extraction.
 
@@ -675,6 +686,10 @@ def bedrock_extract(
         region: AWS region.
         profile: AWS profile name from ``~/.aws/credentials``.
         temperature: Sampling temperature (0.0–1.0, default 0.1).
+        system_prompt: Optional system prompt override.  When provided,
+            this replaces the default ``_EXTRACTION_SYSTEM_PROMPT`` in the
+            ``system`` field.  Use the *system* part returned by
+            ``build_extraction_prompt()`` for best results.
 
     Returns:
         List of extracted triple dicts, or ``[]`` on failure.
@@ -683,7 +698,7 @@ def bedrock_extract(
     body = _bedrock_converse_with_retries(
         {"modelId": model,
          "messages": [{"role": "user", "content": [{"text": prompt}]}],
-         "system": [{"text": _EXTRACTION_SYSTEM_PROMPT}],
+         "system": [{"text": system_prompt or _EXTRACTION_SYSTEM_PROMPT}],
          "inferenceConfig": {"maxTokens": 32768, "temperature": temperature}},
         model=model, region=region, profile=profile,
         label="extract", on_error="return",
@@ -4627,7 +4642,8 @@ class KnowledgeGraph:
         *,
         focus_entities: list[str] | None = None,
         max_triples: int = 50,
-    ) -> str:
+        existing_node_limit: int = 50,
+    ) -> tuple[str, str]:
         """
         Build a prompt for an LLM to extract knowledge graph triples from text.
 
@@ -4638,9 +4654,15 @@ class KnowledgeGraph:
             text: Document text to extract from.
             focus_entities: Optional list of entity names/IDs to focus extraction on.
             max_triples: Maximum triples to request from the LLM.
+            existing_node_limit: Maximum number of existing node names to include
+                in the prompt for entity deduplication (default 50).
 
         Returns:
-            A prompt string ready to send to an LLM.
+            A ``(system, user)`` tuple.  The *system* string contains schema,
+            rules, and examples; the *user* string contains the document text.
+            Callers that use chat APIs with a dedicated ``system`` parameter
+            should place each part accordingly.  For single-prompt APIs,
+            concatenate with ``system + "\\n\\n" + user``.
         """
         existing_relations = sorted(self._valid_relations())
         pending_proposals = [p.name for p in self.get_proposals()]
@@ -4650,6 +4672,29 @@ class KnowledgeGraph:
             focus_section = f"""
 FOCUS ENTITIES (prioritize relationships involving these):
 {json.dumps(focus_entities, indent=2)}
+"""
+
+        # Option 7: Provide existing node names for entity linking.
+        # Include the top-N nodes by degree so the LLM can reuse them
+        # rather than creating duplicates.
+        existing_nodes_section = ""
+        node_names: list[str] = []
+        if self._data["nodes"]:
+            # Sort by degree (most connected first) for relevance
+            degree_map = dict(self._G.degree())
+            sorted_ids = sorted(
+                self._data["nodes"],
+                key=lambda nid: degree_map.get(nid, 0),
+                reverse=True,
+            )
+            for nid in sorted_ids[:existing_node_limit]:
+                node = self._data["nodes"][nid]
+                label = node.get("label", nid)
+                node_names.append(label)
+            if node_names:
+                existing_nodes_section = f"""
+EXISTING ENTITIES IN GRAPH (link to these when applicable, using exact names):
+{json.dumps(node_names, indent=2)}
 """
 
         system = f"""You are a knowledge graph extraction engine.
@@ -4662,13 +4707,19 @@ INSTRUCTIONS:
 3. For each relationship, use an EXISTING relation type if it fits reasonably well.
 4. Only propose a NEW relation type when no existing type captures the semantics.
 5. Return up to {max_triples} triples, prioritized by importance and confidence.
+6. Canonicalize entity names: use the most complete, standard form.
+   Merge abbreviations and variants into one entity (e.g., "KF" → "Kalman filter").
+   If the text introduces an acronym, use the expanded form as the entity name.
+7. Edge direction matters: source is the subject, target is the object.
+   "A depends_on B" means A requires B, not the reverse.
+   "A created_by B" means B created A.
 
 EXISTING RELATION TYPES (prefer these):
 {json.dumps(existing_relations, indent=2)}
 
 RECENTLY PROPOSED (not yet accepted — reuse if applicable):
 {json.dumps(pending_proposals, indent=2)}
-
+{existing_nodes_section}
 NODE TYPES (assign one to each entity):
 {json.dumps(sorted(DEFAULT_NODE_TYPES), indent=2)}
 
@@ -4678,9 +4729,11 @@ OUTPUT FORMAT — a JSON array of objects:
     "source": "entity name (human-readable)",
     "source_type": "node type",
     "source_description": "one-sentence description of the source entity",
+    "source_body": "optional 2-3 sentence summary if the text provides substantial detail about this entity, otherwise null",
     "target": "entity name (human-readable)",
     "target_type": "node type",
     "target_description": "one-sentence description of the target entity",
+    "target_body": "optional 2-3 sentence summary if the text provides substantial detail about this entity, otherwise null",
     "relation": "relation_type (snake_case, existing or new)",
     "is_new_relation": false,
     "suggested_relation": null,
@@ -4690,30 +4743,24 @@ OUTPUT FORMAT — a JSON array of objects:
   }}
 ]
 
-EXAMPLES:
+EXAMPLE:
 
 Input: "The Kalman filter is widely used in navigation systems. It requires a state-space model and produces optimal estimates under Gaussian noise."
 Output:
 [
-  {{"source": "Kalman filter", "source_type": "concept", "source_description": "Recursive algorithm for estimating the state of a linear dynamic system from noisy measurements", "target": "navigation systems", "target_type": "concept", "target_description": "Systems that determine position and guide movement", "relation": "used_in", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.92, "context": "The Kalman filter is widely used in navigation systems."}},
-  {{"source": "Kalman filter", "source_type": "concept", "source_description": "Recursive algorithm for estimating the state of a linear dynamic system from noisy measurements", "target": "state-space model", "target_type": "concept", "target_description": "Mathematical representation of a system using state variables", "relation": "depends_on", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.90, "context": "It requires a state-space model"}},
-  {{"source": "Kalman filter", "source_type": "concept", "source_description": "Recursive algorithm for estimating the state of a linear dynamic system from noisy measurements", "target": "Gaussian noise", "target_type": "concept", "target_description": "Statistical noise with a normal probability distribution", "relation": "assumes", "is_new_relation": true, "suggested_relation": "assumes", "justification": "Captures a precondition or assumption dependency not covered by depends_on.", "confidence": 0.85, "context": "produces optimal estimates under Gaussian noise"}}
+  {{"source": "Kalman filter", "source_type": "concept", "source_description": "Recursive algorithm for estimating the state of a linear dynamic system from noisy measurements", "source_body": "The Kalman filter is widely used in navigation systems. It requires a state-space model as input and produces optimal state estimates under the assumption of Gaussian noise.", "target": "navigation systems", "target_type": "concept", "target_description": "Systems that determine position and guide movement", "target_body": null, "relation": "used_in", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.92, "context": "The Kalman filter is widely used in navigation systems."}},
+  {{"source": "Kalman filter", "source_type": "concept", "source_description": "Recursive algorithm for estimating the state of a linear dynamic system from noisy measurements", "source_body": null, "target": "state-space model", "target_type": "concept", "target_description": "Mathematical representation of a system using state variables", "target_body": null, "relation": "depends_on", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.90, "context": "It requires a state-space model"}},
+  {{"source": "Kalman filter", "source_type": "concept", "source_description": "Recursive algorithm for estimating the state of a linear dynamic system from noisy measurements", "source_body": null, "target": "Gaussian noise", "target_type": "concept", "target_description": "Statistical noise with a normal probability distribution", "target_body": null, "relation": "assumes", "is_new_relation": true, "suggested_relation": "assumes", "justification": "Captures a precondition or assumption dependency not covered by depends_on.", "confidence": 0.85, "context": "produces optimal estimates under Gaussian noise"}}
 ]
+
+ABBREVIATED EXAMPLE (showing variety of relation types and node types):
 
 Input: "TensorFlow was developed by Google Brain. It supports GPU acceleration and is commonly compared to PyTorch."
 Output:
 [
-  {{"source": "TensorFlow", "source_type": "tool", "source_description": "Open-source machine learning framework", "target": "Google Brain", "target_type": "organization", "target_description": "AI research team at Google", "relation": "created_by", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.95, "context": "TensorFlow was developed by Google Brain."}},
-  {{"source": "TensorFlow", "source_type": "tool", "source_description": "Open-source machine learning framework", "target": "GPU acceleration", "target_type": "concept", "target_description": "Using graphics processing units to speed up computation", "relation": "supports", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.90, "context": "It supports GPU acceleration"}},
-  {{"source": "TensorFlow", "source_type": "tool", "source_description": "Open-source machine learning framework", "target": "PyTorch", "target_type": "tool", "target_description": "Open-source machine learning framework by Meta", "relation": "alternative_to", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.75, "context": "commonly compared to PyTorch"}}
-]
-
-Input: "Convolutional layers extract spatial features. Pooling reduces dimensionality before the fully connected layer classifies the output."
-Output:
-[
-  {{"source": "convolutional layers", "source_type": "concept", "source_description": "Neural network layers that apply convolution filters to detect patterns", "target": "spatial features", "target_type": "concept", "target_description": "Location-dependent patterns in input data such as edges and textures", "relation": "produces", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.90, "context": "Convolutional layers extract spatial features."}},
-  {{"source": "pooling", "source_type": "concept", "source_description": "Downsampling operation that reduces spatial dimensions of feature maps", "target": "dimensionality", "target_type": "concept", "target_description": "The number of features or spatial dimensions in a representation", "relation": "reduces", "is_new_relation": true, "suggested_relation": "reduces", "justification": "Captures a quantitative reduction relationship not covered by existing types.", "confidence": 0.88, "context": "Pooling reduces dimensionality"}},
-  {{"source": "fully connected layer", "source_type": "concept", "source_description": "Neural network layer where every neuron connects to all neurons in the previous layer", "target": "convolutional layers", "target_type": "concept", "target_description": "Neural network layers that apply convolution filters to detect patterns", "relation": "depends_on", "is_new_relation": false, "suggested_relation": null, "justification": null, "confidence": 0.70, "context": "before the fully connected layer classifies the output"}}
+  {{"source": "TensorFlow", "source_type": "tool", "target": "Google Brain", "target_type": "organization", "relation": "created_by", "confidence": 0.95, ...}},
+  {{"source": "TensorFlow", "source_type": "tool", "target": "GPU acceleration", "target_type": "concept", "relation": "supports", "confidence": 0.90, ...}},
+  {{"source": "TensorFlow", "source_type": "tool", "target": "PyTorch", "target_type": "tool", "relation": "alternative_to", "confidence": 0.75, ...}}
 ]
 
 RULES:
@@ -4723,6 +4770,16 @@ RULES:
 - confidence ranges: 0.9+ explicit statement, 0.7-0.9 strong implication,
   0.5-0.7 reasonable inference, <0.5 speculative.
 - Prefer specific relations (e.g. "depends_on") over generic ones (e.g. "related_to").
+- source_body / target_body: include ONLY when the text provides substantial
+  detail (2-3 sentences) about the entity. Set to null otherwise.
+
+AVOID:
+- Trivial definitional triples (e.g., "Python is a programming language")
+  unless the text specifically discusses that classification in depth.
+- Using "related_to" when a more specific relation type exists.
+- Extracting the same relationship more than once with different wording.
+- Creating separate entities for abbreviations and their expansions
+  (e.g., do NOT create both "KF" and "Kalman filter" — use "Kalman filter").
 {focus_section}"""
 
         user = f"""Extract entity relationship triples from the following text as a JSON array.
@@ -4732,7 +4789,7 @@ TEXT:
 {text}
 ---"""
 
-        return system + "\n\n" + user
+        return (system, user)
 
     def ingest_document(
         self,
@@ -4792,9 +4849,10 @@ TEXT:
             "errors": [],
         }
 
-        prompt = self.build_extraction_prompt(
+        system_prompt, user_prompt = self.build_extraction_prompt(
             text, focus_entities=focus_entities, max_triples=max_triples
         )
+        prompt = system_prompt + "\n\n" + user_prompt
 
         if progress_fn:
             progress_fn({"event": "extraction_start", "doc_id": doc_id})
@@ -4863,8 +4921,10 @@ TEXT:
 
                     [{"source": "...", "source_type": "concept",
                       "source_description": "...",
+                      "source_body": "optional longer description (2-3 sentences)",
                       "target": "...", "target_type": "concept",
                       "target_description": "...",
+                      "target_body": "optional longer description (2-3 sentences)",
                       "relation": "depends_on",
                       "is_new_relation": false,
                       "suggested_relation": null,
@@ -5110,11 +5170,12 @@ TEXT:
                 context = triple.get("context", "")
 
                 # Ensure nodes exist
-                for nid, label, ntype, desc_key in [
-                    (source_id, source_label, triple.get("source_type", "concept"), "source_description"),
-                    (target_id, target_label, triple.get("target_type", "concept"), "target_description"),
+                for nid, label, ntype, desc_key, body_key in [
+                    (source_id, source_label, triple.get("source_type", "concept"), "source_description", "source_body"),
+                    (target_id, target_label, triple.get("target_type", "concept"), "target_description", "target_body"),
                 ]:
                     desc = triple.get(desc_key, "").strip()
+                    body = (triple.get(body_key) or "").strip() if triple.get(body_key) else ""
                     if not self.has_node(nid):
                         node_props: dict[str, Any] = {}
                         if desc:
@@ -5125,6 +5186,8 @@ TEXT:
                                 "confidence": conf,
                                 "updated_at": now_iso(),
                             }]
+                        if body:
+                            node_props["body"] = body
                         if ingestion_id:
                             node_props["ingestion_id"] = ingestion_id
                         if content_hash:
@@ -5139,13 +5202,19 @@ TEXT:
                         )
                         stats["nodes_added"] += 1
                     else:
-                        # Node already exists — merge description if available
+                        # Node already exists — merge description and body if available
+                        existing = self._data["nodes"].get(nid, {})
+                        existing.setdefault("properties", {})
                         if desc:
-                            existing = self._data["nodes"].get(nid, {})
-                            existing.setdefault("properties", {})
                             _merge_description(
                                 existing["properties"], desc, doc_id, conf,
                             )
+                        if body and not existing["properties"].get("body"):
+                            existing["properties"]["body"] = body
+                        elif body and existing["properties"].get("body") and len(body) > len(existing["properties"]["body"]):
+                            # Keep the longer body text
+                            existing["properties"]["body"] = body
+                        if desc or body:
                             # Sync networkx
                             self._G.nodes[nid].update(existing)
                             self._dirty = True
@@ -6031,10 +6100,11 @@ TEXT:
             ) -> tuple[int, dict[str, Any], str, str, str, list[dict[str, Any]] | None, str | None, float]:
                 """Run LLM extraction for one section (thread-safe)."""
                 t0 = time.monotonic()
-                prompt = self.build_extraction_prompt(
+                _sys, _usr = self.build_extraction_prompt(
                     section_text,
                     max_triples=max_triples_per_section,
                 )
+                prompt = _sys + "\n\n" + _usr
                 if progress_fn:
                     progress_fn({
                         "event": "section_start",
