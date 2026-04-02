@@ -978,9 +978,19 @@ async def ingest_documents(
                 ingest_thread.start()
 
                 # Stream events in real-time as they arrive from the
-                # ingestion thread.
+                # ingestion thread.  Use a timeout so we can emit
+                # keepalive pings when LLM extraction is slow, which
+                # prevents HTTP proxies / clients from closing the
+                # connection due to inactivity.
+                _KEEPALIVE_SECONDS = 15
                 while True:
-                    ev = event_queue.get()
+                    try:
+                        ev = event_queue.get(timeout=_KEEPALIVE_SECONDS)
+                    except queue.Empty:
+                        # No event yet — send a keepalive to hold the
+                        # connection open.
+                        yield json.dumps({"type": "ping"}) + "\n"
+                        continue
                     if ev is _DONE:
                         break
 
