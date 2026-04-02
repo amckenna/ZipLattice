@@ -8814,8 +8814,9 @@ def _salvage_truncated_json(raw: str) -> list[dict[str, Any]] | None:
     """Try to recover complete objects from a truncated JSON array.
 
     When the LLM hits its token limit the JSON is cut off mid-object,
-    e.g. ``[{...}, {... <eof>``. This finds the last complete object
-    boundary and closes the array so the valid prefix can be parsed.
+    e.g. ``[{...}, {... <eof>``. This iterates backwards through ``}``
+    positions to find the rightmost one that yields a valid JSON array,
+    recovering as many complete objects as possible.
 
     Also handles dict-wrapped arrays (e.g. ``{"entities": [{...}, {... <eof>``).
     In that case, the inner array is located and salvaged.
@@ -8835,22 +8836,27 @@ def _salvage_truncated_json(raw: str) -> list[dict[str, Any]] | None:
     if not stripped.startswith("["):
         return None
 
-    # Walk backwards from the end to find the last '}' that could
-    # close a complete object inside the top-level array.
-    last_brace = raw.rfind("}")
-    if last_brace == -1:
-        return None
+    # Walk backwards from the end trying each '}' as a potential
+    # object boundary.  The first (rightmost) '}' that yields a valid
+    # JSON array wins.  This handles cases where the truncated tail
+    # object contains '}' characters (e.g. in string values) that
+    # don't form a valid object boundary.
+    search_from = len(raw)
+    while True:
+        last_brace = raw.rfind("}", 0, search_from)
+        if last_brace == -1:
+            return None
 
-    # Close the array right after that brace
-    candidate = raw[: last_brace + 1].rstrip().rstrip(",") + "]"
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
+        candidate = raw[: last_brace + 1].rstrip().rstrip(",") + "]"
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            search_from = last_brace
+            continue
 
-    if isinstance(parsed, list) and all(isinstance(o, dict) for o in parsed):
-        return parsed
-    return None
+        if isinstance(parsed, list) and all(isinstance(o, dict) for o in parsed):
+            return parsed
+        search_from = last_brace
 
 
 # ---------------------------------------------------------------------------
