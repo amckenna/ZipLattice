@@ -1976,6 +1976,54 @@ class KnowledgeGraph:
             self.save_embeddings()
 
     # ------------------------------------------------------------------
+    # Checkpoint management (for ingestion resume)
+    # ------------------------------------------------------------------
+
+    @property
+    def checkpoint_path(self) -> Path:
+        """Path to the ingestion checkpoint file."""
+        return self.graph_path.with_name(
+            f"{self.graph_path.stem}_checkpoint.json"
+        )
+
+    def save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Save an ingestion checkpoint to disk.
+
+        The checkpoint captures enough state to resume a partially
+        completed ``ingest_markdown`` call.  It is written atomically
+        (write-to-temp then rename) so a crash mid-write won't corrupt
+        the file.
+        """
+        path = self.checkpoint_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(checkpoint, f, indent=2, cls=GraphEncoder)
+        tmp.replace(path)
+        logger.debug("Saved checkpoint to %s", path)
+
+    def load_checkpoint(self) -> dict[str, Any] | None:
+        """Load an existing checkpoint, or return None."""
+        path = self.checkpoint_path
+        if not path.exists():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Corrupt checkpoint file %s: %s", path, exc)
+            return None
+
+    def clear_checkpoint(self) -> bool:
+        """Remove the checkpoint file.  Returns True if a file was removed."""
+        path = self.checkpoint_path
+        if path.exists():
+            path.unlink()
+            logger.debug("Cleared checkpoint %s", path)
+            return True
+        return False
+
+    # ------------------------------------------------------------------
     # Source file management
     # ------------------------------------------------------------------
 
@@ -5607,6 +5655,7 @@ TEXT:
         progress_fn: Callable[[dict[str, Any]], None] | None = None,
         parallel_extractions: int = 1,
         incremental: bool = False,
+        checkpoint: bool = False,
     ) -> dict[str, Any]:
         """
         Ingest a markdown document with structure-aware chunking.
@@ -5636,6 +5685,13 @@ TEXT:
                              embed_nodes() to build high-quality section embeddings.
                              Increases JSON file size but produces much better
                              embeddings. Set False to keep the file lean.
+            checkpoint: If True, save a checkpoint file after each section's
+                        LLM extraction completes. On a subsequent call with
+                        the same ``doc_id`` and document content, sections
+                        already in the checkpoint are skipped (their triples
+                        are replayed from the checkpoint instead of calling
+                        the LLM again). The checkpoint is cleared on
+                        successful completion.
             preserve_source: Copy the original markdown into the managed
                              sources directory for later reference. Uses
                              content-hashing for deduplication.
@@ -5763,6 +5819,42 @@ TEXT:
 
         aggregate_stats["ingestion_id"] = ingestion_id
         aggregate_stats["content_hash"] = source_content_hash
+
+        # ── Checkpoint resume: load previous progress ─────────────
+        # When checkpoint=True, we look for an existing checkpoint file
+        # matching this doc_id and content hash.  Completed sections
+        # stored in the checkpoint will have their triples replayed
+        # (bypassing the LLM) while new sections go through normal
+        # extraction.
+        _ckpt_data: dict[str, Any] | None = None
+        _ckpt_completed: dict[str, list[dict[str, Any]]] = {}
+        _ckpt_section_stats: dict[str, dict[str, Any]] = {}
+        _sections_resumed = 0
+        if checkpoint:
+            _ckpt_data = self.load_checkpoint()
+            if _ckpt_data is not None:
+                if (_ckpt_data.get("doc_id") == doc_id
+                        and _ckpt_data.get("content_hash") == source_content_hash):
+                    _ckpt_completed = _ckpt_data.get("completed_sections", {})
+                    _ckpt_section_stats = _ckpt_data.get("section_stats", {})
+                    logger.info(
+                        "[%s] Resuming from checkpoint: %d sections already completed",
+                        doc_id, len(_ckpt_completed),
+                    )
+                    if progress_fn:
+                        progress_fn({
+                            "event": "checkpoint_resume",
+                            "doc_id": doc_id,
+                            "completed_sections": len(_ckpt_completed),
+                            "completed_headings": sorted(_ckpt_completed.keys()),
+                        })
+                else:
+                    # Checkpoint is for a different doc or version — discard
+                    logger.info(
+                        "[%s] Discarding stale checkpoint (doc_id/hash mismatch)",
+                        doc_id,
+                    )
+                    _ckpt_data = None
 
         # ── Incremental ingestion: determine unchanged sections ───
         # When incremental=True and we have a previous version with section
@@ -5965,6 +6057,43 @@ TEXT:
                 continue
 
             section_text = context_prefix + body
+
+            # Checkpoint resume: skip sections already completed in a
+            # previous (interrupted) run.  The graph state was persisted
+            # after each section, so the data is already in the graph.
+            if _ckpt_completed and heading in _ckpt_completed:
+                _sections_resumed += 1
+                saved_stats = _ckpt_section_stats.get(heading, {})
+                logger.info(
+                    "[%s] [%d/%d] Skipping '%s' (completed in checkpoint)",
+                    doc_id, i + 1, len(sections), heading,
+                )
+                if progress_fn:
+                    progress_fn({
+                        "event": "section_resume",
+                        "index": i,
+                        "total": len(sections),
+                        "heading": heading,
+                        "triples": saved_stats.get("triples_processed", 0),
+                    })
+                # Accumulate the saved stats into aggregate totals
+                for _stat_key in ("triples_processed", "nodes_added",
+                                  "nodes_updated", "edges_added",
+                                  "edges_updated", "proposals_created",
+                                  "proposals_augmented"):
+                    _agg_key = f"total_{_stat_key}" if _stat_key != "triples_processed" else "total_triples"
+                    aggregate_stats[_agg_key] += saved_stats.get(_stat_key, 0)
+                section_record = {
+                    "heading": heading,
+                    "char_count": section["char_count"],
+                    "elapsed_seconds": 0.0,
+                    "resumed": True,
+                    **{k: v for k, v in saved_stats.items() if k != "errors"},
+                    "errors": [],
+                }
+                aggregate_stats["sections"].append(section_record)
+                continue
+
             extractable.append((i, section, section_slug, section_text, heading))
 
         # ── Phase 2: LLM extraction + graph writes ────────────────
@@ -5974,6 +6103,7 @@ TEXT:
             idx: int, section: dict[str, Any], section_slug: str,
             section_text: str, heading: str, section_stats: dict[str, Any],
             elapsed: float,
+            triples_for_ckpt: list[dict[str, Any]] | None = None,
         ) -> None:
             """Apply extraction results to the graph (serial)."""
             nonlocal _extraction_seconds
@@ -6037,6 +6167,24 @@ TEXT:
                     "errors": section_stats["errors"],
                 })
 
+            # Save checkpoint after each successfully processed section
+            if checkpoint and triples_for_ckpt is not None:
+                _ckpt_completed[heading] = triples_for_ckpt
+                _ckpt_section_stats[heading] = {
+                    k: v for k, v in section_stats.items()
+                    if k != "errors"
+                }
+                self.save_checkpoint({
+                    "doc_id": doc_id,
+                    "content_hash": source_content_hash,
+                    "ingestion_id": ingestion_id,
+                    "completed_sections": _ckpt_completed,
+                    "section_stats": _ckpt_section_stats,
+                    "updated": now_iso(),
+                })
+                # Also persist graph state so checkpoint + graph are consistent
+                self.save()
+
         _parallel = max(1, parallel_extractions)
 
         if _parallel <= 1:
@@ -6084,8 +6232,10 @@ TEXT:
                     progress_fn=_section_pfn,
                 )
                 elapsed = time.monotonic() - t0
+
                 _write_section(idx, section, section_slug, section_text, heading,
-                               section_stats, elapsed)
+                               section_stats, elapsed,
+                               [] if checkpoint else None)
 
         else:
             # ── Parallel extraction, serial graph writes ───────
@@ -6175,7 +6325,8 @@ TEXT:
                         )
 
                     _write_section(idx, section, section_slug, section_text,
-                                   heading, section_stats, elapsed)
+                                   heading, section_stats, elapsed,
+                                   [] if checkpoint else None)
 
         # Add links found in the document as lightweight reference edges
         all_links: list[dict[str, str]] = []
@@ -6194,13 +6345,35 @@ TEXT:
                     {"text": text, "url": url} for url, text in unique_urls.items()
                 ]
 
+        # Record checkpoint resume stats
+        if _sections_resumed:
+            aggregate_stats["sections_resumed"] = _sections_resumed
+
+        # Clear checkpoint on successful completion
+        if checkpoint:
+            self.clear_checkpoint()
+            logger.info("[%s] Checkpoint cleared (ingestion complete)", doc_id)
+
         # Compute timing metrics
         _total_elapsed = time.monotonic() - _ingest_t0
         aggregate_stats["elapsed_seconds"] = round(_total_elapsed, 1)
         aggregate_stats["extraction_seconds"] = round(_extraction_seconds, 1)
 
         _skipped_inc = aggregate_stats["sections_skipped_incremental"]
-        if _skipped_inc:
+        if _sections_resumed:
+            logger.info(
+                "Markdown ingest '%s': %d sections (%d resumed from checkpoint), "
+                "%d triples → %d nodes added (%d updated), "
+                "%d edges added (%d updated) [%.1fs total, %.1fs extraction]",
+                doc_id, aggregate_stats["total_sections"], _sections_resumed,
+                aggregate_stats["total_triples"],
+                aggregate_stats["total_nodes_added"],
+                aggregate_stats["total_nodes_updated"],
+                aggregate_stats["total_edges_added"],
+                aggregate_stats["total_edges_updated"],
+                _total_elapsed, _extraction_seconds,
+            )
+        elif _skipped_inc:
             logger.info(
                 "Markdown ingest '%s': %d sections (%d skipped, incremental), "
                 "%d triples → %d nodes added (%d updated), "
@@ -6234,6 +6407,7 @@ TEXT:
                 "doc_id": doc_id,
                 "total_sections": aggregate_stats["total_sections"],
                 "sections_skipped_incremental": _skipped_inc,
+                "sections_resumed": _sections_resumed,
                 "total_triples": aggregate_stats["total_triples"],
                 "total_nodes_added": aggregate_stats["total_nodes_added"],
                 "total_nodes_updated": aggregate_stats["total_nodes_updated"],
@@ -8814,8 +8988,9 @@ def _salvage_truncated_json(raw: str) -> list[dict[str, Any]] | None:
     """Try to recover complete objects from a truncated JSON array.
 
     When the LLM hits its token limit the JSON is cut off mid-object,
-    e.g. ``[{...}, {... <eof>``. This finds the last complete object
-    boundary and closes the array so the valid prefix can be parsed.
+    e.g. ``[{...}, {... <eof>``. This iterates backwards through ``}``
+    positions to find the rightmost one that yields a valid JSON array,
+    recovering as many complete objects as possible.
 
     Also handles dict-wrapped arrays (e.g. ``{"entities": [{...}, {... <eof>``).
     In that case, the inner array is located and salvaged.
@@ -8835,22 +9010,27 @@ def _salvage_truncated_json(raw: str) -> list[dict[str, Any]] | None:
     if not stripped.startswith("["):
         return None
 
-    # Walk backwards from the end to find the last '}' that could
-    # close a complete object inside the top-level array.
-    last_brace = raw.rfind("}")
-    if last_brace == -1:
-        return None
+    # Walk backwards from the end trying each '}' as a potential
+    # object boundary.  The first (rightmost) '}' that yields a valid
+    # JSON array wins.  This handles cases where the truncated tail
+    # object contains '}' characters (e.g. in string values) that
+    # don't form a valid object boundary.
+    search_from = len(raw)
+    while True:
+        last_brace = raw.rfind("}", 0, search_from)
+        if last_brace == -1:
+            return None
 
-    # Close the array right after that brace
-    candidate = raw[: last_brace + 1].rstrip().rstrip(",") + "]"
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
+        candidate = raw[: last_brace + 1].rstrip().rstrip(",") + "]"
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            search_from = last_brace
+            continue
 
-    if isinstance(parsed, list) and all(isinstance(o, dict) for o in parsed):
-        return parsed
-    return None
+        if isinstance(parsed, list) and all(isinstance(o, dict) for o in parsed):
+            return parsed
+        search_from = last_brace
 
 
 # ---------------------------------------------------------------------------
@@ -8961,6 +9141,15 @@ def _make_progress_callback(
                         print(f"         ... and {len(errors) - 5} more")
             else:
                 print(f" {triples} triples → {result_str} ({elapsed}s)")
+        elif ev == "checkpoint_resume":
+            n = event.get("completed_sections", 0)
+            print(f"  Resuming from checkpoint: {n} sections already completed")
+            if verbose:
+                for h in event.get("completed_headings", [])[:10]:
+                    print(f"    completed: {h}")
+        elif ev == "section_resume":
+            triples = event.get("triples", 0)
+            print(f"  {tag} Resume: \"{heading}\" ({triples} triples from checkpoint)")
         elif ev == "incremental_skip_plan":
             unchanged = event.get("unchanged_sections", [])
             changed = event.get("changed_sections", [])
@@ -9020,8 +9209,14 @@ def _print_file_summary(
     print(f"\nIngested: {md_path.name}")
     print(f"  Document ID: {stats['doc_id']}")
     _skipped_inc = stats.get("sections_skipped_incremental", 0)
+    _resumed = stats.get("sections_resumed", 0)
+    _section_notes: list[str] = []
     if _skipped_inc:
-        print(f"  Sections: {stats['total_sections']} ({_skipped_inc} skipped, unchanged)")
+        _section_notes.append(f"{_skipped_inc} skipped, unchanged")
+    if _resumed:
+        _section_notes.append(f"{_resumed} resumed from checkpoint")
+    if _section_notes:
+        print(f"  Sections: {stats['total_sections']} ({', '.join(_section_notes)})")
     else:
         print(f"  Sections: {stats['total_sections']}")
     print(f"  Triples extracted: {stats['total_triples']}")
@@ -9159,6 +9354,13 @@ def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
         print(f"  Parallel extractions: {args.parallel} threads")
     if args.incremental and not _quiet:
         print("  Incremental mode: unchanged sections will skip LLM extraction")
+    if args.checkpoint and not _quiet:
+        ckpt = kg.load_checkpoint()
+        if ckpt and ckpt.get("doc_id"):
+            _n_done = len(ckpt.get("completed_sections", {}))
+            print(f"  Checkpoint found: {_n_done} sections completed for '{ckpt['doc_id']}'")
+        else:
+            print("  Checkpoint mode: progress will be saved after each section")
 
     _progress = _make_progress_callback(quiet=_quiet, verbose=_verbose)
 
@@ -9208,6 +9410,7 @@ def _cmd_ingest_md(args: Any, kg: "KnowledgeGraph") -> None:
             progress_fn=_progress,
             parallel_extractions=args.parallel,
             incremental=args.incremental,
+            checkpoint=args.checkpoint,
         )
         _total_elapsed = time.monotonic() - _ingest_t0
 
@@ -9423,6 +9626,12 @@ def main() -> None:
                              "ingestion. Uses section-level content hashes to detect changes. "
                              "Structural nodes/edges are always updated. Dramatically reduces "
                              "LLM calls when re-ingesting documents with minor edits.")
+    parser.add_argument("--checkpoint", action="store_true",
+                        help="Enable checkpoint and resume for ingestion. Saves progress "
+                             "after each section so that if the process is interrupted "
+                             "(e.g. model server crash), re-running the same command "
+                             "automatically resumes from where it left off. The checkpoint "
+                             "is cleared on successful completion.")
     parser.add_argument("--temperature", type=float, default=None, metavar="T",
                         help="Sampling temperature for LLM extraction (0.0–2.0, default 0.1). "
                              "Lower values produce more deterministic output; higher values "

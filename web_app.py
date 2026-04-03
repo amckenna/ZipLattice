@@ -848,11 +848,13 @@ async def ingest_documents(
     incremental: str = Form(""),
     temperature: str = Form("0.1"),
     no_think: str = Form(""),
+    checkpoint_mode: str = Form(""),
 ) -> Response:
     """Run LLM ingestion with streaming progress log."""
     _verbose = verbose.strip() == "1"
     _incremental = incremental.strip() == "1"
     _no_think = no_think.strip() == "1"
+    _checkpoint = checkpoint_mode.strip() == "1"
     try:
         _parallel = max(1, int(parallel.strip() or "1"))
     except (ValueError, TypeError):
@@ -967,6 +969,7 @@ async def ingest_documents(
                             progress_fn=_capture_progress,
                             parallel_extractions=_parallel,
                             incremental=_incremental,
+                            checkpoint=_checkpoint,
                         )
                         ingest_result.update(stats)
                     except Exception as exc:

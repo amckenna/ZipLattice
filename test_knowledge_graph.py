@@ -2703,3 +2703,130 @@ def test_query_parse_error(tmp_path):
     kg = _make_query_graph(tmp_path)
     with pytest.raises(QueryParseError):
         kg.graph_query("this is not a valid query")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint and resume
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_save_load_clear(tmp_path):
+    """save_checkpoint / load_checkpoint / clear_checkpoint round-trip."""
+    kg = KnowledgeGraph(tmp_path / "ck.json")
+    assert kg.load_checkpoint() is None
+
+    data = {"doc_id": "doc1", "content_hash": "abc123", "completed_sections": {"Intro": []}}
+    kg.save_checkpoint(data)
+    loaded = kg.load_checkpoint()
+    assert loaded is not None
+    assert loaded["doc_id"] == "doc1"
+    assert "Intro" in loaded["completed_sections"]
+
+    assert kg.clear_checkpoint() is True
+    assert kg.load_checkpoint() is None
+    assert kg.clear_checkpoint() is False
+
+
+def test_checkpoint_corrupt_file(tmp_path):
+    """load_checkpoint handles corrupt files gracefully."""
+    kg = KnowledgeGraph(tmp_path / "ck.json")
+    kg.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    kg.checkpoint_path.write_text("NOT JSON", encoding="utf-8")
+    assert kg.load_checkpoint() is None
+
+
+def test_checkpoint_full_ingestion(tmp_path):
+    """checkpoint=True saves checkpoints and clears on completion."""
+    kg = KnowledgeGraph(tmp_path / "ck.json")
+
+    call_count = 0
+
+    def mock_extract(prompt):
+        nonlocal call_count
+        call_count += 1
+        return [
+            {"source": "Radar", "target": "Radio waves",
+             "relation": "uses", "confidence": 0.9,
+             "context": "Radar uses radio waves."},
+        ]
+
+    md = _long_section("Basics", "Radar uses radio waves for detection and ranging.")
+    stats = kg.ingest_markdown(md, "doc1", llm_extract_fn=mock_extract, checkpoint=True)
+
+    assert stats["total_triples"] > 0
+    assert call_count == 1
+    # Checkpoint should be cleared on success
+    assert kg.load_checkpoint() is None
+
+
+def test_checkpoint_resume_skips_completed(tmp_path):
+    """Sections completed in a checkpoint are skipped on resume."""
+    kg = KnowledgeGraph(tmp_path / "ck.json")
+
+    call_count = 0
+
+    def mock_extract(prompt):
+        nonlocal call_count
+        call_count += 1
+        return [
+            {"source": "Radar", "target": "Radio waves",
+             "relation": "uses", "confidence": 0.9,
+             "context": "Radar uses radio waves."},
+        ]
+
+    md = (_long_section("Intro", "Radar uses radio waves for detection.")
+          + "\n" + _long_section("Details", "Details about radar systems and antennas."))
+
+    # First ingestion — completes fully
+    stats1 = kg.ingest_markdown(md, "doc1", llm_extract_fn=mock_extract, checkpoint=True)
+    first_count = call_count
+    assert first_count == 2  # Both sections extracted
+    assert kg.load_checkpoint() is None  # cleared
+
+    # Simulate a partially completed ingestion by manually writing a checkpoint
+    from knowledge_graph import content_hash
+    chash = content_hash(md)
+    kg.save_checkpoint({
+        "doc_id": "doc1",
+        "content_hash": chash,
+        "completed_sections": {"Intro": []},
+        "section_stats": {
+            "Intro": {
+                "triples_processed": 1, "nodes_added": 2, "nodes_updated": 0,
+                "edges_added": 1, "edges_updated": 0,
+                "proposals_created": 0, "proposals_augmented": 0,
+            },
+        },
+    })
+
+    # Second ingestion with checkpoint — should skip "Intro", only extract "Details"
+    call_count = 0
+    stats2 = kg.ingest_markdown(md, "doc1", llm_extract_fn=mock_extract, checkpoint=True)
+
+    assert call_count == 1  # Only "Details" was extracted
+    assert stats2.get("sections_resumed", 0) == 1
+    assert kg.load_checkpoint() is None  # cleared after success
+
+
+def test_checkpoint_stale_discarded(tmp_path):
+    """A checkpoint for a different doc/hash is discarded."""
+    kg = KnowledgeGraph(tmp_path / "ck.json")
+
+    def mock_extract(prompt):
+        return [{"source": "A", "target": "B", "relation": "related_to",
+                 "confidence": 0.8, "context": "A relates to B."}]
+
+    # Write a checkpoint for a different document
+    kg.save_checkpoint({
+        "doc_id": "other-doc",
+        "content_hash": "different",
+        "completed_sections": {"Intro": []},
+        "section_stats": {},
+    })
+
+    md = _long_section("Basics", "Information about basics of this topic.")
+    stats = kg.ingest_markdown(md, "doc1", llm_extract_fn=mock_extract, checkpoint=True)
+
+    # Should proceed normally (stale checkpoint discarded)
+    assert stats["total_triples"] > 0
+    assert stats.get("sections_resumed", 0) == 0
