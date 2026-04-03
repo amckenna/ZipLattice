@@ -16,11 +16,11 @@ Run with::
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
 import os
-import queue
 import re
 import shutil
 import tempfile
@@ -33,7 +33,7 @@ import zipfile
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
@@ -891,7 +891,7 @@ async def ingest_documents(
         logger.info("[ingest %s] %s", graph_name, msg)
         return json.dumps({"type": "log", "message": msg}) + "\n"
 
-    def _stream() -> Generator[str, None, None]:
+    async def _stream() -> AsyncGenerator[str, None]:
       # Attach a log-capture handler to surface knowledge_graph logs in verbose mode
       kg_logger = logging.getLogger("knowledge_graph")
       capture_handler: _LogCaptureHandler | None = None
@@ -903,12 +903,11 @@ async def ingest_documents(
           kg_logger.setLevel(logging.DEBUG)
           kg_logger.addHandler(capture_handler)
 
-      def _drain_captured() -> Generator[str, None, None]:
-          """Yield any captured knowledge_graph log messages."""
+      def _drain_captured_lines() -> list[str]:
+          """Return any captured knowledge_graph log messages as a list."""
           if capture_handler is None:
-              return
-          for msg in capture_handler.drain():
-              yield _log(f"  [kg] {msg}")
+              return []
+          return [_log(f"  [kg] {msg}") for msg in capture_handler.drain()]
 
       try:
         _model = extract_model.strip() or query_model
@@ -938,6 +937,7 @@ async def ingest_documents(
 
         # Sentinel value to signal ingestion thread completion
         _DONE = object()
+        loop = asyncio.get_running_loop()
 
         for di, doc in enumerate(batch):
             doc_tokens = len(doc.get("text", "")) // 4
@@ -947,15 +947,15 @@ async def ingest_documents(
                 yield _log(f"[{di + 1}/{total_docs}] Ingesting '{doc['doc_id']}'...")
 
             try:
-                # Use a queue so progress events stream in real-time
-                # instead of being batched until ingest_markdown returns.
-                event_queue: queue.Queue = queue.Queue()
+                # Use an asyncio queue so progress events stream in
+                # real-time without blocking the event loop thread pool.
+                event_queue: asyncio.Queue = asyncio.Queue()
 
                 def _capture_progress(event: dict) -> None:
-                    event_queue.put(event)
+                    loop.call_soon_threadsafe(event_queue.put_nowait, event)
 
-                # Run ingestion in a background thread so the generator
-                # can yield log lines as events arrive.
+                # Run ingestion in a background thread so the async
+                # generator can yield log lines as events arrive.
                 ingest_result: dict = {}
                 ingest_error: list = []
 
@@ -975,7 +975,7 @@ async def ingest_documents(
                     except Exception as exc:
                         ingest_error.append(exc)
                     finally:
-                        event_queue.put(_DONE)
+                        loop.call_soon_threadsafe(event_queue.put_nowait, _DONE)
 
                 ingest_thread = threading.Thread(target=_run_ingest, daemon=True)
                 ingest_thread.start()
@@ -988,8 +988,10 @@ async def ingest_documents(
                 _KEEPALIVE_SECONDS = 15
                 while True:
                     try:
-                        ev = event_queue.get(timeout=_KEEPALIVE_SECONDS)
-                    except queue.Empty:
+                        ev = await asyncio.wait_for(
+                            event_queue.get(), timeout=_KEEPALIVE_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
                         # No event yet — send a keepalive to hold the
                         # connection open.
                         yield json.dumps({"type": "ping"}) + "\n"
@@ -998,17 +1000,21 @@ async def ingest_documents(
                         break
 
                     # Drain any captured knowledge_graph debug logs
-                    yield from _drain_captured()
+                    for line in _drain_captured_lines():
+                        yield line
 
                     formatted = _format_ingest_event(ev, verbose=_verbose)
                     if formatted:
                         for line in formatted.split("\n"):
                             yield _log(line)
 
-                ingest_thread.join()
+                # Wait for thread to fully finish (should be immediate
+                # since _DONE was already received).
+                await asyncio.to_thread(ingest_thread.join)
 
                 # Drain any remaining captured logs after thread completes
-                yield from _drain_captured()
+                for line in _drain_captured_lines():
+                    yield line
 
                 # Re-raise ingestion errors
                 if ingest_error:
@@ -1089,7 +1095,9 @@ async def ingest_documents(
             efn = _build_embed_fn(embed_model, _embed_url,
                                  provider=provider, bedrock_region=bedrock_region,
                                  bedrock_profile=bedrock_profile)
-            embed_stats = kg.embed_nodes(efn, skip_existing=True, model_name=embed_model)
+            embed_stats = await asyncio.to_thread(
+                kg.embed_nodes, efn, skip_existing=True, model_name=embed_model,
+            )
             embed_count = embed_stats.get("nodes_embedded", 0)
             # Save embeddings immediately so they survive client disconnects
             kg.save_embeddings()
@@ -1101,7 +1109,8 @@ async def ingest_documents(
         except Exception as exc:
             logger.error("Embedding failed for graph '%s': %s", graph_name, exc)
             yield _log(f"  embedding failed: {exc}")
-        yield from _drain_captured()
+        for line in _drain_captured_lines():
+            yield line
 
         try:
             kg.save()

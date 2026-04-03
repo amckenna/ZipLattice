@@ -396,6 +396,14 @@
       }
     } catch(err) {
       logContent.textContent += 'Network error: ' + err.message + '\n';
+      logContent.textContent += 'The server may still be processing — data is saved after each document.\n';
+      logContent.textContent += 'Check the graph detail page to see what was ingested.\n';
+      if (resultDiv) {
+        resultDiv.innerHTML = '<p class="mt-2 text-sm">'
+          + 'Connection lost during ingestion. The server saves progress after each document, '
+          + 'so partial results are preserved. '
+          + '<a href="/graphs/{{ graph_name }}" class="underline font-medium">View graph &rarr;</a></p>';
+      }
     }
 
     btn.disabled = false;
