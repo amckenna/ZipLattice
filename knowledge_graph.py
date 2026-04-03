@@ -5900,6 +5900,12 @@ TEXT:
             aggregate_stats["errors"].append("No sections found in markdown.")
             return aggregate_stats
 
+        # Compute per-section estimated tokens (chars // 4 heuristic)
+        _section_estimated_tokens: list[int] = []
+        for _sec in sections:
+            _section_estimated_tokens.append(_sec["char_count"] // 4)
+        _total_estimated_tokens = sum(_section_estimated_tokens)
+
         # Notify progress callback of document ingestion start
         if progress_fn:
             progress_fn({
@@ -5907,6 +5913,8 @@ TEXT:
                 "doc_id": doc_id,
                 "total_sections": len(sections),
                 "char_count": len(text),
+                "estimated_tokens": _total_estimated_tokens,
+                "section_estimated_tokens": _section_estimated_tokens,
             })
 
         doc_slug = slugify(doc_id)
@@ -6129,9 +6137,13 @@ TEXT:
             aggregate_stats["total_edges_updated"] += section_stats["edges_updated"]
             aggregate_stats["total_proposals_created"] += section_stats["proposals_created"]
             aggregate_stats["total_proposals_augmented"] += section_stats["proposals_augmented"]
+            _sec_est_tok = section["char_count"] // 4
+            _sec_tok_per_sec = round(_sec_est_tok / elapsed, 1) if elapsed > 0 else 0
             section_record = {
                 "heading": heading,
                 "char_count": section["char_count"],
+                "estimated_tokens": _sec_est_tok,
+                "tokens_per_second": _sec_tok_per_sec,
                 "elapsed_seconds": round(elapsed, 1),
                 **section_stats,
             }
@@ -6150,12 +6162,16 @@ TEXT:
             )
 
             if progress_fn:
+                _est_tok = section["char_count"] // 4
+                _tok_per_sec = round(_est_tok / elapsed, 1) if elapsed > 0 else 0
                 progress_fn({
                     "event": "section_done",
                     "index": idx,
                     "total": len(sections),
                     "heading": heading,
                     "char_count": section["char_count"],
+                    "estimated_tokens": _est_tok,
+                    "tokens_per_second": _tok_per_sec,
                     "elapsed_seconds": round(elapsed, 1),
                     "triples": section_stats["triples_processed"],
                     "nodes_added": section_stats["nodes_added"],
@@ -6195,6 +6211,7 @@ TEXT:
                     doc_id, idx + 1, len(sections), heading,
                     f"{section['char_count']:,}",
                 )
+                _est_tokens = section["char_count"] // 4
                 if progress_fn:
                     progress_fn({
                         "event": "section_start",
@@ -6202,6 +6219,7 @@ TEXT:
                         "total": len(sections),
                         "heading": heading,
                         "char_count": section["char_count"],
+                        "estimated_tokens": _est_tokens,
                     })
 
                 t0 = time.monotonic()
@@ -6262,6 +6280,7 @@ TEXT:
                         "total": len(sections),
                         "heading": heading,
                         "char_count": section["char_count"],
+                        "estimated_tokens": section["char_count"] // 4,
                     })
                 try:
                     triples = llm_extract_fn(prompt)
@@ -6401,6 +6420,13 @@ TEXT:
             )
 
         # Notify progress callback of document ingestion completion
+        _doc_total_tokens = _total_estimated_tokens
+        _doc_tok_per_sec = (
+            round(_doc_total_tokens / _extraction_seconds, 1)
+            if _extraction_seconds > 0 else 0
+        )
+        aggregate_stats["estimated_tokens"] = _doc_total_tokens
+        aggregate_stats["tokens_per_second"] = _doc_tok_per_sec
         if progress_fn:
             progress_fn({
                 "event": "doc_done",
@@ -6417,6 +6443,8 @@ TEXT:
                 "total_proposals_augmented": aggregate_stats["total_proposals_augmented"],
                 "elapsed_seconds": aggregate_stats["elapsed_seconds"],
                 "extraction_seconds": aggregate_stats["extraction_seconds"],
+                "estimated_tokens": _doc_total_tokens,
+                "tokens_per_second": _doc_tok_per_sec,
             })
 
         # Compute diff from pre-ingestion snapshot
@@ -9078,7 +9106,32 @@ def _cmd_preview_md(args: Any, kg: "KnowledgeGraph") -> None:
 def _make_progress_callback(
     *, quiet: bool, verbose: bool,
 ) -> Callable[[dict[str, Any]], None]:
-    """Build the CLI progress callback for ingestion and embedding events."""
+    """Build the CLI progress callback for ingestion and embedding events.
+
+    Includes a visual progress bar, estimated token counts per section,
+    and tokens-per-second throughput for each extraction step.
+    """
+
+    # Mutable state shared across callback invocations
+    _state: dict[str, Any] = {
+        "total_sections": 0,
+        "extractable_sections": 0,
+        "sections_done": 0,           # completed (extracted, skipped, resumed)
+        "total_estimated_tokens": 0,
+        "tokens_processed": 0,        # tokens from completed sections
+        "extraction_start": 0.0,      # monotonic time for throughput
+        "cumulative_extraction_secs": 0.0,
+    }
+
+    def _bar(done: int, total: int, width: int = 30) -> str:
+        """Render a text progress bar: [=====>          ] 3/12"""
+        if total <= 0:
+            return ""
+        frac = min(done / total, 1.0)
+        filled = int(width * frac)
+        arrow = ">" if filled < width and done < total else ""
+        bar = "=" * max(filled - len(arrow), 0) + arrow
+        return f"[{bar:<{width}}] {done}/{total}"
 
     def _progress(event: dict[str, Any]) -> None:
         if quiet:
@@ -9094,11 +9147,21 @@ def _make_progress_callback(
             doc = event.get("doc_id", "?")
             secs = event.get("total_sections", 0)
             ccount = event.get("char_count", 0)
-            print(f"  Document: \"{doc}\" ({ccount:,} chars, {secs} sections)")
+            est_tok = event.get("estimated_tokens", 0)
+            _state["total_sections"] = secs
+            _state["sections_done"] = 0
+            _state["total_estimated_tokens"] = est_tok
+            _state["tokens_processed"] = 0
+            _state["cumulative_extraction_secs"] = 0.0
+            _state["extraction_start"] = time.monotonic()
+            print(f"  Document: \"{doc}\" ({ccount:,} chars, {secs} sections, ~{est_tok:,} tokens)")
         elif ev == "section_skip":
-            print(f"  {tag} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
+            _state["sections_done"] += 1
+            bar = _bar(_state["sections_done"], _state["total_sections"])
+            print(f"  {bar} Skip: \"{heading}\" ({chars:,} chars, {event.get('reason', 'skipped')})")
         elif ev == "section_start":
-            print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars)...", end="", flush=True)
+            est_tok = event.get("estimated_tokens", chars // 4)
+            print(f"  {tag} Extracting: \"{heading}\" ({chars:,} chars, ~{est_tok:,} tok)...", end="", flush=True)
         elif ev == "extraction_done":
             n = event.get("triples_returned", 0)
             if verbose:
@@ -9112,11 +9175,19 @@ def _make_progress_callback(
         elif ev == "section_done":
             elapsed = event.get("elapsed_seconds", 0)
             triples = event.get("triples", 0)
+            est_tok = event.get("estimated_tokens", chars // 4)
+            tok_per_sec = event.get("tokens_per_second", 0)
             nodes_added = event.get("nodes_added", 0)
             nodes_updated = event.get("nodes_updated", 0)
             edges_added = event.get("edges_added", 0)
             edges_updated = event.get("edges_updated", 0)
             errors = event.get("errors", [])
+
+            # Update running totals
+            _state["sections_done"] += 1
+            _state["tokens_processed"] += est_tok
+            _state["cumulative_extraction_secs"] += elapsed
+
             parts = []
             if nodes_added:
                 parts.append(f"{nodes_added} new")
@@ -9132,15 +9203,28 @@ def _make_progress_callback(
             result_str = node_summary
             if edge_summary:
                 result_str += f", {edge_summary}"
+
+            tok_info = f", ~{tok_per_sec:,.0f} tok/s" if tok_per_sec else ""
             if errors:
-                print(f" {triples} triples → {result_str} ({len(errors)} errors, {elapsed}s)")
+                print(f" {triples} triples → {result_str} ({len(errors)} errors, {elapsed}s{tok_info})")
                 if verbose:
                     for err in errors[:5]:
                         print(f"         {err}")
                     if len(errors) > 5:
                         print(f"         ... and {len(errors) - 5} more")
             else:
-                print(f" {triples} triples → {result_str} ({elapsed}s)")
+                print(f" {triples} triples → {result_str} ({elapsed}s{tok_info})")
+
+            # Print progress bar after section result
+            bar = _bar(_state["sections_done"], _state["total_sections"])
+            avg_tok_s = (
+                round(_state["tokens_processed"] / _state["cumulative_extraction_secs"], 1)
+                if _state["cumulative_extraction_secs"] > 0 else 0
+            )
+            avg_info = f" avg ~{avg_tok_s:,.0f} tok/s" if avg_tok_s else ""
+            tok_done = _state["tokens_processed"]
+            tok_total = _state["total_estimated_tokens"]
+            print(f"  {bar} ~{tok_done:,}/{tok_total:,} tokens{avg_info}")
         elif ev == "checkpoint_resume":
             n = event.get("completed_sections", 0)
             print(f"  Resuming from checkpoint: {n} sections already completed")
@@ -9148,8 +9232,10 @@ def _make_progress_callback(
                 for h in event.get("completed_headings", [])[:10]:
                     print(f"    completed: {h}")
         elif ev == "section_resume":
+            _state["sections_done"] += 1
             triples = event.get("triples", 0)
-            print(f"  {tag} Resume: \"{heading}\" ({triples} triples from checkpoint)")
+            bar = _bar(_state["sections_done"], _state["total_sections"])
+            print(f"  {bar} Resume: \"{heading}\" ({triples} triples from checkpoint)")
         elif ev == "incremental_skip_plan":
             unchanged = event.get("unchanged_sections", [])
             changed = event.get("changed_sections", [])
@@ -9166,15 +9252,21 @@ def _make_progress_callback(
             if verbose:
                 print(f"  Version diff (v{event.get('version_from')}→v{event.get('version_to')}): {summary}")
         elif ev == "doc_done":
-            if verbose:
-                secs = event.get("total_sections", 0)
-                triples = event.get("total_triples", 0)
-                na = event.get("total_nodes_added", 0)
-                ea = event.get("total_edges_added", 0)
-                skipped_inc = event.get("sections_skipped_incremental", 0)
-                inc_note = f", {skipped_inc} skipped (unchanged)" if skipped_inc else ""
-                print(f"  Document complete: {secs} sections{inc_note}, "
-                      f"{triples} triples, {na} nodes, {ea} edges")
+            secs = event.get("total_sections", 0)
+            triples = event.get("total_triples", 0)
+            na = event.get("total_nodes_added", 0)
+            ea = event.get("total_edges_added", 0)
+            est_tok = event.get("estimated_tokens", 0)
+            tok_per_sec = event.get("tokens_per_second", 0)
+            elapsed = event.get("elapsed_seconds", 0)
+            extraction_secs = event.get("extraction_seconds", 0)
+            skipped_inc = event.get("sections_skipped_incremental", 0)
+            inc_note = f", {skipped_inc} skipped (unchanged)" if skipped_inc else ""
+            tok_info = f", ~{tok_per_sec:,.0f} tok/s" if tok_per_sec else ""
+            print(f"  Done: {secs} sections{inc_note}, "
+                  f"{triples} triples, {na} nodes, {ea} edges "
+                  f"[{elapsed}s total, {extraction_secs}s extraction, "
+                  f"~{est_tok:,} tokens{tok_info}]")
         elif ev == "embed_start":
             tn = event.get("total_nodes", 0)
             sk = event.get("nodes_skipped", 0)
@@ -9232,7 +9324,10 @@ def _print_file_summary(
         edge_str += f", {_e_updated} updated"
     print(f"  Nodes: {node_str}")
     print(f"  Edges: {edge_str}")
-    print(f"  Total time: {elapsed:.1f}s")
+    _est_tok = stats.get("estimated_tokens", 0)
+    _tok_per_sec = stats.get("tokens_per_second", 0)
+    _tok_info = f" (~{_est_tok:,} tokens, ~{_tok_per_sec:,.0f} tok/s)" if _est_tok else ""
+    print(f"  Total time: {elapsed:.1f}s{_tok_info}")
     print(f"  Graph totals: {graph_stats['num_nodes']} nodes, "
           f"{graph_stats['num_edges']} edges")
     if embed_stats and embed_stats["nodes_embedded"]:
@@ -9286,8 +9381,10 @@ def _print_file_summary(
                     triples_info += f", {n_errors} errors"
                 else:
                     sec_tag = "ok"
+                _sec_tok_s = sec_stat.get("tokens_per_second", 0)
+                _tok_s_str = f", ~{_sec_tok_s:,.0f} tok/s" if _sec_tok_s else ""
                 print(f"    [{sec_tag}]   {_heading} "
-                      f"({sec_stat.get('char_count', 0):,} chars{triples_info}{elapsed_str})")
+                      f"({sec_stat.get('char_count', 0):,} chars{triples_info}{elapsed_str}{_tok_s_str})")
 
     if stats["errors"]:
         print(f"\n  Errors ({len(stats['errors'])}):")

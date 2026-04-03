@@ -1878,6 +1878,67 @@ def test_incremental_progress_events(tmp_path):
     assert skip_events[0]["heading"] == "Stable"
 
 
+def test_progress_events_include_token_estimates(tmp_path):
+    """Progress events include estimated_tokens and tokens_per_second."""
+    kg = KnowledgeGraph(tmp_path / "tok.json")
+
+    def mock_extract(prompt):
+        return [{"source": "A", "target": "B", "relation": "related_to"}]
+
+    events = []
+
+    def capture(event):
+        events.append(event)
+
+    md = _long_section("Intro", "x" * 400) + "\n" + _long_section("Details", "y" * 800)
+    kg.ingest_markdown(md, "doc1", llm_extract_fn=mock_extract,
+                       progress_fn=capture)
+
+    # doc_start should have estimated_tokens and section_estimated_tokens
+    doc_starts = [e for e in events if e["event"] == "doc_start"]
+    assert len(doc_starts) == 1
+    ds = doc_starts[0]
+    assert "estimated_tokens" in ds
+    assert ds["estimated_tokens"] > 0
+    assert "section_estimated_tokens" in ds
+    assert len(ds["section_estimated_tokens"]) == ds["total_sections"]
+
+    # section_start should have estimated_tokens
+    sec_starts = [e for e in events if e["event"] == "section_start"]
+    for ss in sec_starts:
+        assert "estimated_tokens" in ss
+        assert ss["estimated_tokens"] > 0
+
+    # section_done should have estimated_tokens and tokens_per_second
+    sec_dones = [e for e in events if e["event"] == "section_done"]
+    for sd in sec_dones:
+        assert "estimated_tokens" in sd
+        assert sd["estimated_tokens"] > 0
+        assert "tokens_per_second" in sd
+
+    # doc_done should have estimated_tokens and tokens_per_second
+    doc_dones = [e for e in events if e["event"] == "doc_done"]
+    assert len(doc_dones) == 1
+    dd = doc_dones[0]
+    assert "estimated_tokens" in dd
+    assert dd["estimated_tokens"] > 0
+    assert "tokens_per_second" in dd
+
+    # aggregate stats should also include token info
+    stats = kg.ingest_markdown(
+        _long_section("Solo", "z" * 200),
+        "doc2", llm_extract_fn=mock_extract,
+    )
+    assert "estimated_tokens" in stats
+    assert stats["estimated_tokens"] > 0
+    assert "tokens_per_second" in stats
+    # Per-section records should include token info
+    for sec in stats.get("sections", []):
+        if not sec.get("skipped"):
+            assert "estimated_tokens" in sec
+            assert "tokens_per_second" in sec
+
+
 def test_incremental_structural_nodes_still_updated(tmp_path):
     """Even when sections are skipped for extraction, structural nodes/edges are created."""
     kg = KnowledgeGraph(tmp_path / "struct.json")
