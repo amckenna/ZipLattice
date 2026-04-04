@@ -118,6 +118,13 @@ def test_graph_detail_page():
     assert "cytoscape" in resp.text.lower()
 
 
+def test_graph_detail_compound_groups():
+    _create_graph("compound-test")
+    resp = client.get("/graphs/compound-test?compound=true")
+    assert resp.status_code == 200
+    assert "isCompound = true" in resp.text
+
+
 def test_graph_detail_nonexistent():
     resp = client.get("/graphs/does-not-exist", follow_redirects=False)
     assert resp.status_code == 303  # redirect to dashboard

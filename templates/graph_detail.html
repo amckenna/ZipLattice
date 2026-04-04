@@ -190,6 +190,19 @@
          class="border border-gray-800 px-4 py-1.5 text-sm text-gray-400 hover:border-white hover:text-white transition-colors">
         Upload Documents
       </a>
+      {% if compound %}
+      <a href="/graphs/{{ graph_name }}"
+         class="border border-indigo-600 bg-indigo-600/20 px-4 py-1.5 text-sm text-indigo-300 hover:border-indigo-400 hover:text-indigo-200 transition-colors"
+         title="Currently showing compound groups — click to show flat graph">
+        Grouped
+      </a>
+      {% else %}
+      <a href="/graphs/{{ graph_name }}?compound=true"
+         class="border border-gray-800 px-4 py-1.5 text-sm text-gray-400 hover:border-white hover:text-white transition-colors"
+         title="Group entities by document/section context">
+        Grouped
+      </a>
+      {% endif %}
       <a href="/graphs/{{ graph_name }}/analytics"
          class="border border-gray-800 px-4 py-1.5 text-sm text-gray-400 hover:border-white hover:text-white transition-colors">
         Analytics
@@ -414,6 +427,7 @@ const typeColors = {{ type_colors_json|safe }};
 const relationColors = {{ relation_colors_json|safe }};
 const graphStats = {{ stats_json|safe }};
 const hasPositions = {{ has_positions|tojson }};
+const isCompound = {{ compound|default(false)|tojson }};
 
 // Use preset layout for instant rendering when positions are pre-computed
 const initialLayout = hasPositions
@@ -488,6 +502,38 @@ const cy = cytoscape({
     { selector: 'edge.dimmed', style: { 'opacity': 0.05 } },
     { selector: 'edge.highlighted', style: { 'opacity': 1, 'width': 3, 'z-index': 999 } },
     { selector: 'node.hidden, edge.hidden', style: { 'display': 'none' } },
+    // Compound parent node styles (document/section bounding boxes)
+    {
+      selector: ':parent',
+      style: {
+        'background-opacity': 0.08,
+        'background-color': 'data(color)',
+        'border-width': 1,
+        'border-color': 'data(color)',
+        'border-opacity': 0.3,
+        'shape': 'roundrectangle',
+        'label': 'data(label)',
+        'color': 'data(color)',
+        'font-size': '13px',
+        'font-weight': 'bold',
+        'text-valign': 'top',
+        'text-halign': 'center',
+        'text-margin-y': 10,
+        'text-outline-color': themeVar('--graph-bg'),
+        'text-outline-width': 2,
+        'padding': 20,
+        'min-width': 80,
+        'min-height': 40,
+        'compound-sizing-wrt-labels': 'include',
+      }
+    },
+    {
+      selector: 'node[type = "document"]',
+      style: {
+        'border-style': isCompound ? 'dashed' : 'solid',
+        'font-size': isCompound ? '15px' : '11px',
+      }
+    },
   ],
   layout: initialLayout,
   minZoom: 0.1,
@@ -500,6 +546,8 @@ const HIDDEN_TYPES_DEFAULT = new Set(['document', 'section']);
 (function() {
   const tf = document.getElementById('type-filters');
   Object.entries(typeColors).forEach(([t, c]) => {
+    // In compound mode, structural types are parents — no checkbox needed
+    if (isCompound && (t === 'document' || t === 'section')) return;
     const checked = HIDDEN_TYPES_DEFAULT.has(t) ? '' : 'checked';
     tf.innerHTML += `<label class="filter-item"><input type="checkbox" ${checked} data-type="${t}" onchange="applyFilters()"><span class="color-dot" style="background:${c}"></span>${t}</label>`;
   });

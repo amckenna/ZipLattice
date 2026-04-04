@@ -485,9 +485,13 @@ async def dashboard(request: Request) -> HTMLResponse:
 
 
 @app.get("/graphs/{name}", response_class=HTMLResponse)
-async def graph_detail(request: Request, name: str) -> Response:
+async def graph_detail(
+    request: Request,
+    name: str,
+    compound: bool = False,
+) -> Response:
     """Graph detail page with Cytoscape visualization."""
-    logger.info("GET /graphs/%s — detail page", name)
+    logger.info("GET /graphs/%s — detail page (compound=%s)", name, compound)
     json_file = GRAPHS_DIR / name / f"{name}.json"
     if not json_file.exists():
         return RedirectResponse(url="/", status_code=303)
@@ -497,7 +501,7 @@ async def graph_detail(request: Request, name: str) -> Response:
         logger.error("Failed to load graph '%s': %s", name, exc)
         return RedirectResponse(url="/", status_code=303)
 
-    cy = kg.cytoscape_elements()
+    cy = kg.cytoscape_elements(compound_groups=compound)
     sources = kg._data.get("meta", {}).get("sources", {})
 
     # Compute per-source node and edge counts
@@ -528,6 +532,7 @@ async def graph_detail(request: Request, name: str) -> Response:
     return templates.TemplateResponse("graph_detail.html", {
         "request": request,
         "graph_name": name,
+        "name": name,
         "stats": cy["stats"],
         "sources": sources_enriched,
         "elements_json": json.dumps(cy["elements"], cls=GraphEncoder),
@@ -535,6 +540,7 @@ async def graph_detail(request: Request, name: str) -> Response:
         "relation_colors_json": json.dumps(cy["relation_colors"]),
         "stats_json": json.dumps(cy["stats"]),
         "has_positions": cy.get("has_positions", False),
+        "compound": cy.get("compound", False),
     })
 
 

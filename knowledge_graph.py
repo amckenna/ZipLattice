@@ -8021,6 +8021,10 @@ TEXT:
 
         return {nid: {"x": xy[0], "y": xy[1]} for nid, xy in combined.items()}
 
+    # Structural node types and relations used for compound grouping
+    _STRUCTURAL_TYPES = {"document", "section"}
+    _STRUCTURAL_RELATIONS = {"part_of", "contains", "documented_by", "documents"}
+
     def cytoscape_elements(
         self,
         *,
@@ -8028,8 +8032,17 @@ TEXT:
         depth: int | None = None,
         min_confidence: float = 0.0,
         precompute_layout: bool = True,
+        compound_groups: bool = False,
     ) -> dict:
         """Return Cytoscape.js data needed to render an interactive graph.
+
+        When *compound_groups* is ``True``, document and section nodes are
+        converted into Cytoscape compound (parent) nodes. Entity nodes are
+        nested inside their source section/document using the ``parent``
+        field. Structural edges (``documented_by``, ``part_of``,
+        ``contains``, ``documents``) are removed so only knowledge-bearing
+        relations remain.  The result ``"compound"`` key is set to
+        ``True`` so the frontend can apply appropriate compound styles.
 
         Returns a dict with keys:
           - ``elements``: list of Cytoscape element dicts (nodes + edges)
@@ -8041,6 +8054,7 @@ TEXT:
           - ``stats``: dict with node/edge/component/proposal counts
           - ``has_positions``: bool indicating whether elements contain
             pre-computed layout positions (``preset`` layout ready)
+          - ``compound``: bool indicating compound grouping is active
         """
         if center_node and depth:
             subgraph = self.get_subgraph(center_node, depth=depth)
@@ -8056,10 +8070,83 @@ TEXT:
                 if e.get("confidence", 1.0) >= min_confidence
             ]
 
+        # --- Compound grouping: build parent mapping and filter ---
+        # parent_map: entity node id -> compound parent node id
+        parent_map: dict[str, str] = {}
+        # section_parent_map: section node id -> document node id
+        section_parent_map: dict[str, str] = {}
+        structural_node_ids: set[str] = set()
+
+        if compound_groups:
+            # Identify structural nodes
+            for nid, node in render_nodes.items():
+                if node.get("type") in self._STRUCTURAL_TYPES:
+                    structural_node_ids.add(nid)
+
+            # Build section -> document parent hierarchy from part_of edges
+            for edge in render_edges:
+                if edge.get("relation") != "part_of":
+                    continue
+                src, tgt = edge["source"], edge["target"]
+                if (src in structural_node_ids and tgt in structural_node_ids):
+                    src_type = render_nodes.get(src, {}).get("type")
+                    tgt_type = render_nodes.get(tgt, {}).get("type")
+                    if src_type == "section" and tgt_type == "document":
+                        section_parent_map[src] = tgt
+                    elif src_type == "section" and tgt_type == "section":
+                        # Nested section hierarchy
+                        section_parent_map[src] = tgt
+
+            # Map entity nodes to their section/document parent via source field
+            # Source format: "doc:<doc_id>::<section_heading>" or "doc:<doc_id>"
+            for nid, node in render_nodes.items():
+                if nid in structural_node_ids:
+                    continue
+                source = node.get("source", "")
+                if not source.startswith("doc:"):
+                    continue
+                # Try to find the section node first, then fall back to document
+                # Section node IDs are slugified from "doc_id--heading"
+                if "::" in source:
+                    parts = source.split("::", 1)
+                    doc_part = parts[0].removeprefix("doc:")
+                    heading = parts[1]
+                    section_slug = slugify(f"{doc_part}--{heading}")
+                    if section_slug in structural_node_ids:
+                        parent_map[nid] = section_slug
+                        continue
+                # Fall back to document node
+                doc_id = source.split("::")[0].removeprefix("doc:")
+                doc_slug = slugify(doc_id)
+                if doc_slug in structural_node_ids:
+                    parent_map[nid] = doc_slug
+
+            # Filter out structural edges
+            render_edges = [
+                e for e in render_edges
+                if e.get("relation") not in self._STRUCTURAL_RELATIONS
+            ]
+
         # Pre-compute positions with NetworkX spring_layout
+        # For compound mode, only layout non-structural nodes
         positions: dict[str, dict[str, float]] = {}
         if precompute_layout and render_nodes:
-            positions = self._compute_layout_positions(render_nodes, render_edges)
+            if compound_groups:
+                layout_nodes = {
+                    nid: n for nid, n in render_nodes.items()
+                    if nid not in structural_node_ids
+                }
+                layout_edges = [
+                    e for e in render_edges
+                    if (e["source"] not in structural_node_ids
+                        and e["target"] not in structural_node_ids)
+                ]
+                if layout_nodes:
+                    positions = self._compute_layout_positions(
+                        layout_nodes, layout_edges,
+                    )
+            else:
+                positions = self._compute_layout_positions(render_nodes, render_edges)
 
         elements: list[dict] = []
         degree: dict[str, int] = defaultdict(int)
@@ -8067,9 +8154,35 @@ TEXT:
             degree[e["source"]] += 1
             degree[e["target"]] += 1
 
+        # Add compound parent nodes first (document, then section)
+        if compound_groups:
+            for nid in structural_node_ids:
+                node = render_nodes[nid]
+                ntype = node.get("type", "custom")
+                elem: dict = {
+                    "group": "nodes",
+                    "data": {
+                        "id": nid,
+                        "label": node.get("label", nid),
+                        "type": ntype,
+                        "color": self._node_color(ntype),
+                        "confidence": node.get("confidence", 1.0),
+                        "source": node.get("source", "unknown"),
+                        "degree": 0,
+                        "properties": node.get("properties", {}),
+                        "compound": True,
+                    },
+                }
+                # Nest sections inside their parent document/section
+                if nid in section_parent_map:
+                    elem["data"]["parent"] = section_parent_map[nid]
+                elements.append(elem)
+
         for nid, node in render_nodes.items():
+            if compound_groups and nid in structural_node_ids:
+                continue  # already added as compound parents
             ntype = node.get("type", "custom")
-            elem: dict = {
+            elem = {
                 "group": "nodes",
                 "data": {
                     "id": nid,
@@ -8082,6 +8195,8 @@ TEXT:
                     "properties": node.get("properties", {}),
                 },
             }
+            if compound_groups and nid in parent_map:
+                elem["data"]["parent"] = parent_map[nid]
             if nid in positions:
                 elem["position"] = positions[nid]
             elements.append(elem)
@@ -8089,6 +8204,10 @@ TEXT:
         for i, edge in enumerate(render_edges):
             src, tgt = edge["source"], edge["target"]
             if src not in render_nodes or tgt not in render_nodes:
+                continue
+            # In compound mode, skip edges involving structural nodes
+            if compound_groups and (src in structural_node_ids
+                                    or tgt in structural_node_ids):
                 continue
             relation = edge.get("relation", "related_to")
             elements.append({
@@ -8106,8 +8225,36 @@ TEXT:
                 },
             })
 
-        types_present = sorted({n.get("type", "custom") for n in render_nodes.values()})
-        relations_present = sorted({e.get("relation", "related_to") for e in render_edges})
+        # For compound mode, report only knowledge-bearing types/relations
+        if compound_groups:
+            content_nodes = {
+                nid: n for nid, n in render_nodes.items()
+                if nid not in structural_node_ids
+            }
+            types_present = sorted({
+                n.get("type", "custom") for n in content_nodes.values()
+            })
+            relations_present = sorted({
+                e.get("relation", "related_to") for e in render_edges
+                if e.get("relation") not in self._STRUCTURAL_RELATIONS
+            })
+            node_count = len(content_nodes)
+            edge_count = sum(
+                1 for e in render_edges
+                if (e["source"] not in structural_node_ids
+                    and e["target"] not in structural_node_ids
+                    and e["source"] in render_nodes
+                    and e["target"] in render_nodes)
+            )
+        else:
+            types_present = sorted({
+                n.get("type", "custom") for n in render_nodes.values()
+            })
+            relations_present = sorted({
+                e.get("relation", "related_to") for e in render_edges
+            })
+            node_count = len(render_nodes)
+            edge_count = len(render_edges)
 
         pending_proposals = [
             {"name": p.name, "confidence": p.confidence,
@@ -8123,9 +8270,10 @@ TEXT:
             "relations": relations_present,
             "proposals": pending_proposals,
             "has_positions": bool(positions),
+            "compound": compound_groups,
             "stats": {
-                "nodes": len(render_nodes),
-                "edges": len(render_edges),
+                "nodes": node_count,
+                "edges": edge_count,
                 "components": nx.number_weakly_connected_components(self._G),
                 "pending_proposals": len(pending_proposals),
                 "relation_types": len(relations_present),
@@ -8141,6 +8289,7 @@ TEXT:
         min_confidence: float = 0.0,
         layout: str = "cose",
         title: str = "Knowledge Graph",
+        compound_groups: bool = False,
     ) -> Path:
         """
         Export a detailed interactive HTML visualization using Cytoscape.js.
@@ -8152,6 +8301,10 @@ TEXT:
             node/edge detail panel, confidence slider, type toggles
           - Color coding by node type and relation type
           - Click-to-focus neighborhood exploration
+
+        When *compound_groups* is ``True``, document and section nodes
+        become compound parent containers and structural edges are
+        removed.  See :meth:`cytoscape_elements` for details.
 
         When *layout* is ``"cose"`` (the default), node positions are
         pre-computed server-side with ``nx.spring_layout()`` and the
@@ -8166,110 +8319,30 @@ TEXT:
             layout: Initial layout algorithm ('cose', 'circle', 'grid',
                     'breadthfirst', 'concentric').
             title: Page title.
+            compound_groups: Use compound (parent) nodes for document
+                context instead of structural nodes and edges.
 
         Returns:
             Path to the generated HTML file.
         """
         output_path = Path(output_path)
 
-        # Determine which nodes/edges to render
-        if center_node and depth:
-            subgraph = self.get_subgraph(center_node, depth=depth)
-            render_nodes = subgraph["nodes"]
-            render_edges = subgraph["edges"]
-        else:
-            render_nodes = self._data["nodes"]
-            render_edges = self._data["edges"]
+        cy = self.cytoscape_elements(
+            center_node=center_node,
+            depth=depth if center_node else None,
+            min_confidence=min_confidence,
+            precompute_layout=True,
+            compound_groups=compound_groups,
+        )
 
-        # Filter edges by confidence
-        if min_confidence > 0:
-            render_edges = [
-                e for e in render_edges
-                if e.get("confidence", 1.0) >= min_confidence
-            ]
-
-        # Pre-compute positions for instant preset layout
-        positions: dict[str, dict[str, float]] = {}
-        if render_nodes:
-            positions = self._compute_layout_positions(render_nodes, render_edges)
-        has_positions = bool(positions)
-
-        # Build Cytoscape elements
-        elements = []
-
-        # Compute degree for sizing
-        degree: dict[str, int] = defaultdict(int)
-        for e in render_edges:
-            degree[e["source"]] += 1
-            degree[e["target"]] += 1
-
-        for nid, node in render_nodes.items():
-            ntype = node.get("type", "custom")
-            elem: dict = {
-                "group": "nodes",
-                "data": {
-                    "id": nid,
-                    "label": node.get("label", nid),
-                    "type": ntype,
-                    "color": self._node_color(ntype),
-                    "confidence": node.get("confidence", 1.0),
-                    "source": node.get("source", "unknown"),
-                    "degree": degree.get(nid, 0),
-                    "properties": node.get("properties", {}),
-                },
-            }
-            if nid in positions:
-                elem["position"] = positions[nid]
-            elements.append(elem)
-
-        for i, edge in enumerate(render_edges):
-            src = edge["source"]
-            tgt = edge["target"]
-            if src not in render_nodes or tgt not in render_nodes:
-                continue
-            relation = edge.get("relation", "related_to")
-            elements.append({
-                "group": "edges",
-                "data": {
-                    "id": f"e{i}",
-                    "source": src,
-                    "target": tgt,
-                    "relation": relation,
-                    "color": self._edge_color(relation),
-                    "confidence": edge.get("confidence", 1.0),
-                    "source_tag": edge.get("source_tag", "unknown"),
-                    "weight": edge.get("weight", 1.0),
-                    "properties": edge.get("properties", {}),
-                },
-            })
-
-        # Collect types and relations for controls
-        types_present = sorted({n.get("type", "custom") for n in render_nodes.values()})
-        relations_present = sorted({e.get("relation", "related_to") for e in render_edges})
-
-        type_colors_json = json.dumps({t: self._node_color(t) for t in types_present})
-        relation_colors_json = json.dumps({r: self._edge_color(r) for r in relations_present})
-        elements_json = json.dumps(elements, cls=GraphEncoder)
-
-        # Proposal data for the panel
-        pending_proposals = [
-            {"name": p.name, "confidence": p.confidence,
-             "justification": p.justification, "num_examples": len(p.examples)}
-            for p in self.get_proposals(status=ProposalStatus.PENDING.value)
-        ]
-        proposals_json = json.dumps(pending_proposals)
-
-        stats = {
-            "nodes": len(render_nodes),
-            "edges": len(render_edges),
-            "components": nx.number_weakly_connected_components(self._G),
-            "pending_proposals": len(pending_proposals),
-            "relation_types": len(relations_present),
-        }
-        stats_json = json.dumps(stats)
+        elements_json = json.dumps(cy["elements"], cls=GraphEncoder)
+        type_colors_json = json.dumps(cy["type_colors"])
+        relation_colors_json = json.dumps(cy["relation_colors"])
+        proposals_json = json.dumps(cy["proposals"])
+        stats_json = json.dumps(cy["stats"])
 
         # Use preset layout for instant render when positions are pre-computed
-        effective_layout = "preset" if has_positions else layout
+        effective_layout = "preset" if cy["has_positions"] else layout
 
         html = self._cytoscape_html_template(
             title=title,
@@ -8279,15 +8352,16 @@ TEXT:
             proposals_json=proposals_json,
             stats_json=stats_json,
             initial_layout=effective_layout,
-            types_present=types_present,
-            relations_present=relations_present,
+            types_present=cy["types"],
+            relations_present=cy["relations"],
+            compound=cy.get("compound", False),
         )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(html, encoding="utf-8")
 
         logger.info("Cytoscape export: %s (%d nodes, %d edges)",
-                     output_path, len(render_nodes), len(render_edges))
+                     output_path, cy["stats"]["nodes"], cy["stats"]["edges"])
         return output_path
 
     def _cytoscape_html_template(
@@ -8302,6 +8376,7 @@ TEXT:
         initial_layout: str,
         types_present: list[str],
         relations_present: list[str],
+        compound: bool = False,
     ) -> str:
         """Generate the full self-contained Cytoscape.js HTML page."""
 
@@ -8322,6 +8397,8 @@ TEXT:
             f'{r}</label>'
             for r in relations_present
         )
+
+        compound_json = "true" if compound else "false"
 
         return f"""<!DOCTYPE html>
 <html lang="en">
@@ -8544,6 +8621,7 @@ const typeColors = {type_colors_json};
 const relationColors = {relation_colors_json};
 const proposals = {proposals_json};
 const graphStats = {stats_json};
+const isCompound = {compound_json};
 
 // --- Init Cytoscape ---
 const cy = cytoscape({{
@@ -8623,6 +8701,39 @@ const cy = cytoscape({{
     {{
       selector: 'node.hidden, edge.hidden',
       style: {{ 'display': 'none' }}
+    }},
+    // Compound parent node styles (document/section bounding boxes)
+    {{
+      selector: ':parent',
+      style: {{
+        'background-opacity': 0.08,
+        'background-color': 'data(color)',
+        'border-width': 1,
+        'border-color': 'data(color)',
+        'border-opacity': 0.3,
+        'shape': 'roundrectangle',
+        'label': 'data(label)',
+        'color': 'data(color)',
+        'font-size': '13px',
+        'font-weight': 'bold',
+        'text-valign': 'top',
+        'text-halign': 'center',
+        'text-margin-y': 10,
+        'text-outline-color': '#0f172a',
+        'text-outline-width': 2,
+        'padding': 20,
+        'min-width': 80,
+        'min-height': 40,
+        'compound-sizing-wrt-labels': 'include',
+      }}
+    }},
+    // Document-level compound nodes (outer containers)
+    {{
+      selector: 'node[type = "document"]',
+      style: {{
+        'border-style': isCompound ? 'dashed' : 'solid',
+        'font-size': isCompound ? '15px' : '11px',
+      }}
     }},
   ],
   layout: {{ name: '{initial_layout}', animate: true, animationDuration: 600,
@@ -9682,6 +9793,9 @@ def main() -> None:
                         help="Export Pyvis visualization (optionally specify output path)")
     parser.add_argument("--cytoscape", nargs="?", const="graph_cytoscape.html",
                         help="Export Cytoscape visualization (optionally specify output path)")
+    parser.add_argument("--compound-groups", action="store_true",
+                        help="Use compound (parent) nodes for document/section context "
+                             "instead of structural nodes and edges (use with --cytoscape)")
     parser.add_argument("--center", help="Center visualization on this node (use with --pyvis/--cytoscape)")
     parser.add_argument("--preview-md", help="Preview section breakdown of a markdown or text file (dry run)")
     parser.add_argument("--ingest-md", nargs="+", metavar="FILE",
@@ -9902,6 +10016,7 @@ def main() -> None:
             args.cytoscape,
             center_node=args.center,
             depth=args.depth if args.center else None,
+            compound_groups=args.compound_groups,
         )
         print(f"Cytoscape visualization: {path}")
 

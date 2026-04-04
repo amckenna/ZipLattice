@@ -2891,3 +2891,171 @@ def test_checkpoint_stale_discarded(tmp_path):
     # Should proceed normally (stale checkpoint discarded)
     assert stats["total_triples"] > 0
     assert stats.get("sections_resumed", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Cytoscape compound groups
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def graph_with_structure(tmp_path):
+    """Graph with document/section structural nodes and entity nodes."""
+    kg = KnowledgeGraph(tmp_path / "compound.json")
+    # Document node (slugified id: "mydoc")
+    kg.add_node("mydoc", type="document", label="My Document",
+                source="doc_ingest")
+    # Section nodes — IDs match what ingest_markdown produces:
+    # slugify("mydoc--Introduction") -> "mydoc-introduction"
+    kg.add_node("mydoc-introduction", type="section", label="Introduction",
+                source="doc:mydoc")
+    kg.add_node("mydoc-methods", type="section", label="Methods",
+                source="doc:mydoc")
+    # Structure edges
+    kg.add_edge("mydoc-introduction", "mydoc", relation="part_of",
+                source_tag="markdown_ingest")
+    kg.add_edge("mydoc-methods", "mydoc", relation="part_of",
+                source_tag="markdown_ingest")
+    kg.add_edge("mydoc", "mydoc-introduction", relation="contains",
+                source_tag="markdown_ingest")
+    kg.add_edge("mydoc", "mydoc-methods", relation="contains",
+                source_tag="markdown_ingest")
+    # Entity nodes — source field matches the format used during ingestion
+    kg.add_node("radar", type="concept", label="Radar",
+                source="doc:mydoc::Introduction")
+    kg.add_node("antenna", type="technology", label="Antenna",
+                source="doc:mydoc::Methods")
+    kg.add_node("signal", type="concept", label="Signal Processing",
+                source="doc:mydoc::Introduction")
+    # Knowledge edges
+    kg.add_edge("radar", "antenna", relation="uses")
+    kg.add_edge("radar", "signal", relation="depends_on")
+    # documented_by edges
+    kg.add_edge("radar", "mydoc-introduction", relation="documented_by",
+                source_tag="markdown_ingest")
+    kg.add_edge("antenna", "mydoc-methods", relation="documented_by",
+                source_tag="markdown_ingest")
+    kg.add_edge("signal", "mydoc-introduction", relation="documented_by",
+                source_tag="markdown_ingest")
+    return kg
+
+
+def test_cytoscape_elements_default_no_compound(graph_with_structure):
+    """Default cytoscape_elements returns all nodes and edges (no compound)."""
+    cy = graph_with_structure.cytoscape_elements(precompute_layout=False)
+    assert cy["compound"] is False
+    # All nodes present including structural
+    node_ids = {e["data"]["id"] for e in cy["elements"] if e["group"] == "nodes"}
+    assert "mydoc" in node_ids
+    assert "mydoc-introduction" in node_ids
+    assert "radar" in node_ids
+    # Structural edges present
+    edge_relations = {e["data"]["relation"] for e in cy["elements"] if e["group"] == "edges"}
+    assert "part_of" in edge_relations
+    assert "documented_by" in edge_relations
+
+
+def test_cytoscape_elements_compound_groups(graph_with_structure):
+    """Compound groups converts structural nodes to parents and removes structural edges."""
+    cy = graph_with_structure.cytoscape_elements(
+        precompute_layout=False, compound_groups=True,
+    )
+    assert cy["compound"] is True
+
+    nodes = [e for e in cy["elements"] if e["group"] == "nodes"]
+    edges = [e for e in cy["elements"] if e["group"] == "edges"]
+
+    node_ids = {n["data"]["id"] for n in nodes}
+    # All nodes still present (structural as compound parents)
+    assert "mydoc" in node_ids
+    assert "mydoc-introduction" in node_ids
+    assert "radar" in node_ids
+
+    # Structural nodes have compound=True flag
+    doc_node = next(n for n in nodes if n["data"]["id"] == "mydoc")
+    assert doc_node["data"].get("compound") is True
+    section_node = next(n for n in nodes if n["data"]["id"] == "mydoc-introduction")
+    assert section_node["data"].get("compound") is True
+
+    # Entity nodes do NOT have compound=True
+    radar_node = next(n for n in nodes if n["data"]["id"] == "radar")
+    assert "compound" not in radar_node["data"]
+
+    # Sections are parented to the document
+    assert section_node["data"].get("parent") == "mydoc"
+    methods_node = next(n for n in nodes if n["data"]["id"] == "mydoc-methods")
+    assert methods_node["data"].get("parent") == "mydoc"
+
+    # Entity nodes are parented to their sections
+    assert radar_node["data"].get("parent") == "mydoc-introduction"
+    antenna_node = next(n for n in nodes if n["data"]["id"] == "antenna")
+    assert antenna_node["data"].get("parent") == "mydoc-methods"
+    signal_node = next(n for n in nodes if n["data"]["id"] == "signal")
+    assert signal_node["data"].get("parent") == "mydoc-introduction"
+
+    # No structural edges remain
+    edge_relations = {e["data"]["relation"] for e in edges}
+    assert "part_of" not in edge_relations
+    assert "contains" not in edge_relations
+    assert "documented_by" not in edge_relations
+    assert "documents" not in edge_relations
+
+    # Knowledge edges remain
+    assert "uses" in edge_relations
+    assert "depends_on" in edge_relations
+
+    # Types should not include document/section
+    assert "document" not in cy["types"]
+    assert "section" not in cy["types"]
+    assert "concept" in cy["types"]
+    assert "technology" in cy["types"]
+
+    # Relations should not include structural ones
+    assert "part_of" not in cy["relations"]
+    assert "documented_by" not in cy["relations"]
+
+    # Stats reflect only knowledge-bearing counts
+    assert cy["stats"]["nodes"] == 3  # radar, antenna, signal
+    assert cy["stats"]["edges"] == 2  # uses, depends_on
+
+
+def test_cytoscape_compound_html_template(graph_with_structure):
+    """Compound mode produces HTML template with compound styles."""
+    cy = graph_with_structure.cytoscape_elements(
+        precompute_layout=False, compound_groups=True,
+    )
+    import json
+    html = graph_with_structure._cytoscape_html_template(
+        title="Test",
+        elements_json=json.dumps(cy["elements"]),
+        type_colors_json=json.dumps(cy["type_colors"]),
+        relation_colors_json=json.dumps(cy["relation_colors"]),
+        proposals_json=json.dumps(cy["proposals"]),
+        stats_json=json.dumps(cy["stats"]),
+        initial_layout="preset",
+        types_present=cy["types"],
+        relations_present=cy["relations"],
+        compound=True,
+    )
+    assert "isCompound = true" in html
+    assert ":parent" in html
+    assert "compound-sizing-wrt-labels" in html
+
+
+def test_cytoscape_non_compound_html_template(graph_with_structure):
+    """Non-compound mode produces HTML template with isCompound = false."""
+    cy = graph_with_structure.cytoscape_elements(precompute_layout=False)
+    import json
+    html = graph_with_structure._cytoscape_html_template(
+        title="Test",
+        elements_json=json.dumps(cy["elements"]),
+        type_colors_json=json.dumps(cy["type_colors"]),
+        relation_colors_json=json.dumps(cy["relation_colors"]),
+        proposals_json=json.dumps(cy["proposals"]),
+        stats_json=json.dumps(cy["stats"]),
+        initial_layout="preset",
+        types_present=cy["types"],
+        relations_present=cy["relations"],
+        compound=False,
+    )
+    assert "isCompound = false" in html
